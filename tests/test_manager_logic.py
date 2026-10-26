@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import json
 import os
 import re
@@ -750,7 +752,7 @@ class ManagerLogicTests(unittest.TestCase):
 
     def test_node_table_contains_latency_country_panel_and_test_action(self) -> None:
         self.assertIn('<th style="width: 125px;">延迟</th>', manager.INDEX_HTML)
-        self.assertIn('colspan="7"', manager.INDEX_HTML)
+        self.assertIn('colspan="8"', manager.INDEX_HTML)
         self.assertIn('class="country-option-input"', manager.INDEX_HTML)
         self.assertIn('${testBtn}', manager.INDEX_HTML)
 
@@ -840,8 +842,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.2.1", manager.APP_VERSION)
-        self.assertEqual("V1.2.1 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.2.2", manager.APP_VERSION)
+        self.assertEqual("V1.2.2 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -909,15 +911,15 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("2.2.0", result["latest_version"])
         self.assertEqual("v2.2.0", result["latest_tag"])
         self.assertEqual(
-            "https://github.com/baoweise-bot/aimili-vpngate/releases/tag/v2.2.0",
+            "https://github.com/liulangdegezi/aimili-vpngate-plus/releases/tag/v2.2.0",
             result["release_url"],
         )
         fetch_mock.assert_called_once_with(manager.GITHUB_LATEST_RELEASE_API, True)
 
     def test_latest_release_check_reports_current_formal_version(self) -> None:
         release = {
-            "tag_name": "v1.2.1",
-            "name": "AimiliVPN V1.2.1 正式版",
+            "tag_name": "v1.2.2",
+            "name": "AimiliVPN V1.2.2 正式版",
             "draft": False,
             "prerelease": False,
         }
@@ -925,7 +927,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.2.1 正式版", result["current_version_label"])
+        self.assertEqual("V1.2.2 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -944,7 +946,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.2.1", result["current_version"])
+        self.assertEqual("1.2.2", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1305,7 +1307,7 @@ class CodeUpdateTests(unittest.TestCase):
         self.assertIn("最长约 90 秒", html)
         self.assertIn("出口 IP 可能变化", html)
         self.assertIn("请用终端 ml update 重试", html)
-        self.assertIn("120000", html)
+        self.assertIn("600000", html)
         self.assertIn("aimili_code_update_done", html)
 
     def test_update_worker_never_touches_scoring_gate(self) -> None:
@@ -1459,20 +1461,21 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_2_1(self) -> None:
-        self.assertEqual("1.2.1", manager.APP_VERSION)
-        self.assertEqual("V1.2.1 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.2.1 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_2_2(self) -> None:
+        self.assertEqual("1.2.2", manager.APP_VERSION)
+        self.assertEqual("V1.2.2 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.2.2 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.2.1"', install_text)
-        self.assertNotIn('"1.2.0"', install_text)
+        self.assertIn('"1.2.2"', install_text)
+        self.assertNotIn('"1.2.1"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.2.1", compose_text)
-        self.assertNotIn("1.2.0", compose_text)
+        self.assertIn(":1.2.2", compose_text)
+        self.assertNotIn("1.2.1", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.2.1", version_text)
+        self.assertEqual("1.2.2", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn("## V1.2.1", changelog)
+        self.assertIn("## V1.2.2", changelog)
+        self.assertIn("## V1.2.1（2026-10-26，已发布正式版 v1.2.1）", changelog)
         self.assertIn("## V1.2.0（2026-10-26，已发布正式版 v1.2.0）", changelog)
         self.assertIn("## V1.1.0（2026-10-26，已发布正式版 v1.1.0）", changelog)
 
@@ -1552,3 +1555,552 @@ class RetentionEligibilityTests(unittest.TestCase):
         }
         cfg = {"routing_mode": "fixed_region", "force_country": "United Kingdom"}
         self.assertFalse(manager.retention_eligible(node, cfg))
+
+
+class DetectionGatingTests(unittest.TestCase):
+    """1.2.2 detection frequency (A): trigger + candidate-hash gating.
+
+    The full-sweep priority order itself is untouched by this batch
+    (full_sweep_order / full_sweep_priority); these tests prove the
+    gating decision and that a skip keeps previous probe results.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.path_patches = [
+            mock.patch.object(manager, "DATA_DIR", root),
+            mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
+            mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "STATE_FILE", root / "state.json"),
+            mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
+            mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
+            mock.patch.object(manager, "API_CACHE_FILE", root / "api_snapshot.csv"),
+            mock.patch.object(manager, "API_CACHE_META_FILE", root / "api_snapshot.meta.json"),
+            mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
+        ]
+        for patcher in self.path_patches:
+            patcher.start()
+        manager.ensure_dirs()
+        self._saved_restart_first = manager._first_maintain_after_startup
+        manager.active_openvpn_process = None
+        manager.active_openvpn_node_id = ""
+        manager.is_connecting = False
+        manager.full_sweep_running = False
+        manager.full_sweep_cancel_requested = False
+
+    def tearDown(self) -> None:
+        manager._first_maintain_after_startup = self._saved_restart_first
+        for patcher in reversed(self.path_patches):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    def _write_candidates(self, ids: list[str]) -> list[dict]:
+        nodes = []
+        for index, node_id in enumerate(ids):
+            nodes.append(
+                {
+                    "id": node_id,
+                    "ip": f"192.0.2.{index + 1}",
+                    "country": "United Kingdom",
+                    "country_short": "GB",
+                    "ping": index + 1,
+                    "score": 100,
+                    "config_text": "client\nremote 192.0.2.1 1194 udp\n",
+                    "config_file": str(manager.CONFIG_DIR / f"{node_id}.ovpn"),
+                    "probe_status": "not_checked",
+                    "probed_at": 0,
+                    "active": False,
+                }
+            )
+        manager.write_json(manager.NODES_FILE, nodes)
+        return nodes
+
+    def _run_maintain(self, candidates, trigger, restart_first):
+        manager._first_maintain_after_startup = restart_first
+        sweep_mock = mock.Mock(
+            return_value={
+                "skipped": False,
+                "tested": 2,
+                "available": 1,
+                "unavailable": 1,
+            }
+        )
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "active_openvpn_running", return_value=True),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+            mock.patch.object(manager, "sweep_retained_nodes", return_value=0),
+            mock.patch.object(manager, "run_full_sweep", sweep_mock),
+            mock.patch.object(manager, "log_to_json") as log_mock,
+        ):
+            message = manager.maintain_valid_nodes(force=False, trigger=trigger)
+        return message, sweep_mock, log_mock
+
+    def test_decision_manual_always_sweeps(self) -> None:
+        self.assertTrue(manager.should_run_full_sweep("manual", False, False)[0])
+        self.assertTrue(manager.should_run_full_sweep("manual", True, False)[0])
+
+    def test_decision_check_always_sweeps(self) -> None:
+        self.assertTrue(manager.should_run_full_sweep("check", False, False)[0])
+
+    def test_decision_refill_never_sweeps(self) -> None:
+        self.assertFalse(manager.should_run_full_sweep("refill", True, True)[0])
+        self.assertFalse(manager.should_run_full_sweep("refill", False, False)[0])
+
+    def test_decision_auto_sweeps_only_on_change_or_restart_first(self) -> None:
+        self.assertTrue(manager.should_run_full_sweep("auto", True, False)[0])
+        self.assertTrue(manager.should_run_full_sweep("auto", False, True)[0])
+        self.assertTrue(manager.should_run_full_sweep("auto", True, True)[0])
+        self.assertFalse(manager.should_run_full_sweep("auto", False, False)[0])
+        # Unknown triggers are treated as auto, never as manual.
+        self.assertFalse(manager.should_run_full_sweep("bogus", False, False)[0])
+        self.assertTrue(manager.should_run_full_sweep("bogus", True, False)[0])
+
+    def test_candidate_hash_ignores_fetch_order(self) -> None:
+        nodes_a = [{"id": "b"}, {"id": "a"}]
+        nodes_b = [{"id": "a"}, {"id": "b"}]
+        self.assertEqual(
+            manager._candidate_list_hash(nodes_a),
+            manager._candidate_list_hash(nodes_b),
+        )
+        nodes_c = [{"id": "a"}, {"id": "c"}]
+        self.assertNotEqual(
+            manager._candidate_list_hash(nodes_a),
+            manager._candidate_list_hash(nodes_c),
+        )
+
+    def test_auto_unchanged_list_skips_sweep_and_keeps_results(self) -> None:
+        candidates = self._write_candidates(["node-a", "node-b"])
+        message, sweep_mock, _ = self._run_maintain(candidates, "auto", True)
+        self.assertEqual(1, sweep_mock.call_count)
+        # Mark previous probe results, then run again with the same list.
+        stored = manager.read_nodes()
+        for node in stored:
+            node["probe_status"] = "available"
+        manager.write_json(manager.NODES_FILE, stored)
+        message, sweep_mock, log_mock = self._run_maintain(candidates, "auto", False)
+        sweep_mock.assert_not_called()
+        self.assertIn("已跳过", message)
+        self.assertIn("节点列表未变化", message)
+        self.assertIn("已跳过", manager.get_state().get("last_check_message", ""))
+        self.assertTrue(
+            any("已跳过" in str(call) for call in log_mock.call_args_list)
+        )
+        stored = manager.read_nodes()
+        self.assertTrue(all(n["probe_status"] == "available" for n in stored))
+
+    def test_auto_changed_list_sweeps(self) -> None:
+        candidates_a = self._write_candidates(["node-a", "node-b"])
+        self._run_maintain(candidates_a, "auto", True)
+        candidates_b = self._write_candidates(["node-a", "node-c"])
+        _, sweep_mock, _ = self._run_maintain(candidates_b, "auto", False)
+        self.assertEqual(1, sweep_mock.call_count)
+
+    def test_manual_unchanged_list_still_sweeps(self) -> None:
+        candidates = self._write_candidates(["node-a", "node-b"])
+        self._run_maintain(candidates, "auto", True)
+        _, sweep_mock, _ = self._run_maintain(candidates, "manual", False)
+        self.assertEqual(1, sweep_mock.call_count)
+
+    def test_refill_changed_list_never_sweeps(self) -> None:
+        candidates_a = self._write_candidates(["node-a", "node-b"])
+        self._run_maintain(candidates_a, "auto", True)
+        candidates_b = self._write_candidates(["node-a", "node-c"])
+        message, sweep_mock, _ = self._run_maintain(candidates_b, "refill", False)
+        sweep_mock.assert_not_called()
+        self.assertIn("已跳过", message)
+        self.assertIn("后台补齐", message)
+
+    def test_restart_first_unchanged_list_sweeps(self) -> None:
+        candidates = self._write_candidates(["node-a", "node-b"])
+        self._run_maintain(candidates, "auto", True)
+        _, sweep_mock, _ = self._run_maintain(candidates, "auto", True)
+        self.assertEqual(1, sweep_mock.call_count)
+
+    def test_refill_does_not_consume_restart_first_flag(self) -> None:
+        candidates = self._write_candidates(["node-a", "node-b"])
+        message, sweep_mock, _ = self._run_maintain(candidates, "refill", True)
+        sweep_mock.assert_not_called()
+        self.assertTrue(manager._first_maintain_after_startup)
+        _, sweep_mock, _ = self._run_maintain(candidates, "auto", True)
+        self.assertEqual(1, sweep_mock.call_count)
+
+    def test_sweep_priority_order_unchanged_by_gating(self) -> None:
+        nodes = [
+            {"id": "slow-other", "latency_ms": 500, "ping": 500},
+            {"id": "gb-node", "latency_ms": 300, "ping": 300, "country": "United Kingdom", "country_short": "GB"},
+            {"id": "fast-other", "latency_ms": 10, "ping": 10},
+        ]
+        ui_cfg = {"routing_mode": "fixed_region", "force_country": "United Kingdom"}
+        ordered = [n["id"] for n in manager.full_sweep_order(nodes, ui_cfg)]
+        self.assertEqual(["gb-node", "fast-other", "slow-other"], ordered)
+        # Gating decisions do not mutate the node list or its order.
+        for trigger in ("manual", "auto", "refill", "check"):
+            manager.should_run_full_sweep(trigger, False, False)
+        self.assertEqual(
+            ["gb-node", "fast-other", "slow-other"],
+            [n["id"] for n in manager.full_sweep_order(nodes, ui_cfg)],
+        )
+
+
+class CodeUpdateLastAttemptTests(unittest.TestCase):
+    """1.2.2 one-click diagnostics: rejected attempts and last attempt.
+
+    The status/last-attempt files are pointed at a per-test temp dir so
+    these tests never touch the import-time temp dir shared by other
+    test classes, and a rejected attempt can never overwrite a running
+    status file (the two files are distinct paths).
+    """
+
+    def setUp(self) -> None:
+        self._saved_is_connecting = manager.is_connecting
+        self._saved_full_sweep = manager.full_sweep_running
+        self._saved_data_dir = manager.DATA_DIR
+        self._saved_status_file = manager.CODE_UPDATE_STATUS_FILE
+        self._saved_last_attempt_file = manager.CODE_UPDATE_LAST_ATTEMPT_FILE
+        self._tmp = tempfile.TemporaryDirectory()
+        manager.DATA_DIR = Path(self._tmp.name)
+        manager.CODE_UPDATE_STATUS_FILE = Path(self._tmp.name) / "code_update_status.json"
+        manager.CODE_UPDATE_LAST_ATTEMPT_FILE = Path(self._tmp.name) / "code_update_last_attempt.json"
+        manager.is_connecting = False
+        manager.full_sweep_running = False
+
+    def tearDown(self) -> None:
+        manager.is_connecting = self._saved_is_connecting
+        manager.full_sweep_running = self._saved_full_sweep
+        manager.DATA_DIR = self._saved_data_dir
+        manager.CODE_UPDATE_STATUS_FILE = self._saved_status_file
+        manager.CODE_UPDATE_LAST_ATTEMPT_FILE = self._saved_last_attempt_file
+        if manager.maintenance_lock.locked():
+            manager.maintenance_lock.release()
+        self._tmp.cleanup()
+
+    def _log_text(self) -> str:
+        logs_dir = Path(self._tmp.name) / "logs"
+        if not logs_dir.exists():
+            return ""
+        text = ""
+        for log_file in logs_dir.glob("*.json"):
+            text += log_file.read_text(encoding="utf-8")
+        return text
+
+    def test_rejected_attempt_writes_log_and_last_attempt(self) -> None:
+        reason = "已有面板更新正在进行中，请稍后查看更新状态"
+        manager.record_code_update_rejected(reason, "1.2.2")
+        last = manager.read_code_update_last_attempt()
+        self.assertIsNotNone(last)
+        self.assertEqual("not_started", last["result"])
+        self.assertEqual(reason, last["reason"])
+        self.assertFalse(manager.CODE_UPDATE_STATUS_FILE.exists())
+        log_text = self._log_text()
+        self.assertIn("CodeUpdate", log_text)
+        self.assertIn(reason, log_text)
+
+    def test_rejected_attempt_never_overwrites_running_status(self) -> None:
+        manager.write_code_update_status(
+            "running", "fetch", "正在拉取 main 分支…", "1.2.2", ""
+        )
+        manager.record_code_update_rejected("节点维护任务正在运行，请稍后再试更新", "1.2.2")
+        status = manager.read_code_update_status()
+        self.assertEqual("running", status["result"])
+        self.assertEqual("fetch", status["stage"])
+        self.assertEqual(
+            "节点维护任务正在运行，请稍后再试更新",
+            status["last_attempt"]["reason"],
+        )
+
+    def test_spawn_failure_logs_method_and_detail(self) -> None:
+        manager.record_code_update_spawn_failure(
+            "none", "systemd-run：返回码 1；setsid：权限不足", "1.2.2"
+        )
+        status = manager.read_code_update_status()
+        self.assertEqual("failed", status["result"])
+        self.assertEqual("无法启动更新器进程", status["error"])
+        self.assertTrue(status["needs_terminal"])
+        log_text = self._log_text()
+        self.assertIn("CodeUpdate", log_text)
+        self.assertIn("systemd-run", log_text)
+        self.assertIn("setsid", log_text)
+
+    def test_successful_start_clears_last_attempt(self) -> None:
+        manager.record_code_update_rejected("请先在确认框中确认更新", "1.2.2")
+        self.assertIsNotNone(manager.read_code_update_last_attempt())
+        manager.clear_code_update_last_attempt()
+        self.assertIsNone(manager.read_code_update_last_attempt())
+
+    def test_spawn_detailed_reports_method(self) -> None:
+        with (
+            mock.patch.object(
+                manager.subprocess, "run",
+                return_value=mock.Mock(returncode=0),
+            ),
+            mock.patch.object(manager.subprocess, "Popen") as popen_mock,
+        ):
+            ok, method, detail = manager.spawn_code_updater_detailed()
+        self.assertTrue(ok)
+        self.assertEqual("systemd-run", method)
+        self.assertEqual("", detail)
+        popen_mock.assert_not_called()
+
+        with (
+            mock.patch.object(
+                manager.subprocess, "run",
+                return_value=mock.Mock(returncode=1),
+            ),
+            mock.patch.object(manager.subprocess, "Popen") as popen_mock,
+        ):
+            ok, method, detail = manager.spawn_code_updater_detailed()
+        self.assertTrue(ok)
+        self.assertEqual("setsid", method)
+        popen_mock.assert_called_once()
+
+        with (
+            mock.patch.object(
+                manager.subprocess, "run", side_effect=OSError("no systemd-run")
+            ),
+            mock.patch.object(
+                manager.subprocess, "Popen", side_effect=OSError("no permission")
+            ),
+        ):
+            ok, method, detail = manager.spawn_code_updater_detailed()
+        self.assertFalse(ok)
+        self.assertEqual("none", method)
+        self.assertIn("systemd-run", detail)
+        self.assertIn("setsid", detail)
+
+    def test_frontend_poll_timeout_cancel_restore_markers(self) -> None:
+        html = manager.INDEX_HTML
+        self.assertIn("600000", html)
+        self.assertIn("查看更新状态", html)
+        self.assertIn("aimili_code_update_cancelled", html)
+        self.assertIn("restoreCodeUpdateStatus", html)
+        self.assertIn("上次已取消更新", html)
+        self.assertNotIn("120000", html)
+        self.assertNotIn("正在刷新页面以确认新版本", html)
+
+class CodeUpdateWriteFailureTests(unittest.TestCase):
+    """1.2.2 write-failure observability: a failed code-update write is
+    never silent again. Status/log/last-attempt files are repointed to
+    a per-test temp dir, and write_json is only ever faked to raise
+    OSError (never to silently succeed), so no test touches real data."""
+
+    def setUp(self) -> None:
+        self._saved_data_dir = manager.DATA_DIR
+        self._saved_status_file = manager.CODE_UPDATE_STATUS_FILE
+        self._saved_log_file = manager.CODE_UPDATE_LOG_FILE
+        self._saved_last_attempt_file = manager.CODE_UPDATE_LAST_ATTEMPT_FILE
+        self._saved_deployment = manager.DEPLOYMENT_MODE
+        self._tmp = tempfile.TemporaryDirectory()
+        manager.DATA_DIR = Path(self._tmp.name)
+        manager.CODE_UPDATE_STATUS_FILE = Path(self._tmp.name) / "code_update_status.json"
+        manager.CODE_UPDATE_LOG_FILE = Path(self._tmp.name) / "code_update.log"
+        manager.CODE_UPDATE_LAST_ATTEMPT_FILE = Path(self._tmp.name) / "code_update_last_attempt.json"
+        manager.DEPLOYMENT_MODE = "source"
+
+    def tearDown(self) -> None:
+        manager.DATA_DIR = self._saved_data_dir
+        manager.CODE_UPDATE_STATUS_FILE = self._saved_status_file
+        manager.CODE_UPDATE_LOG_FILE = self._saved_log_file
+        manager.CODE_UPDATE_LAST_ATTEMPT_FILE = self._saved_last_attempt_file
+        manager.DEPLOYMENT_MODE = self._saved_deployment
+        self._tmp.cleanup()
+
+    def _log_text(self) -> str:
+        logs_dir = Path(self._tmp.name) / "logs"
+        if not logs_dir.exists():
+            return ""
+        text = ""
+        for log_file in logs_dir.glob("*.json"):
+            text += log_file.read_text(encoding="utf-8")
+        return text
+
+    def _make_install_dir(self, version: str = "1.1.0") -> Path:
+        install_dir = Path(self._tmp.name) / "install"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        (install_dir / ".git").mkdir(exist_ok=True)
+        (install_dir / "VERSION").write_text(version + "\n", encoding="utf-8")
+        return install_dir
+
+    def _fake_result(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
+        return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_append_log_returns_bool_and_reports_failure_to_stderr(self) -> None:
+        self.assertTrue(manager._code_update_append_log("hello"))
+        self.assertIn("hello", manager.CODE_UPDATE_LOG_FILE.read_text(encoding="utf-8"))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch("builtins.open", side_effect=OSError("read-only (test)")):
+                self.assertFalse(manager._code_update_append_log("lost"))
+        self.assertIn("code_update.log", err.getvalue())
+        self.assertIn("read-only (test)", err.getvalue())
+
+    def test_status_write_reports_failure_and_keeps_entry_shape(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(
+                manager, "write_json", side_effect=OSError("disk full (test)")
+            ):
+                entry = manager.write_code_update_status(
+                    "running", "fetch", "正在拉取 main 分支…", "1.2.2", ""
+                )
+        self.assertFalse(entry["status_ok"])
+        self.assertTrue(entry["log_ok"])
+        self.assertFalse(entry["write_ok"])
+        self.assertEqual("running", entry["result"])
+        self.assertEqual("fetch", entry["stage"])
+        self.assertIn("code_update_status.json", err.getvalue())
+        self.assertIn("disk full (test)", err.getvalue())
+        self.assertIn("写入更新状态失败", self._log_text())
+
+    def test_status_write_success_flags_and_file_content_unchanged(self) -> None:
+        entry = manager.write_code_update_status(
+            "running", "fetch", "正在拉取 main 分支…", "1.2.2", ""
+        )
+        self.assertTrue(entry["status_ok"])
+        self.assertTrue(entry["log_ok"])
+        self.assertTrue(entry["write_ok"])
+        status = manager.read_code_update_status()
+        self.assertEqual("running", status["result"])
+        self.assertEqual("fetch", status["stage"])
+
+    def test_last_attempt_write_reports_failure_to_stderr(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(
+                manager, "write_json", side_effect=OSError("disk full (test)")
+            ):
+                entry = manager.write_code_update_last_attempt(
+                    "not_started", "测试原因", "1.2.2"
+                )
+        self.assertFalse(entry["write_ok"])
+        self.assertIn("code_update_last_attempt.json", err.getvalue())
+        self.assertIn("disk full (test)", err.getvalue())
+        self.assertTrue(
+            manager.write_code_update_last_attempt("not_started", "测试原因", "1.2.2")["write_ok"]
+        )
+
+    def test_clear_last_attempt_missing_is_ok_and_failure_reports(self) -> None:
+        self.assertTrue(manager.clear_code_update_last_attempt())
+        manager.write_code_update_last_attempt("not_started", "测试原因", "1.2.2")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(
+                Path, "unlink", side_effect=OSError("perm (test)")
+            ):
+                self.assertFalse(manager.clear_code_update_last_attempt())
+        self.assertIn("code_update_last_attempt.json", err.getvalue())
+        self.assertIn("perm (test)", err.getvalue())
+
+    def test_start_refuses_to_spawn_when_initial_status_write_fails(self) -> None:
+        with mock.patch.object(
+            manager,
+            "write_code_update_status",
+            return_value={"status_ok": False, "log_ok": False, "write_ok": False},
+        ):
+            spawn_mock = mock.Mock()
+            with mock.patch.object(manager, "spawn_code_updater_detailed", spawn_mock):
+                started, error = manager.start_code_update_updater("1.2.2")
+        self.assertFalse(started)
+        self.assertIn("无法写入更新状态文件", error)
+        spawn_mock.assert_not_called()
+        last = manager.read_code_update_last_attempt()
+        self.assertIsNotNone(last)
+        self.assertEqual("not_started", last["result"])
+        self.assertIn("无法写入更新状态文件", last["reason"])
+
+    def test_start_success_and_spawn_failure_paths_unchanged(self) -> None:
+        manager.record_code_update_rejected("请先在确认框中确认更新", "1.2.2")
+        with mock.patch.object(
+            manager, "spawn_code_updater_detailed", return_value=(True, "systemd-run", "")
+        ):
+            started, error = manager.start_code_update_updater("1.2.2")
+        self.assertTrue(started)
+        self.assertEqual("", error)
+        self.assertIsNone(manager.read_code_update_last_attempt())
+        status = manager.read_code_update_status()
+        self.assertEqual("running", status["result"])
+        self.assertEqual("starting", status["stage"])
+        with mock.patch.object(
+            manager, "spawn_code_updater_detailed", return_value=(False, "none", "boom")
+        ):
+            started, error = manager.start_code_update_updater("1.2.2")
+        self.assertFalse(started)
+        self.assertEqual("无法启动更新器进程", error)
+        status = manager.read_code_update_status()
+        self.assertEqual("failed", status["result"])
+        self.assertEqual("无法启动更新器进程", status["error"])
+
+    def test_worker_pre_overwrite_status_write_failure_aborts(self) -> None:
+        install_dir = self._make_install_dir("1.1.0")
+        calls: list = []
+        original_write_json = manager.write_json
+        state = {"status_calls": 0}
+
+        def failing_write_json(path, data):
+            if Path(path) == manager.CODE_UPDATE_STATUS_FILE:
+                state["status_calls"] += 1
+                if state["status_calls"] == 1:
+                    raise OSError("disk full (test)")
+            return original_write_json(path, data)
+
+        def fake(cmd, cwd, timeout, env=None):
+            calls.append(list(cmd))
+            return self._fake_result(0)
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(manager, "write_json", side_effect=failing_write_json):
+                result = manager.run_code_update_worker(
+                    install_dir=install_dir, runner=fake, panel_healthy=lambda h, p, t: True
+                )
+        self.assertFalse(result)
+        self.assertEqual([], calls)
+        status = manager.read_code_update_status()
+        self.assertEqual("failed", status["result"])
+        self.assertEqual("fetch", status["stage"])
+        self.assertIn("无法写入更新状态文件", status["error"])
+        self.assertIn("code_update_status.json", err.getvalue())
+        self.assertIn("disk full (test)", err.getvalue())
+        self.assertIn("写入更新状态失败", self._log_text())
+
+    def test_worker_post_overwrite_status_write_failure_rolls_back(self) -> None:
+        install_dir = self._make_install_dir("1.1.0")
+        calls: list = []
+        original_write_json = manager.write_json
+        state = {"status_calls": 0}
+
+        def failing_write_json(path, data):
+            if Path(path) == manager.CODE_UPDATE_STATUS_FILE:
+                state["status_calls"] += 1
+                if state["status_calls"] == 4:
+                    raise OSError("disk full (test)")
+            return original_write_json(path, data)
+
+        def fake(cmd, cwd, timeout, env=None):
+            calls.append(list(cmd))
+            if cmd[:2] == ["git", "rev-parse"] and cmd[2] == "HEAD":
+                return self._fake_result(0, "aaa111\n")
+            if cmd[:2] == ["git", "rev-parse"]:
+                return self._fake_result(0, "bbb222\n")
+            if cmd[:3] == ["git", "worktree", "add"]:
+                tmp_path = Path(cmd[4])
+                tmp_path.mkdir(parents=True, exist_ok=True)
+                (tmp_path / "vpngate_manager.py").write_text("x = 1\n", encoding="utf-8")
+                return self._fake_result(0)
+            return self._fake_result(0)
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(manager, "write_json", side_effect=failing_write_json):
+                result = manager.run_code_update_worker(
+                    install_dir=install_dir, runner=fake, panel_healthy=lambda h, p, t: True
+                )
+        self.assertFalse(result)
+        # Status writes: 1 fetch, 2 check, 3 checkout, 4 install (failed),
+        # then the rollback path records the failed status.
+        self.assertEqual(5, state["status_calls"])
+        self.assertIn(["git", "checkout", "-B", "main", "aaa111"], calls)
+        self.assertIn(["git", "reset", "--hard", "aaa111"], calls)
+        self.assertEqual(1, calls.count(["bash", "install.sh"]))
+        status = manager.read_code_update_status()
+        self.assertEqual("failed", status["result"])
+        self.assertEqual("install", status["stage"])
+        self.assertIn("无法写入更新状态文件", status["error"])
+        self.assertIn("已回滚", status["error"])
+        self.assertIn("code_update_status.json", err.getvalue())
+        self.assertIn("已回滚", self._log_text())
