@@ -175,7 +175,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.2.0"
+DEFAULT_APP_VERSION = "1.2.1"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -950,9 +950,9 @@ def check_latest_release() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Panel one-click code update (1.2.0).
+# Panel one-click code update.
 #
-# Design notes (see 1.2.0 plan):
+# Design notes (see one-click update plan):
 # - The panel only checks (check_latest_release) today; installing from the
 #   panel is new. The terminal `ml update` flow is interactive (input()
 #   prompts, no non-interactive mode), so the panel must NOT call it: with
@@ -1175,7 +1175,7 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
             return fail("restarting", "重启容器失败", cmd_tail(upped) or "docker compose up 失败", needs_terminal=True)
         # If compose recreates this container, this process dies here and
         # the status stays "restarting"; the panel then recovers via page
-        # reload + check_update showing the new version (see 1.2.0 plan).
+        # reload + check_update showing the new version (see one-click update plan).
         host, port = _code_update_ui_host_port()
         if healthy(host, port, CODE_UPDATE_PANEL_HEALTH_TIMEOUT_SECONDS):
             write_code_update_status(
@@ -2469,6 +2469,35 @@ def full_sweep_priority(node: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
     return False
 
 
+def retention_eligible(node: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
+    """Whether a disappeared node may enter the retained (observing) pool (1.2.1).
+
+    Only the proxy-settings selection gates retention; everything else keeps
+    the Phase 1 behaviour (all missing non-favorite nodes retained):
+    - fixed_region with a country set: only country-matching nodes;
+    - fixed_ip with a node id set: only that node;
+    - fixed_region/fixed_ip with an empty selection, auto, favorites: all.
+    This is purely selection-based: favorites never reach this check (the
+    refresh merge exempts them before it), and the 14-day observing grace
+    still applies to every node that does enter the pool. Do not reuse
+    full_sweep_priority here: it returns False for every node in auto mode
+    because auto has no priority group, which is a priority, not a
+    retention qualification.
+    """
+    routing_mode = ui_cfg.get("routing_mode", "auto")
+    if routing_mode == "fixed_region":
+        target_country = str(ui_cfg.get("force_country", "") or "").strip()
+        if not target_country:
+            return True
+        return country_matches(node.get("country"), target_country, node.get("country_short"))
+    if routing_mode == "fixed_ip":
+        fixed_id = str(ui_cfg.get("fixed_node_id") or "").strip()
+        if not fixed_id:
+            return True
+        return str(node.get("id")) == fixed_id
+    return True
+
+
 def full_sweep_order(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(
         nodes,
@@ -3253,7 +3282,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         # Phase 1 retention: favorites are loaded before the merge so the
         # disappeared-node handling below can exempt them (plan §三.3).
+        # 1.2.1 retention filter: the current proxy-settings selection is
+        # loaded alongside so the merge can decide which missing nodes are
+        # eligible for the observing pool.
         fav_ids = set(load_ui_config().get("favorite_node_ids", []))
+        retention_ui_cfg = load_ui_config()
 
         with lock:
             current_nodes = read_nodes()
@@ -3313,6 +3346,13 @@ def maintain_valid_nodes(force: bool = False) -> str:
             # deleted for disappearing; other missing nodes enter the
             # observing state and keep being probed; only nodes whose
             # 14-day grace period has expired are archived + deleted.
+            # 1.2.1 retention filter: after the favorite exemption, a
+            # missing node that does not match the current proxy-settings
+            # selection is archived + deleted at once instead of entering
+            # the pool. The check runs on every refresh for every missing
+            # node, so an already-observing node that stops matching after
+            # a selection change is purged on the next refresh rather
+            # than waiting out its grace period.
             for old in current_nodes:
                 oid = str(old.get("id") or "")
                 if not oid or oid in seen_ids:
@@ -3322,6 +3362,9 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     old["source_present"] = 0
                     merged.append(old)
                     seen_ids.add(oid)
+                    continue
+                if not retention_eligible(old, retention_ui_cfg):
+                    archive_retained_node(old, "retention-filter-non-matching")
                     continue
                 last_seen = float(old.get("last_seen_at") or old.get("fetched_at") or now)
                 if old.get("retention_status") == "observing" and now - last_seen > RETAINED_OBSERVING_GRACE_SECONDS:
@@ -5025,12 +5068,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.2.0 正式版</span>
+        <span id="github_version_label">V1.2.1 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.2.0 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.2.1 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
@@ -5042,7 +5085,6 @@ INDEX_HTML = r"""<!doctype html>
           一键更新
         </button>
         <a href="https://github.com/liulangdegezi/aimili-vpngate-plus/tree/main" target="_blank" rel="noopener noreferrer">GitHub main 主分支</a>
-        <a id="latest_release_link" href="https://github.com/liulangdegezi/aimili-vpngate-plus/releases/latest" target="_blank" rel="noopener noreferrer">下载最新正式版</a>
         <a href="https://github.com/liulangdegezi/aimili-vpngate-plus/blob/main/CHANGELOG.md" target="_blank" rel="noopener noreferrer">版本升级日志</a>
         <div id="update_check_status" class="update-check-status" role="status" aria-live="polite">点击“检测更新”查询 GitHub 最新正式版。</div>
       </div>
@@ -5874,7 +5916,7 @@ function stableSortNodes() {
 }
 
 function render(){
-  const versionLabel = state.app_version_label || "V1.2.0 正式版";
+  const versionLabel = state.app_version_label || "V1.2.1 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -6457,7 +6499,6 @@ async function checkForUpdate(event) {
   if (event) event.stopPropagation();
   const button = $("check_update_btn");
   const statusBox = $("update_check_status");
-  const releaseLink = $("latest_release_link");
   if (!button || !statusBox) return;
 
   button.disabled = true;
@@ -6472,10 +6513,8 @@ async function checkForUpdate(event) {
     if (result.no_release) {
       statusBox.className = "update-check-status current";
       statusBox.textContent = `仓库尚未发布正式版，当前 ${result.current_version_label} 可正常使用。`;
-      if (releaseLink && result.release_url) releaseLink.href = result.release_url;
       return;
     }
-    if (releaseLink && result.release_url) releaseLink.href = result.release_url;
     if (result.update_available) {
       statusBox.className = "update-check-status available";
       if (result.deployment_mode === "docker") {
@@ -7885,7 +7924,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if effective_path == "/api/update_code":
-            # Panel one-click update (1.2.0). Auth is the shared do_POST
+            # Panel one-click update. Auth is the shared do_POST
             # session check above; no new auth mechanism. Only the
             # `confirmed` flag is read from the body -- nothing else from
             # the request is ever used as a command or argument.
