@@ -840,12 +840,15 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.2.0", manager.APP_VERSION)
-        self.assertEqual("V1.2.0 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.2.1", manager.APP_VERSION)
+        self.assertEqual("V1.2.1 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
-        self.assertIn("/releases/latest", manager.INDEX_HTML)
+        self.assertNotIn("/releases/latest", manager.INDEX_HTML)
+        self.assertNotIn('id="latest_release_link"', manager.INDEX_HTML)
+        self.assertNotIn("下载最新正式版", manager.INDEX_HTML)
+        self.assertNotIn("releaseLink", manager.INDEX_HTML)
         self.assertNotIn("/tree/bate", manager.INDEX_HTML)
         self.assertNotIn(">测试版<", manager.INDEX_HTML)
         self.assertIn('id="deployment_mode_label"', manager.INDEX_HTML)
@@ -913,8 +916,8 @@ class ManagerLogicTests(unittest.TestCase):
 
     def test_latest_release_check_reports_current_formal_version(self) -> None:
         release = {
-            "tag_name": "v1.2.0",
-            "name": "AimiliVPN V1.2.0 正式版",
+            "tag_name": "v1.2.1",
+            "name": "AimiliVPN V1.2.1 正式版",
             "draft": False,
             "prerelease": False,
         }
@@ -922,7 +925,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.2.0 正式版", result["current_version_label"])
+        self.assertEqual("V1.2.1 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -941,7 +944,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.2.0", result["current_version"])
+        self.assertEqual("1.2.1", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1257,7 +1260,7 @@ if __name__ == "__main__":
 
 
 class CodeUpdateTests(unittest.TestCase):
-    """Panel one-click code update (1.2.0). All worker tests use fake
+    """Panel one-click code update. All worker tests use fake
     command runners, so no real git checkout, install, or restart ever runs
     under test; the fake install dir is a temp dir, never the repo."""
 
@@ -1456,18 +1459,96 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_2_0(self) -> None:
-        self.assertEqual("1.2.0", manager.APP_VERSION)
-        self.assertEqual("V1.2.0 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.2.0 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_2_1(self) -> None:
+        self.assertEqual("1.2.1", manager.APP_VERSION)
+        self.assertEqual("V1.2.1 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.2.1 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.2.0"', install_text)
-        self.assertNotIn('"1.1.0"', install_text)
+        self.assertIn('"1.2.1"', install_text)
+        self.assertNotIn('"1.2.0"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.2.0", compose_text)
-        self.assertNotIn("1.1.0", compose_text)
+        self.assertIn(":1.2.1", compose_text)
+        self.assertNotIn("1.2.0", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.2.0", version_text)
+        self.assertEqual("1.2.1", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn("## V1.2.0", changelog)
+        self.assertIn("## V1.2.1", changelog)
+        self.assertIn("## V1.2.0（2026-10-26，已发布正式版 v1.2.0）", changelog)
         self.assertIn("## V1.1.0（2026-10-26，已发布正式版 v1.1.0）", changelog)
+
+
+class RetentionEligibilityTests(unittest.TestCase):
+    """Retained-pool selection filter (1.2.1).
+
+    retention_eligible answers only "does this disappeared node match the
+    current proxy-settings selection". It deliberately does NOT exempt
+    favorites: the refresh merge exempts favorites before calling it, so a
+    favorited node of a non-matching country still answers False here and
+    is kept only by the merge's earlier favorite branch.
+    """
+
+    def test_fixed_region_matches_by_country_name(self) -> None:
+        node = {"id": "uk1", "country": "United Kingdom", "country_short": "GB"}
+        cfg = {"routing_mode": "fixed_region", "force_country": "United Kingdom"}
+        self.assertTrue(manager.retention_eligible(node, cfg))
+
+    def test_fixed_region_matches_by_country_short_code(self) -> None:
+        node = {"id": "uk1", "country": "United Kingdom", "country_short": "GB"}
+        cfg = {"routing_mode": "fixed_region", "force_country": "GB"}
+        self.assertTrue(manager.retention_eligible(node, cfg))
+
+    def test_fixed_region_non_matching_is_ineligible(self) -> None:
+        node = {"id": "de1", "country": "Germany", "country_short": "DE"}
+        cfg = {"routing_mode": "fixed_region", "force_country": "United Kingdom"}
+        self.assertFalse(manager.retention_eligible(node, cfg))
+
+    def test_fixed_region_empty_country_retains_all(self) -> None:
+        node = {"id": "de1", "country": "Germany", "country_short": "DE"}
+        cfg = {"routing_mode": "fixed_region", "force_country": ""}
+        self.assertTrue(manager.retention_eligible(node, cfg))
+
+    def test_fixed_ip_only_the_fixed_node_is_eligible(self) -> None:
+        cfg = {"routing_mode": "fixed_ip", "fixed_node_id": "fixed1"}
+        self.assertTrue(manager.retention_eligible({"id": "fixed1"}, cfg))
+        self.assertFalse(manager.retention_eligible({"id": "other1"}, cfg))
+
+    def test_fixed_ip_empty_id_retains_all(self) -> None:
+        cfg = {"routing_mode": "fixed_ip", "fixed_node_id": ""}
+        self.assertTrue(manager.retention_eligible({"id": "anything"}, cfg))
+
+    def test_auto_mode_retains_all(self) -> None:
+        # Auto means "no country restriction": unlike full_sweep_priority
+        # (which returns False for every node in auto mode), retention
+        # eligibility must not delete everything in auto mode.
+        node = {"id": "de1", "country": "Germany", "country_short": "DE"}
+        self.assertTrue(manager.retention_eligible(node, {"routing_mode": "auto"}))
+        self.assertTrue(manager.retention_eligible(node, {}))
+
+    def test_favorites_mode_retains_non_favorites(self) -> None:
+        node = {"id": "plain1", "country": "Germany", "country_short": "DE"}
+        cfg = {"routing_mode": "favorites", "favorite_node_ids": ["fav1"]}
+        self.assertTrue(manager.retention_eligible(node, cfg))
+
+    def test_eligibility_ignores_favorite_status_by_design(self) -> None:
+        # A favorited node of a non-matching country answers False here;
+        # the merge keeps it only because its favorite branch runs first.
+        node = {"id": "fav1", "country": "France", "country_short": "FR"}
+        cfg = {
+            "routing_mode": "fixed_region",
+            "force_country": "United Kingdom",
+            "favorite_node_ids": ["fav1"],
+        }
+        self.assertFalse(manager.retention_eligible(node, cfg))
+
+    def test_already_observing_non_matching_node_is_ineligible(self) -> None:
+        # Q3: eligibility is evaluated on every refresh, so an observing
+        # node that stops matching after a selection change is purged on
+        # the next refresh instead of waiting out its grace period.
+        node = {
+            "id": "old1",
+            "country": "Germany",
+            "country_short": "DE",
+            "retention_status": "observing",
+        }
+        cfg = {"routing_mode": "fixed_region", "force_country": "United Kingdom"}
+        self.assertFalse(manager.retention_eligible(node, cfg))
