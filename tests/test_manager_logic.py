@@ -105,6 +105,8 @@ class ManagerLogicTests(unittest.TestCase):
         manager.background_refill_thread = None
         manager.background_refill_cancel_event.clear()
         manager.active_sessions.clear()
+        manager.full_sweep_running = False
+        manager.full_sweep_cancel_requested = False
 
     def tearDown(self) -> None:
         if manager.connection_attempt_lock.locked():
@@ -838,8 +840,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.0.0", manager.APP_VERSION)
-        self.assertEqual("V1.0.0 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.1.0", manager.APP_VERSION)
+        self.assertEqual("V1.1.0 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -911,8 +913,8 @@ class ManagerLogicTests(unittest.TestCase):
 
     def test_latest_release_check_reports_current_formal_version(self) -> None:
         release = {
-            "tag_name": "v1.0.0",
-            "name": "AimiliVPN V1.0.0 正式版",
+            "tag_name": "v1.1.0",
+            "name": "AimiliVPN V1.1.0 正式版",
             "draft": False,
             "prerelease": False,
         }
@@ -920,7 +922,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.0.0 正式版", result["current_version_label"])
+        self.assertEqual("V1.1.0 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -939,7 +941,111 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.0.0", result["current_version"])
+        self.assertEqual("1.1.0", result["current_version"])
+
+    def test_full_sweep_order_fixed_ip_first(self) -> None:
+        nodes = [
+            {"id": "other", "latency_ms": 10, "ping": 10},
+            {"id": "fixed", "latency_ms": 500, "ping": 500},
+            {"id": "other2", "latency_ms": 20, "ping": 20},
+        ]
+        ui_cfg = {"routing_mode": "fixed_ip", "fixed_node_id": "fixed"}
+        ordered = manager.full_sweep_order(nodes, ui_cfg)
+        self.assertEqual(["fixed", "other", "other2"], [n["id"] for n in ordered])
+
+    def test_full_sweep_order_fixed_region_first(self) -> None:
+        nodes = [
+            {"id": "us", "country": "United States", "country_short": "US", "latency_ms": 500, "ping": 500},
+            {"id": "de", "country": "Germany", "country_short": "DE", "latency_ms": 10, "ping": 10},
+            {"id": "jp", "country": "Japan", "country_short": "JP", "latency_ms": 20, "ping": 20},
+        ]
+        ui_cfg = {"routing_mode": "fixed_region", "force_country": "US"}
+        ordered = manager.full_sweep_order(nodes, ui_cfg)
+        self.assertEqual(["us", "de", "jp"], [n["id"] for n in ordered])
+
+    def test_full_sweep_order_favorites_first(self) -> None:
+        nodes = [
+            {"id": "fav", "latency_ms": 500, "ping": 500},
+            {"id": "plain", "latency_ms": 10, "ping": 10},
+        ]
+        ui_cfg = {"routing_mode": "favorites", "favorite_node_ids": ["fav"]}
+        ordered = manager.full_sweep_order(nodes, ui_cfg)
+        self.assertEqual(["fav", "plain"], [n["id"] for n in ordered])
+
+    def test_full_sweep_order_others_by_latency_unknown_last(self) -> None:
+        nodes = [
+            {"id": "medium", "latency_ms": 200, "ping": 10},
+            {"id": "unknown", "latency_ms": 0, "ping": 0},
+            {"id": "fast", "latency_ms": 50, "ping": 999},
+            {"id": "ping_only", "latency_ms": 0, "ping": 300},
+        ]
+        ordered = manager.full_sweep_order(nodes, {"routing_mode": "auto"})
+        self.assertEqual(["fast", "medium", "ping_only", "unknown"], [n["id"] for n in ordered])
+
+    def test_full_sweep_calls_test_multiple_without_early_stop_and_excludes_active(self) -> None:
+        nodes = [
+            {"id": "active", "ip": "192.0.2.1", "remote_host": "192.0.2.1", "latency_ms": 5, "ping": 5, "active": True},
+            {"id": "slow", "ip": "192.0.2.2", "remote_host": "192.0.2.2", "latency_ms": 300, "ping": 300},
+            {"id": "quick", "ip": "192.0.2.3", "remote_host": "192.0.2.3", "latency_ms": 10, "ping": 10},
+        ]
+        manager.write_json(manager.NODES_FILE, nodes)
+        captured = {}
+        def fake_test_multiple(ids, target_available=None, stop_requested=None):
+            captured["ids"] = list(ids)
+            captured["target_available"] = target_available
+            captured["stop_requested"] = stop_requested
+            return [
+                {"id": "quick", "probe_status": "available"},
+                {"id": "slow", "probe_status": "unavailable"},
+            ]
+        with (
+            mock.patch.object(manager, "load_ui_config", return_value={"routing_mode": "auto"}),
+            mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test_multiple),
+            mock.patch.object(manager, "set_state"),
+        ):
+            result = manager.run_full_sweep()
+        self.assertEqual(["quick", "slow"], captured["ids"])
+        self.assertIsNone(captured["target_available"])
+        self.assertIsNotNone(captured["stop_requested"])
+        self.assertFalse(manager.full_sweep_running)
+        self.assertEqual(2, result["tested"])
+        self.assertEqual(1, result["available"])
+        self.assertEqual(1, result["unavailable"])
+        self.assertFalse(result["interrupted"])
+        stop = captured["stop_requested"]
+        self.assertFalse(stop())
+        manager.full_sweep_cancel_requested = True
+        try:
+            self.assertTrue(stop())
+        finally:
+            manager.full_sweep_cancel_requested = False
+
+    def test_test_multiple_nodes_stops_between_batches_on_connect_request(self) -> None:
+        nodes = self.write_nodes(12)
+        calls = []
+        def fake_openvpn(config_file, **kwargs):
+            calls.append(config_file)
+            return True, "ready", None
+        state = {"n": 0}
+        def stop_requested():
+            state["n"] += 1
+            return state["n"] >= 2
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+            mock.patch.object(manager, "NODE_PROBE_WORKERS", 5),
+        ):
+            results = manager.test_multiple_nodes(
+                [node["id"] for node in nodes],
+                target_available=None,
+                stop_requested=stop_requested,
+            )
+        self.assertEqual(5, len(calls))
+        self.assertEqual(5, len(results))
+        stored = manager.read_nodes()
+        self.assertEqual(5, sum(node.get("probe_status") == "available" for node in stored))
+        self.assertEqual(7, sum(node.get("probe_status") == "not_checked" for node in stored))
 
     def test_latest_release_check_reports_source_update_command(self) -> None:
         release = {"tag_name": "v2.2.0", "draft": False, "prerelease": False}
