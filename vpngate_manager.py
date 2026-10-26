@@ -5,14 +5,17 @@ import base64
 import csv
 import json
 import os
+import py_compile
 import queue
 import re
 import secrets
 import select
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -172,7 +175,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.1.0"
+DEFAULT_APP_VERSION = "1.2.0"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -200,7 +203,7 @@ WEB_LOG_MAX_ENTRIES = 500
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
-# Full-sweep (1.1.0) cancel flags. Written by the /api/connect handler when
+# Full-sweep cancel flags. Written by the /api/connect handler when
 # the user asks to connect while a sweep runs; read between batches by
 # test_multiple_nodes via stop_requested. Plain bool assignments are atomic.
 full_sweep_running = False
@@ -944,6 +947,420 @@ def check_latest_release() -> dict[str, Any]:
         "deployment_mode_label": DEPLOYMENT_MODE_LABEL,
         "update_command": UPDATE_COMMAND,
     }
+
+
+# ---------------------------------------------------------------------------
+# Panel one-click code update (1.2.0).
+#
+# Design notes (see 1.2.0 plan):
+# - The panel only checks (check_latest_release) today; installing from the
+#   panel is new. The terminal `ml update` flow is interactive (input()
+#   prompts, no non-interactive mode), so the panel must NOT call it: with
+#   no TTY its prompts fail, and piping "y" would force-reinstall when
+#   already latest. The updater below re-implements the terminal steps
+#   non-interactively; the panel confirmation dialog IS the confirmation.
+# - The updater runs as a separate process, never as a panel thread: the
+#   install step restarts the panel service, which kills the panel process
+#   itself. spawn_code_updater() prefers a systemd transient scope so the
+#   updater survives the service restart (a plain setsid child stays in the
+#   service cgroup and is killed by `systemctl restart` under the default
+#   KillMode=control-group); it falls back to a setsid child when
+#   systemd-run is unavailable. The updater writes its own status/log files
+#   under DATA_DIR, so a restarted panel process can still read the result.
+# - The updater only ever runs FIXED commands (fixed branch, fixed repo
+#   remote, fixed file names). Nothing from a panel request body is ever
+#   used as a command, argument, or shell string.
+# - Safety order (Q4): fetch + compare, then syntax-check the new code in a
+#   temporary git worktree, and only then touch the live checkout. A
+#   pre-checkout failure leaves the running service untouched. A
+#   post-checkout failure attempts a rollback to the recorded pre-update
+#   commit (checkout + reset + reinstall + restart); if that also fails the
+#   status says terminal recovery is needed instead of hiding the failure.
+# - Docker branch: same status-file mechanism, fixed `docker compose pull`
+#   + `docker compose up -d` commands. Live Docker updating additionally
+#   needs a published image and docker access from the panel container;
+#   the fork publishes no image (source install only), so the Docker branch
+#   is structural and branch-tested only, not live-verified.
+# - Scoring gate stays OFF: this updater never touches node selection,
+#   switching, or any iplark scoring state.
+CODE_UPDATE_STATUS_FILE = DATA_DIR / "code_update_status.json"
+CODE_UPDATE_LOG_FILE = DATA_DIR / "code_update.log"
+CODE_UPDATE_BRANCH = "main"
+CODE_UPDATE_STALE_SECONDS = 1800
+CODE_UPDATE_PANEL_HEALTH_TIMEOUT_SECONDS = 150
+CODE_UPDATE_CHECK_FILES = (
+    "vpngate_manager.py",
+    "proxy_server.py",
+    "snapshot_utils.py",
+    "vpn_utils.py",
+)
+code_update_lock = threading.Lock()
+
+
+def _code_update_append_log(line: str) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CODE_UPDATE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} {line}\n")
+    except OSError:
+        pass
+
+
+def write_code_update_status(
+    result: str,
+    stage: str,
+    message: str,
+    current_version: str,
+    target_version: str,
+    error: str = "",
+    needs_terminal: bool = False,
+) -> dict[str, Any]:
+    with lock:
+        previous = read_json(CODE_UPDATE_STATUS_FILE, None)
+        log_tail = list(previous.get("log_tail", [])) if isinstance(previous, dict) else []
+        entry_line = message if not error else f"{message}：{error}"
+        log_tail.append(entry_line)
+        log_tail = log_tail[-50:]
+        entry = {
+            "result": result,
+            "stage": stage,
+            "message": message,
+            "log_tail": log_tail,
+            "current_version": current_version,
+            "target_version": target_version,
+            "error": error,
+            "needs_terminal": bool(needs_terminal),
+            "updated_at": time.time(),
+            "deployment_mode": DEPLOYMENT_MODE,
+            "update_command": UPDATE_COMMAND,
+        }
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            write_json(CODE_UPDATE_STATUS_FILE, entry)
+        except OSError:
+            pass
+        _code_update_append_log(f"[{stage}] {entry_line}")
+        return entry
+
+
+def read_code_update_status() -> dict[str, Any]:
+    data = read_json(CODE_UPDATE_STATUS_FILE, None)
+    if not isinstance(data, dict):
+        data = {}
+    try:
+        updated_at = float(data.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    result = str(data.get("result") or "idle")
+    stale = (
+        result == "running"
+        and updated_at > 0
+        and (time.time() - updated_at) > CODE_UPDATE_STALE_SECONDS
+    )
+    return {
+        "result": result,
+        "stage": str(data.get("stage") or ""),
+        "message": str(data.get("message") or ("尚未执行面板更新" if result == "idle" else "")),
+        "log_tail": list(data.get("log_tail", [])) if isinstance(data.get("log_tail"), list) else [],
+        "current_version": str(data.get("current_version") or APP_VERSION),
+        "target_version": str(data.get("target_version") or ""),
+        "error": str(data.get("error") or ""),
+        "needs_terminal": bool(data.get("needs_terminal", False)),
+        "updated_at": updated_at,
+        "stale": stale,
+        "deployment_mode": DEPLOYMENT_MODE,
+        "update_command": UPDATE_COMMAND,
+    }
+
+
+def code_update_busy_reason() -> str | None:
+    status = read_code_update_status()
+    if status["result"] == "running" and not status["stale"]:
+        return "已有面板更新正在进行中，请稍后查看更新状态"
+    if maintenance_lock.locked():
+        return "节点维护任务正在运行，请稍后再试更新"
+    if is_connecting:
+        return "正在连接节点，请稍后再试更新"
+    if full_sweep_running:
+        return "正在全量检测节点，请稍后再试更新"
+    return None
+
+
+def _code_update_default_runner(cmd, cwd, timeout, env=None):
+    return subprocess.run(
+        cmd, cwd=str(cwd), timeout=timeout, env=env, capture_output=True, text=True
+    )
+
+
+def _code_update_panel_healthy(host: str, port: int, timeout: int) -> bool:
+    deadline = time.time() + timeout
+    hosts = ["127.0.0.1", "::1"] if host in ("::", "0.0.0.0", "") else [host]
+    while time.time() < deadline:
+        for candidate in hosts:
+            try:
+                family = socket.AF_INET6 if ":" in candidate else socket.AF_INET
+                with socket.socket(family, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(2)
+                    sock.connect((candidate, port))
+                    return True
+            except OSError:
+                continue
+        time.sleep(2)
+    return False
+
+
+def _code_update_read_version(install_dir: Path) -> str:
+    try:
+        text = (Path(install_dir) / "VERSION").read_text(encoding="utf-8").strip()
+        return text if text else APP_VERSION
+    except OSError:
+        return APP_VERSION
+
+
+def _code_update_ui_host_port() -> tuple[str, int]:
+    try:
+        ui_cfg = load_ui_config()
+        host = ui_cfg.get("host", UI_HOST)
+        port = bounded_int(ui_cfg.get("port"), UI_PORT, 1, 65535)
+    except Exception:
+        host, port = UI_HOST, UI_PORT
+    return host, port
+
+
+def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) -> bool:
+    """Detached one-click code updater (source + docker branches).
+
+    Never called from the panel process itself; the panel spawns it via
+    spawn_code_updater() as `python3 vpngate_manager.py --code-update`.
+    `runner` is a callable(cmd, cwd, timeout, env=None) returning an object
+    with returncode/stdout/stderr (tests inject fakes so no real git or
+    install step ever runs under test). `panel_healthy` is a
+    callable(host, port, timeout) -> bool (tests inject it).
+    """
+    install_dir = Path(install_dir) if install_dir is not None else ROOT_DIR
+    run = runner or _code_update_default_runner
+    healthy = panel_healthy or _code_update_panel_healthy
+    current_version = _code_update_read_version(install_dir)
+
+    def fail(stage, message, error, needs_terminal=False, target_version=""):
+        write_code_update_status(
+            "failed", stage, message, current_version, target_version,
+            error=error, needs_terminal=needs_terminal,
+        )
+        log_to_json("ERROR", "CodeUpdate", f"面板更新失败[{stage}] {message}：{error}")
+        return False
+
+    def cmd_tail(result) -> str:
+        text = (((getattr(result, "stderr", "") or "") + "\n" + (getattr(result, "stdout", "") or "")).strip())
+        return text[-500:] if text else ""
+
+    if DEPLOYMENT_MODE == "docker":
+        write_code_update_status(
+            "running", "docker_pull", "正在拉取最新容器镜像…", current_version, current_version
+        )
+        try:
+            pulled = run(["docker", "compose", "pull"], install_dir, 600)
+        except Exception as exc:
+            return fail("docker_pull", "拉取容器镜像失败", str(exc))
+        if pulled.returncode != 0:
+            return fail("docker_pull", "拉取容器镜像失败", cmd_tail(pulled) or "docker compose pull 失败")
+        write_code_update_status(
+            "running", "restarting", "正在重启容器…", current_version, current_version
+        )
+        try:
+            upped = run(["docker", "compose", "up", "-d"], install_dir, 300)
+        except Exception as exc:
+            return fail("restarting", "重启容器失败", str(exc), needs_terminal=True)
+        if upped.returncode != 0:
+            return fail("restarting", "重启容器失败", cmd_tail(upped) or "docker compose up 失败", needs_terminal=True)
+        # If compose recreates this container, this process dies here and
+        # the status stays "restarting"; the panel then recovers via page
+        # reload + check_update showing the new version (see 1.2.0 plan).
+        host, port = _code_update_ui_host_port()
+        if healthy(host, port, CODE_UPDATE_PANEL_HEALTH_TIMEOUT_SECONDS):
+            write_code_update_status(
+                "success", "done", "容器更新完成，请用检测更新确认新版本",
+                current_version, current_version,
+            )
+            return True
+        return fail("done", "新面板未在规定时间内响应", "健康检查超时", needs_terminal=True, target_version=current_version)
+
+    write_code_update_status("running", "fetch", "正在拉取 main 分支…", current_version, "")
+    if not (install_dir / ".git").exists():
+        return fail("fetch", "当前安装目录不是 Git 仓库", "缺少 .git，无法通过 Git 更新", needs_terminal=True)
+    try:
+        fetched = run(["git", "fetch", "origin", CODE_UPDATE_BRANCH], install_dir, 120)
+    except Exception as exc:
+        return fail("fetch", "拉取 main 分支失败", str(exc))
+    if fetched.returncode != 0:
+        return fail("fetch", "拉取 main 分支失败", cmd_tail(fetched) or "git fetch 失败")
+    try:
+        local = run(["git", "rev-parse", "HEAD"], install_dir, 30)
+        remote = run(["git", "rev-parse", f"origin/{CODE_UPDATE_BRANCH}"], install_dir, 30)
+        local_sha = (local.stdout or "").strip()
+        remote_sha = (remote.stdout or "").strip()
+    except Exception as exc:
+        return fail("fetch", "读取提交号失败", str(exc))
+    if not local_sha or not remote_sha:
+        return fail("fetch", "读取提交号失败", "git rev-parse 未返回提交号")
+    if local_sha == remote_sha:
+        write_code_update_status(
+            "success", "done", "已是最新正式版，无需更新", current_version, current_version
+        )
+        return True
+
+    # Temp-worktree syntax check BEFORE touching the live checkout (Q4).
+    tmp_dir = None
+    try:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="aimili-code-update-"))
+        write_code_update_status(
+            "running", "check", "正在临时工作区检查新代码…", current_version, ""
+        )
+        try:
+            added = run(
+                ["git", "worktree", "add", "--detach", str(tmp_dir), f"origin/{CODE_UPDATE_BRANCH}"],
+                install_dir, 120,
+            )
+        except Exception as exc:
+            return fail("check", "临时工作区检查失败", str(exc))
+        if added.returncode != 0:
+            return fail("check", "临时工作区检查失败", cmd_tail(added) or "git worktree add 失败")
+        if not (tmp_dir / "vpngate_manager.py").exists():
+            return fail("check", "临时工作区检查失败", "新代码中缺少 vpngate_manager.py")
+        try:
+            for name in CODE_UPDATE_CHECK_FILES:
+                candidate = tmp_dir / name
+                if candidate.exists():
+                    py_compile.compile(str(candidate), doraise=True)
+            install_tmp = tmp_dir / "install.sh"
+            if install_tmp.exists():
+                checked = run(["bash", "-n", str(install_tmp)], install_dir, 30)
+                if checked.returncode != 0:
+                    return fail("check", "临时工作区检查失败", cmd_tail(checked) or "install.sh 语法检查失败")
+        except Exception as exc:
+            return fail("check", "临时工作区检查失败", f"语法检查失败：{exc}")
+    finally:
+        if tmp_dir is not None:
+            try:
+                run(["git", "worktree", "remove", "--force", str(tmp_dir)], install_dir, 60)
+            except Exception:
+                pass
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def rollback(old_sha: str) -> bool:
+        try:
+            run(["git", "checkout", "-B", CODE_UPDATE_BRANCH, old_sha], install_dir, 120)
+            run(["git", "reset", "--hard", old_sha], install_dir, 120)
+            env = dict(os.environ)
+            env["AIMILIVPN_NONINTERACTIVE"] = "1"
+            run(["bash", "install.sh"], install_dir, 600, env)
+            return True
+        except Exception:
+            return False
+
+    def fail_after_checkout(stage, message, error, target_version):
+        rolled_back = rollback(local_sha)
+        if rolled_back:
+            note = f"{error}；已回滚到更新前提交并重装重启"
+            write_code_update_status(
+                "failed", stage, message, current_version, target_version,
+                error=note, needs_terminal=False,
+            )
+        else:
+            note = f"{error}；回滚失败，请用终端 ml update 或重装恢复"
+            write_code_update_status(
+                "failed", stage, message, current_version, target_version,
+                error=note, needs_terminal=True,
+            )
+        log_to_json("ERROR", "CodeUpdate", f"面板更新失败[{stage}] {message}：{note}")
+        return False
+
+    write_code_update_status("running", "checkout", "正在切换到 main 最新代码…", current_version, "")
+    try:
+        checkout = run(
+            ["git", "checkout", "-B", CODE_UPDATE_BRANCH, f"origin/{CODE_UPDATE_BRANCH}"],
+            install_dir, 120,
+        )
+        reset = (
+            run(["git", "reset", "--hard", f"origin/{CODE_UPDATE_BRANCH}"], install_dir, 120)
+            if checkout.returncode == 0 else checkout
+        )
+    except Exception as exc:
+        return fail_after_checkout("checkout", "切换代码失败", str(exc), "")
+    if checkout.returncode != 0 or reset.returncode != 0:
+        return fail_after_checkout(
+            "checkout", "切换代码失败",
+            cmd_tail(reset) or cmd_tail(checkout) or "git checkout/reset 失败", "",
+        )
+    target_version = _code_update_read_version(install_dir)
+    try:
+        run(
+            ["find", ".", "-type", "d", "-name", "__pycache__", "-exec", "rm", "-rf", "{}", "+"],
+            install_dir, 120,
+        )
+    except Exception:
+        pass
+    write_code_update_status(
+        "running", "install", "正在重新安装并重启服务…", current_version, target_version
+    )
+    try:
+        env = dict(os.environ)
+        env["AIMILIVPN_NONINTERACTIVE"] = "1"
+        installed = run(["bash", "install.sh"], install_dir, 600, env)
+    except Exception as exc:
+        return fail_after_checkout("install", "重新安装失败", str(exc), target_version)
+    if installed.returncode != 0:
+        return fail_after_checkout(
+            "install", "重新安装失败", cmd_tail(installed) or "install.sh 执行失败", target_version
+        )
+    write_code_update_status(
+        "running", "health", "正在等待新面板响应…", current_version, target_version
+    )
+    host, port = _code_update_ui_host_port()
+    if not healthy(host, port, CODE_UPDATE_PANEL_HEALTH_TIMEOUT_SECONDS):
+        return fail_after_checkout("health", "新面板未在规定时间内响应", "健康检查超时", target_version)
+    live_version = _code_update_read_version(install_dir)
+    if live_version != target_version:
+        return fail_after_checkout(
+            "health", "新面板版本与目标不一致",
+            f"VERSION 文件为 {live_version}，目标为 {target_version}", target_version,
+        )
+    write_code_update_status(
+        "success", "done", f"更新完成，当前版本 {target_version}", current_version, target_version
+    )
+    log_to_json("INFO", "CodeUpdate", f"面板更新成功：{current_version} -> {target_version}")
+    return True
+
+
+def spawn_code_updater() -> bool:
+    """Spawn the detached code updater.
+
+    Prefers a systemd transient scope so the updater survives the service
+    restart (a plain setsid child stays in the service cgroup and is killed
+    by `systemctl restart` under the default KillMode=control-group).
+    Falls back to a setsid child when systemd-run is unavailable. The worker
+    writes its own log/status files, so stdout is discarded here.
+    """
+    manager_path = str(Path(__file__).resolve())
+    cmd = [sys.executable, manager_path, "--code-update"]
+    try:
+        proc = subprocess.run(
+            ["systemd-run", "--scope", "--no-block", "--quiet", *cmd],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+        )
+        if proc.returncode == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+        )
+        return True
+    except Exception:
+        return False
+
 
 def is_certificate_verification_error(exc: BaseException) -> bool:
     import ssl
@@ -4608,17 +5025,21 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.1.0 正式版</span>
+        <span id="github_version_label">V1.2.0 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.1.0 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.2.0 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
           <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
           检测更新
+        </button>
+        <button id="code_update_btn" type="button" onclick="startCodeUpdate(event)">
+          <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+          一键更新
         </button>
         <a href="https://github.com/liulangdegezi/aimili-vpngate-plus/tree/main" target="_blank" rel="noopener noreferrer">GitHub main 主分支</a>
         <a id="latest_release_link" href="https://github.com/liulangdegezi/aimili-vpngate-plus/releases/latest" target="_blank" rel="noopener noreferrer">下载最新正式版</a>
@@ -5453,7 +5874,7 @@ function stableSortNodes() {
 }
 
 function render(){
-  const versionLabel = state.app_version_label || "V1.1.0 正式版";
+  const versionLabel = state.app_version_label || "V1.2.0 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -5669,7 +6090,7 @@ function render(){
           <div class="table-actions">
             ${testBtn}
             ${favBtn}
-            <button class="test-btn" disabled title="评分功能为第三阶段，暂未启用" style="padding: 0 8px; height: 30px;">查评分</button>
+            <button class="test-btn" disabled title="暂未启用" style="padding: 0 8px; height: 30px;">查评分</button>
             ${connectBtn}
           </div>
         </td>
@@ -6072,6 +6493,96 @@ async function checkForUpdate(event) {
   } finally {
     button.disabled = false;
   }
+}
+
+async function startCodeUpdate(event) {
+  if (event) event.stopPropagation();
+  const button = $("code_update_btn");
+  const statusBox = $("update_check_status");
+  if (!button || !statusBox) return;
+  button.disabled = true;
+  statusBox.className = "update-check-status";
+  statusBox.textContent = "正在连接 GitHub 检查最新正式版...";
+  try {
+    const checkResponse = await fetchWithTimeout("./api/check_update", { cache: "no-store" }, 25000);
+    const check = await readJsonResponse(checkResponse, "更新检查失败");
+    if (!checkResponse.ok || !check.ok) {
+      throw new Error(check.error || "更新检查失败");
+    }
+    if (check.no_release || !check.update_available) {
+      statusBox.className = "update-check-status current";
+      statusBox.textContent = `当前 ${check.current_version_label} 已是最新正式版，无需更新。`;
+      button.disabled = false;
+      return;
+    }
+    const targetTag = check.latest_tag || check.latest_version;
+    const confirmed = confirm(`确认更新到 ${targetTag} 吗？\n服务会重启，现用连接会断一下并重建（最长约 90 秒隧道重建），出口 IP 可能变化。建议在低使用时段执行。`);
+    if (!confirmed) {
+      statusBox.textContent = "已取消更新。";
+      button.disabled = false;
+      return;
+    }
+    statusBox.textContent = `正在启动更新到 ${targetTag}...`;
+    const response = await fetchWithTimeout("./api/update_code", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirmed: true }),
+    }, 25000);
+    const result = await readJsonResponse(response, "启动更新失败");
+    if (!response.ok || !result.ok) {
+      throw new Error(result.error || "启动更新失败");
+    }
+    statusBox.textContent = `正在更新到 ${targetTag}，服务重启期间面板会短暂不可用...`;
+    pollCodeUpdateStatus();
+  } catch (error) {
+    statusBox.className = "update-check-status error";
+    statusBox.textContent = error.message || "启动更新失败。";
+    button.disabled = false;
+  }
+}
+
+function pollCodeUpdateStatus() {
+  const button = $("code_update_btn");
+  const statusBox = $("update_check_status");
+  if (!statusBox) return;
+  const startedAt = Date.now();
+  const tick = async () => {
+    if (Date.now() - startedAt > 120000) {
+      statusBox.textContent = "更新等待超时，正在刷新页面以确认新版本...";
+      try { sessionStorage.setItem("aimili_code_update_done", "1"); } catch (e) {}
+      location.reload();
+      return;
+    }
+    try {
+      const response = await fetchWithTimeout("./api/update_status", { cache: "no-store" }, 10000);
+      const st = await readJsonResponse(response, "更新状态查询失败");
+      if (st.result === "success") {
+        statusBox.className = "update-check-status current";
+        statusBox.textContent = `更新完成，当前版本 ${st.target_version || ""}，正在刷新页面...`;
+        try { sessionStorage.setItem("aimili_code_update_done", "1"); } catch (e) {}
+        window.setTimeout(() => location.reload(), 800);
+        return;
+      }
+      if (st.result === "failed") {
+        statusBox.className = "update-check-status error";
+        statusBox.textContent = `${st.stage ? st.stage + "失败" : "更新失败"}：${st.error || st.message || ""}。请用终端 ml update 重试。`;
+        if (button) button.disabled = false;
+        return;
+      }
+      if (st.result === "running" && st.stale) {
+        statusBox.className = "update-check-status error";
+        statusBox.textContent = "更新状态已超时未更新，请刷新页面并用检测更新确认当前版本，必要时用终端 ml update 重试。";
+        if (button) button.disabled = false;
+        return;
+      }
+      const tail = Array.isArray(st.log_tail) && st.log_tail.length ? st.log_tail[st.log_tail.length - 1] : "";
+      statusBox.textContent = `正在更新：${st.message || st.stage || "进行中"}${tail && tail !== st.message ? "（" + tail + "）" : ""}`;
+      window.setTimeout(tick, 3000);
+    } catch (error) {
+      window.setTimeout(tick, 3000);
+    }
+  };
+  tick();
 }
 
 if (adminBtn && adminDropdown) {
@@ -6765,6 +7276,13 @@ function exportLogContent() {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+try {
+  if (window.sessionStorage && sessionStorage.getItem("aimili_code_update_done") === "1") {
+    sessionStorage.removeItem("aimili_code_update_done");
+    checkForUpdate(null);
+  }
+} catch (e) {}
 </script>
 </body></html>"""
 
@@ -7173,6 +7691,8 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": False, "error": f"无法检查 GitHub 正式版更新: {exc}"},
                     HTTPStatus.BAD_GATEWAY,
                 )
+        elif effective_path == "/api/update_status":
+            self.send_json({"ok": True, **read_code_update_status()})
         elif effective_path.startswith("/configs/"):
             filename = urllib.parse.unquote(effective_path.removeprefix("/configs/"))
             with lock:
@@ -7362,6 +7882,50 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self.is_authorized():
             self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+
+        if effective_path == "/api/update_code":
+            # Panel one-click update (1.2.0). Auth is the shared do_POST
+            # session check above; no new auth mechanism. Only the
+            # `confirmed` flag is read from the body -- nothing else from
+            # the request is ever used as a command or argument.
+            try:
+                payload = self.read_json_body()
+                if payload.get("confirmed") is not True:
+                    self.send_json({"ok": False, "error": "请先在确认框中确认更新"}, HTTPStatus.BAD_REQUEST)
+                    return
+                busy = code_update_busy_reason()
+                if busy:
+                    self.send_json(
+                        {"ok": False, "running": True, "error": busy, "status": read_code_update_status()},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                with code_update_lock:
+                    busy = code_update_busy_reason()
+                    if busy:
+                        self.send_json(
+                            {"ok": False, "running": True, "error": busy, "status": read_code_update_status()},
+                            HTTPStatus.CONFLICT,
+                        )
+                        return
+                    current_version = APP_VERSION
+                    write_code_update_status(
+                        "running", "starting", "正在启动面板更新…", current_version, ""
+                    )
+                    if not spawn_code_updater():
+                        write_code_update_status(
+                            "failed", "starting", "无法启动更新器", current_version, "",
+                            error="无法启动更新器进程", needs_terminal=True,
+                        )
+                        self.send_json({"ok": False, "error": "无法启动更新器进程"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    log_to_json("INFO", "CodeUpdate", f"面板一键更新已启动（当前版本 {current_version}）")
+                    self.send_json({"ok": True, "running": True, "status": read_code_update_status()})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         if effective_path == "/api/update_credentials":
@@ -7898,4 +8462,7 @@ def main() -> None:
     DualStackHTTPServer((ui_host, ui_port), Handler).serve_forever()
 
 if __name__ == "__main__":
-    main()
+    if "--code-update" in sys.argv:
+        run_code_update_worker()
+    else:
+        main()
