@@ -22,7 +22,7 @@ from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import concurrent.futures
 import sys
 import uuid
@@ -172,7 +172,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.0.0"
+DEFAULT_APP_VERSION = "1.1.0"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -200,6 +200,11 @@ WEB_LOG_MAX_ENTRIES = 500
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
+# Full-sweep (1.1.0) cancel flags. Written by the /api/connect handler when
+# the user asks to connect while a sweep runs; read between batches by
+# test_multiple_nodes via stop_requested. Plain bool assignments are atomic.
+full_sweep_running = False
+full_sweep_cancel_requested = False
 connection_attempt_lock = threading.Lock()
 background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
@@ -2023,6 +2028,85 @@ def probe_priority_key(node: dict[str, Any]) -> tuple[int, int, int, int]:
         parse_int(node.get("sessions")),
     )
 
+def sweep_latency_key(node: dict[str, Any]) -> int:
+    latency = parse_int(node.get("latency_ms"))
+    if latency > 0:
+        return latency
+    ping = parse_int(node.get("ping"))
+    if ping > 0:
+        return ping
+    return 999999
+
+
+def full_sweep_priority(node: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
+    routing_mode = ui_cfg.get("routing_mode", "auto")
+    if routing_mode == "fixed_ip":
+        fixed_id = str(ui_cfg.get("fixed_node_id") or "").strip()
+        return bool(fixed_id) and str(node.get("id")) == fixed_id
+    if routing_mode == "fixed_region":
+        target_country = ui_cfg.get("force_country", "")
+        return country_matches(node.get("country"), target_country, node.get("country_short"))
+    if routing_mode == "favorites":
+        fav_ids = set(ui_cfg.get("favorite_node_ids", []) or [])
+        return str(node.get("id")) in fav_ids
+    return False
+
+
+def full_sweep_order(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    return sorted(
+        nodes,
+        key=lambda n: (
+            0 if full_sweep_priority(n, ui_cfg) else 1,
+            sweep_latency_key(n),
+            str(n.get("id") or ""),
+        ),
+    )
+
+
+def run_full_sweep(systemic_probe_failure: str = "") -> dict[str, Any]:
+    global full_sweep_running, full_sweep_cancel_requested
+    if systemic_probe_failure:
+        msg = f"系统级故障，跳过全量检测: {systemic_probe_failure}"
+        print(f"[全量检测] {msg}", flush=True)
+        log_to_json("WARNING", "Main", msg)
+        return {"tested": 0, "available": 0, "unavailable": 0, "skipped": True, "interrupted": False}
+    ui_cfg = load_ui_config()
+    candidates = [n for n in read_nodes() if not n.get("active")]
+    ordered = full_sweep_order(candidates, ui_cfg)
+    candidate_ids = [str(n.get("id")) for n in ordered if n.get("id")]
+    if not candidate_ids:
+        return {"tested": 0, "available": 0, "unavailable": 0, "skipped": False, "interrupted": False}
+    full_sweep_running = True
+    full_sweep_cancel_requested = False
+    try:
+        set_state(is_connecting=False, last_check_message="正在全量检测所有节点可用性…")
+        results = test_multiple_nodes(
+            candidate_ids,
+            target_available=None,
+            stop_requested=lambda: full_sweep_cancel_requested,
+        )
+        tested = len(results)
+        available = sum(1 for r in results if r.get("probe_status") == "available")
+        unavailable = sum(1 for r in results if r.get("probe_status") == "unavailable")
+        interrupted = bool(full_sweep_cancel_requested)
+        summary = (
+            f"全量检测完成：共 {tested} 个，可用 {available} 个，不可用 {unavailable} 个"
+            + ("（连接请求打断）" if interrupted else "")
+        )
+        print(f"[全量检测] {summary}", flush=True)
+        log_to_json("INFO", "Main", summary)
+        set_state(last_check_message=summary)
+        return {
+            "tested": tested,
+            "available": available,
+            "unavailable": unavailable,
+            "skipped": False,
+            "interrupted": interrupted,
+        }
+    finally:
+        full_sweep_running = False
+
+
 def current_fixed_node_id(ui_cfg: dict[str, Any]) -> str:
     if active_openvpn_node_id:
         return active_openvpn_node_id
@@ -2222,7 +2306,7 @@ def is_systemic_probe_failure(message: Any) -> bool:
         )
     )
 
-def test_multiple_nodes(node_ids: list[str], target_available: int | None = None) -> list[dict[str, Any]]:
+def test_multiple_nodes(node_ids: list[str], target_available: int | None = None, stop_requested: Callable[[], bool] | None = None) -> list[dict[str, Any]]:
     with lock:
         nodes = read_nodes()
         to_test = [n for n in nodes if n.get("id") in node_ids]
@@ -2281,6 +2365,10 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
     max_workers = min(NODE_PROBE_WORKERS, max(1, len(to_test)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         for batch_start in range(0, len(to_test), max_workers):
+            if stop_requested is not None and stop_requested():
+                print("[节点检测] 全量检测收到连接请求，提前停止剩余批次", flush=True)
+                log_to_json("INFO", "Main", "全量检测收到连接请求，提前停止剩余批次")
+                break
             if systemic_failure or (target_available is not None and available_count >= target_available):
                 break
 
@@ -2791,6 +2879,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             "consecutive_failures",
                             "last_success_at",
                             "iplark_score",
+
                         ]:
                             if previous.get(key) not in (None, ""):
                                 cand[key] = previous.get(key)
@@ -2922,6 +3011,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if active_openvpn_running():
                         valid_nodes_count = len([n for n in read_nodes() if n.get("probe_status") == "available"])
                         message = f"Fetched {len(candidates)} nodes. Fast-tested {len(fast_results)} nodes and connected."
+                        _sweep = run_full_sweep(systemic_probe_failure)
+                        if not _sweep.get("skipped"):
+                            message = (
+                                f"{message} 全量检测：共 {_sweep['tested']} 个，"
+                                f"可用 {_sweep['available']} 个，不可用 {_sweep['unavailable']} 个"
+                                + ("（连接请求打断）" if _sweep.get("interrupted") else "")
+                                + "。"
+                            )
                         set_state(
                             last_check_at=time.time(),
                             last_check_message=message,
@@ -2995,6 +3092,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         total_tested = len(fast_results) + len(tested_results)
         message = f"Fetched {len(candidates)} nodes. Tested {total_tested} prioritized non-active nodes."
+        _sweep = run_full_sweep(systemic_probe_failure)
+        if not _sweep.get("skipped"):
+            message = (
+                f"{message} 全量检测：共 {_sweep['tested']} 个，"
+                f"可用 {_sweep['available']} 个，不可用 {_sweep['unavailable']} 个"
+                + ("（连接请求打断）" if _sweep.get("interrupted") else "")
+                + "。"
+            )
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
@@ -3039,7 +3144,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AimiliVPN - 安全登录</title>
+  <title>AimiliVPN PLUS - 安全登录</title>
   <style>
     :root {
       --bg-dark: #090d16;
@@ -3231,7 +3336,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
           <path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
         </svg>
       </div>
-      <h2 class="login-title">AimiliVPN</h2>
+      <h2 class="login-title">AimiliVPN PLUS</h2>
       <p class="login-subtitle">请输入您的管理账号和安全密码以继续</p>
       
       <form id="login_form" onsubmit="handleLogin(event)">
@@ -3314,7 +3419,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AimiliVPN 节点池管理系统</title>
+  <title>AimiliVPN PLUS 节点池管理系统</title>
   <style>
     :root {
       --bg-dark: #0b0f19;
@@ -4494,7 +4599,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="brand">
     <h1>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
-      AimiliVPN 节点管理系统
+      AimiliVPN PLUS 节点管理系统
     </h1>
     <div id="status" class="status" role="status" aria-live="polite"><span class="status-dot"></span>服务加载中...</div>
   </div>
@@ -4503,12 +4608,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.0.0 正式版</span>
+        <span id="github_version_label">V1.1.0 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.0.0 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.1.0 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
@@ -4517,6 +4622,7 @@ INDEX_HTML = r"""<!doctype html>
         </button>
         <a href="https://github.com/liulangdegezi/aimili-vpngate-plus/tree/main" target="_blank" rel="noopener noreferrer">GitHub main 主分支</a>
         <a id="latest_release_link" href="https://github.com/liulangdegezi/aimili-vpngate-plus/releases/latest" target="_blank" rel="noopener noreferrer">下载最新正式版</a>
+        <a href="https://github.com/liulangdegezi/aimili-vpngate-plus/blob/main/CHANGELOG.md" target="_blank" rel="noopener noreferrer">版本升级日志</a>
         <div id="update_check_status" class="update-check-status" role="status" aria-live="polite">点击“检测更新”查询 GitHub 最新正式版。</div>
       </div>
     </div>
@@ -5347,7 +5453,7 @@ function stableSortNodes() {
 }
 
 function render(){
-  const versionLabel = state.app_version_label || "V1.0.0 正式版";
+  const versionLabel = state.app_version_label || "V1.1.0 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -5558,14 +5664,12 @@ function render(){
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
         <td style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(ipTypeTitle)}">${esc(translateIpType(n.ip_type))}</td>
-        <!-- Phase 1 placeholder: iplark scoring lands in phase 3; this cell renders a real score automatically once phase 3 writes n.iplark_score. -->
-        <td style="white-space: nowrap;" title="iplark 评分第三阶段接入">${(n.iplark_score === null || n.iplark_score === undefined) ? "—" : esc(n.iplark_score)}</td>
+        <td style="white-space: nowrap;">${(n.iplark_score === null || n.iplark_score === undefined) ? "—" : esc(n.iplark_score)}</td>
         <td>
           <div class="table-actions">
             ${testBtn}
             ${favBtn}
-            <!-- Phase 1 placeholder: iplark score lookup lands in phase 3; button stays disabled until then. -->
-            <button class="test-btn" disabled style="opacity:0.4; cursor:not-allowed; padding: 0 8px; height: 30px;" title="iplark 评分第三阶段接入">查评分</button>
+            <button class="test-btn" disabled title="评分功能为第三阶段，暂未启用" style="padding: 0 8px; height: 30px;">查评分</button>
             ${connectBtn}
           </div>
         </td>
@@ -7601,6 +7705,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/connect":
+            global full_sweep_cancel_requested
+            if full_sweep_running:
+                full_sweep_cancel_requested = True
+                self.send_json({"ok": False, "full_sweep_stopping": True, "error": "全量检测正在运行，已请求停止检测，请稍后重试连接"}, HTTPStatus.CONFLICT)
+                return
             previous_node_id = active_openvpn_node_id if active_openvpn_running() else ""
             try:
                 payload = self.read_json_body()
