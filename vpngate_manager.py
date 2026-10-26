@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import json
 import os
 import py_compile
@@ -175,7 +176,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.2.1"
+DEFAULT_APP_VERSION = "1.2.2"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -208,6 +209,12 @@ maintenance_lock = threading.Lock()
 # test_multiple_nodes via stop_requested. Plain bool assignments are atomic.
 full_sweep_running = False
 full_sweep_cancel_requested = False
+# 1.2.2 detection gating: True until the first maintain that completes a
+# full sweep after this process starts. Pre-restart probe results may be
+# stale, so the first maintain after a service restart must detect once
+# even when the candidate id set hashes identically to before the restart.
+# Refill maintains never clear this flag (they never full-sweep).
+_first_maintain_after_startup = True
 connection_attempt_lock = threading.Lock()
 background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
@@ -997,13 +1004,26 @@ CODE_UPDATE_CHECK_FILES = (
 code_update_lock = threading.Lock()
 
 
-def _code_update_append_log(line: str) -> None:
+def _code_update_append_log(line: str) -> bool:
+    """Append one line to the code-update log file.
+
+    Returns True on success. On OSError the failure is reported to
+    stderr with the file name and reason (never the log content, and
+    never an account, password, or secret path) and False is returned,
+    so a caller can never mistake a lost log line for a recorded one.
+    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         with open(CODE_UPDATE_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} {line}\n")
-    except OSError:
-        pass
+        return True
+    except OSError as exc:
+        print(
+            f"[CodeUpdate] 写入更新日志失败：{CODE_UPDATE_LOG_FILE}：{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
 
 
 def write_code_update_status(
@@ -1015,6 +1035,21 @@ def write_code_update_status(
     error: str = "",
     needs_terminal: bool = False,
 ) -> dict[str, Any]:
+    """Write the one-click update status file + code-update log line.
+
+    The returned entry is the same dict as before plus three
+    return-value-only fields (not persisted in the status file, so the
+    on-disk format and the success path are unchanged):
+    - ``status_ok``: the status file was written (this is the polling
+      source of truth, so call sites gate on this field).
+    - ``log_ok``: the code-update log line was appended.
+    - ``write_ok``: ``status_ok and log_ok``.
+    A status-file failure is never silent: it is printed to stderr with
+    the file name and reason, and a panel-log record is attempted as a
+    second channel (the panel log uses the same reentrant lock, so
+    calling it here cannot deadlock). If both file channels fail,
+    the stderr record is the record of last resort.
+    """
     with lock:
         previous = read_json(CODE_UPDATE_STATUS_FILE, None)
         log_tail = list(previous.get("log_tail", [])) if isinstance(previous, dict) else []
@@ -1034,12 +1069,22 @@ def write_code_update_status(
             "deployment_mode": DEPLOYMENT_MODE,
             "update_command": UPDATE_COMMAND,
         }
+        status_ok = True
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             write_json(CODE_UPDATE_STATUS_FILE, entry)
-        except OSError:
-            pass
-        _code_update_append_log(f"[{stage}] {entry_line}")
+        except OSError as exc:
+            status_ok = False
+            print(
+                f"[CodeUpdate] 写入更新状态失败：{CODE_UPDATE_STATUS_FILE}：{exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            log_to_json("ERROR", "CodeUpdate", f"写入更新状态失败：{stage} {message}")
+        log_ok = _code_update_append_log(f"[{stage}] {entry_line}")
+        entry["status_ok"] = status_ok
+        entry["log_ok"] = log_ok
+        entry["write_ok"] = bool(status_ok and log_ok)
         return entry
 
 
@@ -1070,7 +1115,159 @@ def read_code_update_status() -> dict[str, Any]:
         "stale": stale,
         "deployment_mode": DEPLOYMENT_MODE,
         "update_command": UPDATE_COMMAND,
+        "last_attempt": read_code_update_last_attempt(),
     }
+
+
+# 1.2.2 last-attempt record (Q2): a separate file, never the running
+# status file, so a rejected attempt (400/409/exception) can never
+# overwrite a running updater's status. The handler writes it for every
+# rejected attempt and clears it on a successful start; GET
+# /api/update_status returns it via read_code_update_status() above, so a
+# rejected start stays visible after a page refresh instead of vanishing
+# with the dropdown status text. It records only time, result, and the
+# rejection reason -- never an account, password, or secret path.
+CODE_UPDATE_LAST_ATTEMPT_FILE = DATA_DIR / "code_update_last_attempt.json"
+
+
+def write_code_update_last_attempt(
+    result: str, reason: str, current_version: str = ""
+) -> dict[str, Any]:
+    """Write the separate last-attempt record.
+
+    The returned entry carries ``write_ok`` (True when the file was
+    written). On OSError the failure is printed to stderr with the file
+    name and reason; the panel log is the second channel because the
+    only caller, record_code_update_rejected(), logs there first. The
+    reason itself is never an account, password, or secret path.
+    """
+    entry = {
+        "result": result,
+        "reason": str(reason or ""),
+        "current_version": str(current_version or APP_VERSION),
+        "updated_at": time.time(),
+    }
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        write_json(CODE_UPDATE_LAST_ATTEMPT_FILE, entry)
+        entry["write_ok"] = True
+    except OSError as exc:
+        print(
+            f"[CodeUpdate] 写入上次尝试记录失败：{CODE_UPDATE_LAST_ATTEMPT_FILE}：{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        entry["write_ok"] = False
+    return entry
+
+
+def read_code_update_last_attempt() -> dict[str, Any] | None:
+    data = read_json(CODE_UPDATE_LAST_ATTEMPT_FILE, None)
+    if not isinstance(data, dict):
+        return None
+    return {
+        "result": str(data.get("result") or ""),
+        "reason": str(data.get("reason") or ""),
+        "current_version": str(data.get("current_version") or ""),
+        "updated_at": float(data.get("updated_at") or 0),
+    }
+
+
+def clear_code_update_last_attempt() -> bool:
+    """Remove the last-attempt record; True when nothing remains.
+
+    A missing file already counts as cleared. Any other OSError is
+    printed to stderr with the file name and reason and returns False.
+    Callers never block a successful update start on a stale record:
+    a leftover record stays visible (not silent) and the running status
+    takes precedence in the panel's status restore.
+    """
+    try:
+        CODE_UPDATE_LAST_ATTEMPT_FILE.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        print(
+            f"[CodeUpdate] 清除上次尝试记录失败：{CODE_UPDATE_LAST_ATTEMPT_FILE}：{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+
+def record_code_update_rejected(reason: str, current_version: str = "") -> dict[str, Any]:
+    """Log + persist a rejected one-click start (1.2.2).
+
+    Called for every /api/update_code outcome that never starts an
+    updater: missing confirmation (400), busy rejection (409), and request
+    exceptions. The panel log (CodeUpdate module) and the separate
+    last-attempt file are two independent records, so a single write
+    failure cannot make the attempt silent again.
+    """
+    log_to_json("WARNING", "CodeUpdate", f"面板一键更新未启动：{reason}")
+    return write_code_update_last_attempt("not_started", reason, current_version)
+
+
+def record_code_update_spawn_failure(
+    method: str, detail: str, current_version: str
+) -> dict[str, Any]:
+    """Log + persist a failed updater spawn (1.2.2).
+
+    The status error stays the generic "无法启动更新器进程" so the panel
+    display is unchanged; the spawn method and detail go into the panel
+    log, where they are diagnosable without changing status semantics.
+    """
+    if detail:
+        log_message = (
+            f"面板更新失败[starting] 无法启动更新器：无法启动更新器进程"
+            f"（方式：{method}，{detail}）"
+        )
+    else:
+        log_message = (
+            f"面板更新失败[starting] 无法启动更新器：无法启动更新器进程"
+            f"（方式：{method}）"
+        )
+    log_to_json("ERROR", "CodeUpdate", log_message)
+    return write_code_update_status(
+        "failed", "starting", "无法启动更新器", current_version, "",
+        error="无法启动更新器进程", needs_terminal=True,
+    )
+
+
+def start_code_update_updater(current_version: str) -> tuple[bool, str]:
+    """Write the initial running status and spawn the updater.
+
+    The panel handler calls this only after its busy checks, while
+    holding code_update_lock, so the busy check and the start stay
+    atomic. Returns (True, "") when the updater spawned, otherwise
+    (False, error) where error is the exact text the panel shows.
+    - Initial running-status write failure: the updater is NOT
+      spawned; a rejected attempt is recorded (panel log +
+      last-attempt file, each with its own stderr fallback) and the
+      displayable error is returned. The HTTP error plus stderr
+      already make the failure observable even if the same data
+      directory also refuses the last-attempt write.
+    - Spawn failure: recorded via record_code_update_spawn_failure()
+      and "无法启动更新器进程" is returned (unchanged behavior).
+    - Success: the last-attempt record is cleared and the start is
+      logged (unchanged behavior; a clear failure only leaves a stale
+      visible record and never blocks the start).
+    """
+    entry = write_code_update_status(
+        "running", "starting", "正在启动面板更新…", current_version, ""
+    )
+    if not entry.get("status_ok", False):
+        reason = "无法写入更新状态文件，请检查数据目录并用终端重试"
+        record_code_update_rejected(reason, current_version)
+        return False, reason
+    spawned, spawn_method, spawn_detail = spawn_code_updater_detailed()
+    if not spawned:
+        record_code_update_spawn_failure(spawn_method, spawn_detail, current_version)
+        return False, "无法启动更新器进程"
+    clear_code_update_last_attempt()
+    log_to_json("INFO", "CodeUpdate", f"面板一键更新已启动（当前版本 {current_version}）")
+    return True, ""
 
 
 def code_update_busy_reason() -> str | None:
@@ -1136,6 +1333,14 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
     with returncode/stdout/stderr (tests inject fakes so no real git or
     install step ever runs under test). `panel_healthy` is a
     callable(host, port, timeout) -> bool (tests inject it).
+    Stage status writes are gated on their `status_ok` flag: a failed
+    running-status write aborts before any overwrite (fetch/check/
+    checkout/docker pull/restart) and rolls back after an overwrite
+    (install/health); a failed success record after verification
+    (already-latest, docker healthy, final version match) is logged
+    explicitly instead of rolling back verified-good code. A log-only
+    failure never aborts a stage: the status log_tail already carries
+    the stage message, and the failure itself goes to stderr.
     """
     install_dir = Path(install_dir) if install_dir is not None else ROOT_DIR
     run = runner or _code_update_default_runner
@@ -1150,23 +1355,40 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
         log_to_json("ERROR", "CodeUpdate", f"面板更新失败[{stage}] {message}：{error}")
         return False
 
+    def fail_on_status_write(stage, message, needs_terminal=False, target_version=""):
+        """Abort because a stage's running-status record could not be written.
+
+        fail() writes a failed status (which may itself fail, but then
+        the panel log after it plus the write helper's stderr record
+        still carry the failure) and logs to the panel log, so the
+        abort is never silent. Pre-overwrite callers use this plain
+        fail, never fail_after_checkout: nothing has changed yet, so a
+        rollback would pointlessly reinstall the old code.
+        """
+        return fail(
+            stage, message, "无法写入更新状态文件",
+            needs_terminal=needs_terminal, target_version=target_version,
+        )
+
     def cmd_tail(result) -> str:
         text = (((getattr(result, "stderr", "") or "") + "\n" + (getattr(result, "stdout", "") or "")).strip())
         return text[-500:] if text else ""
 
     if DEPLOYMENT_MODE == "docker":
-        write_code_update_status(
+        if not write_code_update_status(
             "running", "docker_pull", "正在拉取最新容器镜像…", current_version, current_version
-        )
+        ).get("status_ok", False):
+            return fail_on_status_write("docker_pull", "拉取容器镜像失败")
         try:
             pulled = run(["docker", "compose", "pull"], install_dir, 600)
         except Exception as exc:
             return fail("docker_pull", "拉取容器镜像失败", str(exc))
         if pulled.returncode != 0:
             return fail("docker_pull", "拉取容器镜像失败", cmd_tail(pulled) or "docker compose pull 失败")
-        write_code_update_status(
+        if not write_code_update_status(
             "running", "restarting", "正在重启容器…", current_version, current_version
-        )
+        ).get("status_ok", False):
+            return fail_on_status_write("restarting", "重启容器失败", needs_terminal=True)
         try:
             upped = run(["docker", "compose", "up", "-d"], install_dir, 300)
         except Exception as exc:
@@ -1178,14 +1400,21 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
         # reload + check_update showing the new version (see one-click update plan).
         host, port = _code_update_ui_host_port()
         if healthy(host, port, CODE_UPDATE_PANEL_HEALTH_TIMEOUT_SECONDS):
-            write_code_update_status(
+            if not write_code_update_status(
                 "success", "done", "容器更新完成，请用检测更新确认新版本",
                 current_version, current_version,
-            )
+            ).get("status_ok", False):
+                # Container already recreated and healthy: rolling back a
+                # verified-good update because its success record failed
+                # would turn success into failure. Record the loss
+                # explicitly in the panel log (+ stderr from the write
+                # helper) instead, and confirm via check_update.
+                log_to_json("ERROR", "CodeUpdate", "面板更新成功但成功状态写入失败：容器更新完成，请用检测更新确认新版本")
             return True
         return fail("done", "新面板未在规定时间内响应", "健康检查超时", needs_terminal=True, target_version=current_version)
 
-    write_code_update_status("running", "fetch", "正在拉取 main 分支…", current_version, "")
+    if not write_code_update_status("running", "fetch", "正在拉取 main 分支…", current_version, "").get("status_ok", False):
+        return fail_on_status_write("fetch", "拉取 main 分支失败")
     if not (install_dir / ".git").exists():
         return fail("fetch", "当前安装目录不是 Git 仓库", "缺少 .git，无法通过 Git 更新", needs_terminal=True)
     try:
@@ -1204,18 +1433,24 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
     if not local_sha or not remote_sha:
         return fail("fetch", "读取提交号失败", "git rev-parse 未返回提交号")
     if local_sha == remote_sha:
-        write_code_update_status(
+        if not write_code_update_status(
             "success", "done", "已是最新正式版，无需更新", current_version, current_version
-        )
+        ).get("status_ok", False):
+            # Nothing changed (already latest), so there is nothing to
+            # roll back; the lost record is explicit in the panel log
+            # (+ stderr from the write helper), and check_update still
+            # shows the latest version.
+            log_to_json("ERROR", "CodeUpdate", "面板更新成功但成功状态写入失败：已是最新正式版，无需更新")
         return True
 
     # Temp-worktree syntax check BEFORE touching the live checkout (Q4).
     tmp_dir = None
     try:
         tmp_dir = Path(tempfile.mkdtemp(prefix="aimili-code-update-"))
-        write_code_update_status(
+        if not write_code_update_status(
             "running", "check", "正在临时工作区检查新代码…", current_version, ""
-        )
+        ).get("status_ok", False):
+            return fail_on_status_write("check", "临时工作区检查失败")
         try:
             added = run(
                 ["git", "worktree", "add", "--detach", str(tmp_dir), f"origin/{CODE_UPDATE_BRANCH}"],
@@ -1275,7 +1510,9 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
         log_to_json("ERROR", "CodeUpdate", f"面板更新失败[{stage}] {message}：{note}")
         return False
 
-    write_code_update_status("running", "checkout", "正在切换到 main 最新代码…", current_version, "")
+    if not write_code_update_status("running", "checkout", "正在切换到 main 最新代码…", current_version, "").get("status_ok", False):
+        # Checkout has not run yet: plain fail, no rollback (nothing changed).
+        return fail_on_status_write("checkout", "切换代码失败")
     try:
         checkout = run(
             ["git", "checkout", "-B", CODE_UPDATE_BRANCH, f"origin/{CODE_UPDATE_BRANCH}"],
@@ -1300,9 +1537,11 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
         )
     except Exception:
         pass
-    write_code_update_status(
+    if not write_code_update_status(
         "running", "install", "正在重新安装并重启服务…", current_version, target_version
-    )
+    ).get("status_ok", False):
+        # Checkout already changed the live tree: roll back to the old commit.
+        return fail_after_checkout("install", "重新安装失败", "无法写入更新状态文件", target_version)
     try:
         env = dict(os.environ)
         env["AIMILIVPN_NONINTERACTIVE"] = "1"
@@ -1313,9 +1552,12 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
         return fail_after_checkout(
             "install", "重新安装失败", cmd_tail(installed) or "install.sh 执行失败", target_version
         )
-    write_code_update_status(
+    if not write_code_update_status(
         "running", "health", "正在等待新面板响应…", current_version, target_version
-    )
+    ).get("status_ok", False):
+        # Install already ran and the service restarted: roll back
+        # rather than proceed unverified.
+        return fail_after_checkout("health", "等待新面板响应失败", "无法写入更新状态文件", target_version)
     host, port = _code_update_ui_host_port()
     if not healthy(host, port, CODE_UPDATE_PANEL_HEALTH_TIMEOUT_SECONDS):
         return fail_after_checkout("health", "新面板未在规定时间内响应", "健康检查超时", target_version)
@@ -1325,16 +1567,25 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
             "health", "新面板版本与目标不一致",
             f"VERSION 文件为 {live_version}，目标为 {target_version}", target_version,
         )
-    write_code_update_status(
+    if not write_code_update_status(
         "success", "done", f"更新完成，当前版本 {target_version}", current_version, target_version
-    )
+    ).get("status_ok", False):
+        # Health passed and the version matches: the update is verified
+        # good, so rolling it back because its success record failed
+        # would turn success into failure. Record the loss explicitly
+        # instead; the new version is still confirmable via check_update.
+        log_to_json("ERROR", "CodeUpdate", f"面板更新成功但成功状态写入失败：{current_version} -> {target_version}")
     log_to_json("INFO", "CodeUpdate", f"面板更新成功：{current_version} -> {target_version}")
     return True
 
 
-def spawn_code_updater() -> bool:
-    """Spawn the detached code updater.
+def spawn_code_updater_detailed() -> tuple[bool, str, str]:
+    """Spawn the detached code updater, reporting how it was spawned.
 
+    Returns (ok, method, detail): method is "systemd-run", "setsid", or
+    "none"; detail is empty on success and carries the failure reasons on
+    failure (1.2.2: the handler logs method + detail so a spawn failure
+    is diagnosable instead of only writing a generic status error).
     Prefers a systemd transient scope so the updater survives the service
     restart (a plain setsid child stays in the service cgroup and is killed
     by `systemctl restart` under the default KillMode=control-group).
@@ -1343,23 +1594,31 @@ def spawn_code_updater() -> bool:
     """
     manager_path = str(Path(__file__).resolve())
     cmd = [sys.executable, manager_path, "--code-update"]
+    systemd_detail = ""
     try:
         proc = subprocess.run(
             ["systemd-run", "--scope", "--no-block", "--quiet", *cmd],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
         )
         if proc.returncode == 0:
-            return True
-    except Exception:
-        pass
+            return True, "systemd-run", ""
+        systemd_detail = f"返回码 {proc.returncode}"
+    except Exception as exc:
+        systemd_detail = str(exc) or exc.__class__.__name__
     try:
         subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
         )
-        return True
-    except Exception:
-        return False
+        return True, "setsid", f"systemd-run 不可用或失败（{systemd_detail}），已回退 setsid"
+    except Exception as exc:
+        setsid_detail = str(exc) or exc.__class__.__name__
+        return False, "none", f"systemd-run：{systemd_detail}；setsid：{setsid_detail}"
+
+
+def spawn_code_updater() -> bool:
+    """Spawn the detached code updater (bool wrapper for callers/tests)."""
+    return spawn_code_updater_detailed()[0]
 
 
 def is_certificate_verification_error(exc: BaseException) -> bool:
@@ -2509,6 +2768,49 @@ def full_sweep_order(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any]) -> lis
     )
 
 
+def _candidate_list_hash(candidates: list[dict[str, Any]]) -> str:
+    """Stable hash of a fetched candidate id set (1.2.2 detection gating).
+
+    Sorted unique ids only: fetch order shuffling alone must not count
+    as a list change, otherwise every collector cycle would re-sweep.
+    Node ids encode country + IP + port + protocol, so an id-set change
+    captures additions, removals, and IP/port changes. A content-only
+    change without an id change is rare and is still caught by the next
+    manual refresh/check, which always sweeps (see should_run_full_sweep).
+    """
+    ids = sorted({str(c.get("id") or "") for c in candidates if c.get("id")})
+    return hashlib.sha256(",".join(ids).encode("utf-8")).hexdigest()
+
+
+def should_run_full_sweep(
+    trigger: str, list_changed: bool, restart_first: bool
+) -> tuple[bool, str]:
+    """Full-sweep gating decision for 1.2.2 detection frequency (A).
+
+    Priority order itself is untouched (full_sweep_order /
+    full_sweep_priority are not modified here); this only decides
+    whether the (already ordered) full sweep runs at all:
+    - manual / check: always sweep once (explicit user action).
+    - refill: never sweep (prioritized testing only, in maintain).
+    - auto (and any unknown trigger, treated as auto): sweep once when
+      the candidate list changed or on the first maintain after a
+      service restart (pre-restart probe results may be stale);
+      otherwise skip and keep previous probe results.
+    Returns (should_sweep, reason_text) for messages and logs.
+    """
+    if trigger in ("manual", "check"):
+        return True, "手动触发"
+    if trigger == "refill":
+        return False, "后台补齐不触发全量检测"
+    if restart_first and list_changed:
+        return True, "服务重启后首次维护（节点列表亦有变化）"
+    if restart_first:
+        return True, "服务重启后首次维护"
+    if list_changed:
+        return True, "节点列表变化"
+    return False, "节点列表未变化"
+
+
 def run_full_sweep(systemic_probe_failure: str = "") -> dict[str, Any]:
     global full_sweep_running, full_sweep_cancel_requested
     if systemic_probe_failure:
@@ -2911,7 +3213,9 @@ def schedule_background_refill() -> bool:
                     if not ui_cfg.get("connection_enabled", True):
                         return
                     try:
-                        maintain_valid_nodes(force=False)
+                        # 1.2.2: refill never full-sweeps; it only does
+                        # prioritized testing (target available count).
+                        maintain_valid_nodes(force=False, trigger="refill")
                     except Exception as exc:
                         log_to_json("WARNING", "Main", f"后台节点补齐失败: {exc}")
                     if active_openvpn_running():
@@ -3229,8 +3533,20 @@ def connect_node(node_id: str) -> str:
         finish_connection_attempt(token, cancel_event)
         set_state(pending_node_id="")
 
-def maintain_valid_nodes(force: bool = False) -> str:
+def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
+    """Maintain the node pool; trigger is the explicit caller source.
+
+    trigger: "auto" (collector_loop), "manual" (/api/refresh_nodes),
+    "refill" (background refill worker), or "check" (/api/check). The
+    force flag alone cannot distinguish manual from automatic maintains
+    (all callers historically passed force=False except /api/check), so
+    callers MUST pass trigger; an unknown trigger is treated as auto by
+    should_run_full_sweep. trigger decides only whether the terminal
+    full sweep runs (1.2.2 A); prioritized testing, retention, and
+    selection behavior are unchanged.
+    """
     global active_openvpn_process, active_openvpn_node_id, is_connecting
+    global _first_maintain_after_startup
     ensure_dirs()
     if not maintenance_lock.acquire(blocking=False):
         msg = "节点维护任务正在运行，请稍后再试"
@@ -3279,6 +3595,25 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         if not candidates:
             return "没有拉取到新节点"
+
+        # 1.2.2 detection gating (A): compare the fetched candidate id
+        # set with the previous fetch. The hash is stored on every
+        # successful fetch (including a skipped cycle) so the next cycle
+        # compares against the latest list, not a stale one. A failed
+        # fetch returns above and never updates the hash, so a later
+        # successful fetch is correctly seen as a change if it differs.
+        # The restart-first flag is NOT cleared here -- only a completed
+        # full sweep clears it, so a refill maintain (which never sweeps)
+        # cannot consume the first-after-restart sweep.
+        candidate_hash = _candidate_list_hash(candidates)
+        try:
+            previous_candidate_hash = str(get_state().get("last_candidate_hash") or "")
+        except Exception:
+            previous_candidate_hash = ""
+        list_changed = candidate_hash != previous_candidate_hash
+        restart_first = _first_maintain_after_startup
+        set_state(last_candidate_hash=candidate_hash)
+        should_sweep, sweep_reason = should_run_full_sweep(trigger, list_changed, restart_first)
 
         # Phase 1 retention: favorites are loaded before the merge so the
         # disappeared-node handling below can exempt them (plan §三.3).
@@ -3416,6 +3751,9 @@ def maintain_valid_nodes(force: bool = False) -> str:
         initial_tested_ids: set[str] = set()
         fast_results: list[dict[str, Any]] = []
         systemic_probe_failure = ""
+        # 1.2.2: set when a full sweep actually completed in this maintain
+        # (fast-connect path) so the terminal sweep is not run twice.
+        full_sweep_done = False
         ui_cfg = load_ui_config()
         should_fast_connect = (
             ui_cfg.get("connection_enabled", True)
@@ -3471,14 +3809,24 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if active_openvpn_running():
                         valid_nodes_count = len([n for n in read_nodes() if n.get("probe_status") == "available"])
                         message = f"Fetched {len(candidates)} nodes. Fast-tested {len(fast_results)} nodes and connected."
-                        _sweep = run_full_sweep(systemic_probe_failure)
-                        if not _sweep.get("skipped"):
-                            message = (
-                                f"{message} 全量检测：共 {_sweep['tested']} 个，"
-                                f"可用 {_sweep['available']} 个，不可用 {_sweep['unavailable']} 个"
-                                + ("（连接请求打断）" if _sweep.get("interrupted") else "")
-                                + "。"
-                            )
+                        # 1.2.2 gating: same decision as the terminal
+                        # sweep below; a skip is written into the message
+                        # and the panel log so it is observable, not silent.
+                        if should_sweep:
+                            _sweep = run_full_sweep(systemic_probe_failure)
+                            if not _sweep.get("skipped"):
+                                message = (
+                                    f"{message} 全量检测：共 {_sweep['tested']} 个，"
+                                    f"可用 {_sweep['available']} 个，不可用 {_sweep['unavailable']} 个"
+                                    + ("（连接请求打断）" if _sweep.get("interrupted") else "")
+                                    + "。"
+                                )
+                                full_sweep_done = True
+                                _first_maintain_after_startup = False
+                        else:
+                            skip_msg = f"全量检测已跳过（{sweep_reason}），保留上次探测结果。"
+                            message = f"{message} {skip_msg}"
+                            log_to_json("INFO", "Main", skip_msg)
                         set_state(
                             last_check_at=time.time(),
                             last_check_message=message,
@@ -3552,14 +3900,28 @@ def maintain_valid_nodes(force: bool = False) -> str:
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         total_tested = len(fast_results) + len(tested_results)
         message = f"Fetched {len(candidates)} nodes. Tested {total_tested} prioritized non-active nodes."
-        _sweep = run_full_sweep(systemic_probe_failure)
-        if not _sweep.get("skipped"):
-            message = (
-                f"{message} 全量检测：共 {_sweep['tested']} 个，"
-                f"可用 {_sweep['available']} 个，不可用 {_sweep['unavailable']} 个"
-                + ("（连接请求打断）" if _sweep.get("interrupted") else "")
-                + "。"
-            )
+        # 1.2.2 gating (A): the fast-connect path may already have swept
+        # this maintain; otherwise sweep only per should_run_full_sweep.
+        # A skip is written into the returned message (which becomes
+        # last_check_message) and the panel log, so SSH checks and the
+        # panel both show why no sweep ran. Priority order inside the
+        # sweep itself is unchanged (full_sweep_order/priority untouched).
+        if full_sweep_done:
+            pass
+        elif should_sweep:
+            _sweep = run_full_sweep(systemic_probe_failure)
+            if not _sweep.get("skipped"):
+                message = (
+                    f"{message} 全量检测：共 {_sweep['tested']} 个，"
+                    f"可用 {_sweep['available']} 个，不可用 {_sweep['unavailable']} 个"
+                    + ("（连接请求打断）" if _sweep.get("interrupted") else "")
+                    + "。"
+                )
+                _first_maintain_after_startup = False
+        else:
+            skip_msg = f"全量检测已跳过（{sweep_reason}），保留上次探测结果。"
+            message = f"{message} {skip_msg}"
+            log_to_json("INFO", "Main", skip_msg)
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
@@ -3582,7 +3944,7 @@ def collector_loop() -> None:
         try:
             print("[守护线程] 开始执行节点拉取与可用性检测周期任务...", flush=True)
             log_to_json("INFO", "Main", "开始执行节点拉取与可用性检测周期任务...")
-            res = maintain_valid_nodes(force=False)
+            res = maintain_valid_nodes(force=False, trigger="auto")
             if "没有拉取到新节点" not in res:
                 success = True
             log_to_json("INFO", "Main", f"周期同步与检测任务完成，结果: {res}")
@@ -5068,12 +5430,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.2.1 正式版</span>
+        <span id="github_version_label">V1.2.2 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.2.1 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.2.2 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
@@ -5916,7 +6278,7 @@ function stableSortNodes() {
 }
 
 function render(){
-  const versionLabel = state.app_version_label || "V1.2.1 正式版";
+  const versionLabel = state.app_version_label || "V1.2.2 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -6557,6 +6919,8 @@ async function startCodeUpdate(event) {
     const targetTag = check.latest_tag || check.latest_version;
     const confirmed = confirm(`确认更新到 ${targetTag} 吗？\n服务会重启，现用连接会断一下并重建（最长约 90 秒隧道重建），出口 IP 可能变化。建议在低使用时段执行。`);
     if (!confirmed) {
+      // 取消确认框未发请求，服务端永远记不到它；仅同标签页会话存储可见，关标签页即失。
+      try { sessionStorage.setItem("aimili_code_update_cancelled", JSON.stringify({ time: Date.now() })); } catch (e) {}
       statusBox.textContent = "已取消更新。";
       button.disabled = false;
       return;
@@ -6586,10 +6950,19 @@ function pollCodeUpdateStatus() {
   if (!statusBox) return;
   const startedAt = Date.now();
   const tick = async () => {
-    if (Date.now() - startedAt > 120000) {
-      statusBox.textContent = "更新等待超时，正在刷新页面以确认新版本...";
-      try { sessionStorage.setItem("aimili_code_update_done", "1"); } catch (e) {}
-      location.reload();
+    if (Date.now() - startedAt > 600000) {
+      // 1.2.2 (Q3): 超时不再自动刷新回旧版本——更新器仍可能在后台
+      // 运行，刷新会丢进度并误判失败。改为显示后台进行中，并在现有
+      // 更新状态文字区域内提供手动恢复入口；一键更新按钮保持禁用，
+      // 防止在更新器仍在跑时重复启动（重复启动会被互斥拒绝并记日志）。
+      statusBox.className = "update-check-status";
+      statusBox.innerHTML = "";
+      statusBox.appendChild(document.createTextNode("更新已等待超过 10 分钟，仍在后台进行中，请勿重复点击一键更新。"));
+      const resumeBtn = document.createElement("button");
+      resumeBtn.type = "button";
+      resumeBtn.textContent = "查看更新状态";
+      resumeBtn.onclick = (ev) => { if (ev) ev.stopPropagation(); pollCodeUpdateStatus(); };
+      statusBox.appendChild(resumeBtn);
       return;
     }
     try {
@@ -6624,6 +6997,67 @@ function pollCodeUpdateStatus() {
   tick();
 }
 
+// 1.2.2 (Q4): 从服务端恢复更新状态，供页面加载与下拉菜单打开时调用。
+// 只在有可显示的更新状态时改写状态文字（运行中、失败、超时未更新、
+// 上次未启动、会话内取消），无可恢复状态时不改写，避免抹掉刚查到的
+// 检测更新结果。成功状态不显示（版本号标签与检测更新已能确认新版）。
+// 取消记录只在同标签页会话内有效，且取消未发请求、服务端无记录。
+async function restoreCodeUpdateStatus() {
+  const statusBox = $("update_check_status");
+  const button = $("code_update_btn");
+  if (!statusBox) return;
+  let cancelled = null;
+  try {
+    const raw = sessionStorage.getItem("aimili_code_update_cancelled");
+    if (raw) cancelled = JSON.parse(raw);
+  } catch (e) {}
+  try {
+    const response = await fetchWithTimeout("./api/update_status", { cache: "no-store" }, 10000);
+    const st = await readJsonResponse(response, "更新状态查询失败");
+    if (st.result === "running" && !st.stale) {
+      if (button) button.disabled = true;
+      statusBox.className = "update-check-status";
+      const tail = Array.isArray(st.log_tail) && st.log_tail.length ? st.log_tail[st.log_tail.length - 1] : "";
+      statusBox.textContent = `正在更新：${st.message || st.stage || "进行中"}${tail && tail !== st.message ? "（" + tail + "）" : ""}`;
+      pollCodeUpdateStatus();
+      return;
+    }
+    if (st.result === "running" && st.stale) {
+      statusBox.className = "update-check-status error";
+      statusBox.textContent = "更新状态已超时未更新，请刷新页面并用检测更新确认当前版本，必要时用终端 ml update 重试。";
+      if (button) button.disabled = false;
+      return;
+    }
+    if (st.result === "failed") {
+      statusBox.className = "update-check-status error";
+      statusBox.textContent = `${st.stage ? st.stage + "失败" : "更新失败"}：${st.error || st.message || ""}。请用终端 ml update 重试。`;
+      if (button) button.disabled = false;
+      return;
+    }
+    if (st.result === "success") {
+      statusBox.className = "update-check-status";
+      statusBox.textContent = st.message || "上次一键更新已成功。";
+      if (button) button.disabled = false;
+      return;
+    }
+    if (st.last_attempt && st.last_attempt.reason) {
+      const when = st.last_attempt.updated_at ? new Date(st.last_attempt.updated_at * 1000).toLocaleString() : "";
+      statusBox.className = "update-check-status error";
+      statusBox.textContent = `上次一键更新未启动：${st.last_attempt.reason}${when ? "（" + when + "）" : ""}。`;
+      if (button) button.disabled = false;
+      return;
+    }
+    if (cancelled && cancelled.time) {
+      statusBox.className = "update-check-status";
+      statusBox.textContent = `上次已取消更新（${new Date(cancelled.time).toLocaleString()}）。`;
+      if (button) button.disabled = false;
+      return;
+    }
+  } catch (e) {
+    // 状态查询失败时不改写现有文字，静默返回。
+  }
+}
+
 if (adminBtn && adminDropdown) {
   adminBtn.onclick = (e) => {
     e.stopPropagation();
@@ -6643,6 +7077,10 @@ if (githubBtn && githubDropdown) {
     const isShow = githubDropdown.style.display === "block";
     githubDropdown.style.display = isShow ? "none" : "block";
     githubBtn.setAttribute("aria-expanded", isShow ? "false" : "true");
+    if (!isShow) {
+      // 1.2.2 (Q4): 打开下拉菜单时恢复更新状态（运行中则恢复轮询）。
+      restoreCodeUpdateStatus();
+    }
     if (adminDropdown) {
       adminDropdown.style.display = "none";
       if (adminBtn) adminBtn.setAttribute("aria-expanded", "false");
@@ -7320,6 +7758,10 @@ try {
   if (window.sessionStorage && sessionStorage.getItem("aimili_code_update_done") === "1") {
     sessionStorage.removeItem("aimili_code_update_done");
     checkForUpdate(null);
+  } else {
+    // 1.2.2 (Q4): 页面加载时恢复更新状态（运行中则恢复轮询；刷新后
+    // 不再只做检测更新，避免后台仍在跑的更新在刷新后不可见）。
+    restoreCodeUpdateStatus();
   }
 } catch (e) {}
 </script>
@@ -7931,10 +8373,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self.read_json_body()
                 if payload.get("confirmed") is not True:
+                    # 1.2.2: every rejected start leaves a panel log +
+                    # last-attempt record instead of vanishing silently.
+                    record_code_update_rejected("请先在确认框中确认更新", APP_VERSION)
                     self.send_json({"ok": False, "error": "请先在确认框中确认更新"}, HTTPStatus.BAD_REQUEST)
                     return
                 busy = code_update_busy_reason()
                 if busy:
+                    record_code_update_rejected(busy, APP_VERSION)
                     self.send_json(
                         {"ok": False, "running": True, "error": busy, "status": read_code_update_status()},
                         HTTPStatus.CONFLICT,
@@ -7943,27 +8389,28 @@ class Handler(BaseHTTPRequestHandler):
                 with code_update_lock:
                     busy = code_update_busy_reason()
                     if busy:
+                        record_code_update_rejected(busy, APP_VERSION)
                         self.send_json(
                             {"ok": False, "running": True, "error": busy, "status": read_code_update_status()},
                             HTTPStatus.CONFLICT,
                         )
                         return
                     current_version = APP_VERSION
-                    write_code_update_status(
-                        "running", "starting", "正在启动面板更新…", current_version, ""
-                    )
-                    if not spawn_code_updater():
-                        write_code_update_status(
-                            "failed", "starting", "无法启动更新器", current_version, "",
-                            error="无法启动更新器进程", needs_terminal=True,
-                        )
-                        self.send_json({"ok": False, "error": "无法启动更新器进程"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    # The start decision lives in start_code_update_updater()
+                    # so it is unit-testable without an HTTP server; the
+                    # sequence (write starting status, spawn, clear, log)
+                    # is unchanged, except a failed initial status write
+                    # now refuses to spawn instead of spawning blind.
+                    started, start_error = start_code_update_updater(current_version)
+                    if not started:
+                        self.send_json({"ok": False, "error": start_error}, HTTPStatus.INTERNAL_SERVER_ERROR)
                         return
-                    log_to_json("INFO", "CodeUpdate", f"面板一键更新已启动（当前版本 {current_version}）")
                     self.send_json({"ok": True, "running": True, "status": read_code_update_status()})
             except ValueError as exc:
+                record_code_update_rejected(str(exc) or "请求体解析失败", APP_VERSION)
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
+                record_code_update_rejected(str(exc) or "更新启动异常", APP_VERSION)
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
@@ -8221,7 +8668,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path == "/api/check":
             try:
-                self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
+                # 1.2.2: manual check always full-sweeps once.
+                self.send_json({"ok": True, "message": maintain_valid_nodes(force=True, trigger="check")})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_nodes":
@@ -8243,7 +8691,14 @@ class Handler(BaseHTTPRequestHandler):
                         "discovery_countries": discovery_countries,
                     })
                 else:
-                    threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
+                    # 1.2.2: explicit "manual" trigger -- this thread
+                    # must NOT be mistaken for an automatic maintain
+                    # (both historically used force=False).
+                    threading.Thread(
+                        target=maintain_valid_nodes,
+                        kwargs={"force": False, "trigger": "manual"},
+                        daemon=True,
+                    ).start()
                     self.send_json({
                         "ok": True,
                         "message": "已在后台启动节点更新流程",
