@@ -840,8 +840,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.1.0", manager.APP_VERSION)
-        self.assertEqual("V1.1.0 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.2.0", manager.APP_VERSION)
+        self.assertEqual("V1.2.0 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -913,8 +913,8 @@ class ManagerLogicTests(unittest.TestCase):
 
     def test_latest_release_check_reports_current_formal_version(self) -> None:
         release = {
-            "tag_name": "v1.1.0",
-            "name": "AimiliVPN V1.1.0 正式版",
+            "tag_name": "v1.2.0",
+            "name": "AimiliVPN V1.2.0 正式版",
             "draft": False,
             "prerelease": False,
         }
@@ -922,7 +922,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.1.0 正式版", result["current_version_label"])
+        self.assertEqual("V1.2.0 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -941,7 +941,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.1.0", result["current_version"])
+        self.assertEqual("1.2.0", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1254,3 +1254,220 @@ class ProxyServerConcurrencyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodeUpdateTests(unittest.TestCase):
+    """Panel one-click code update (1.2.0). All worker tests use fake
+    command runners, so no real git checkout, install, or restart ever runs
+    under test; the fake install dir is a temp dir, never the repo."""
+
+    def setUp(self) -> None:
+        self._saved_is_connecting = manager.is_connecting
+        self._saved_full_sweep = manager.full_sweep_running
+        self._saved_data_dir = manager.DATA_DIR
+        self._saved_deployment = manager.DEPLOYMENT_MODE
+        self._tmp = tempfile.TemporaryDirectory()
+        manager.DATA_DIR = Path(self._tmp.name)
+        manager.is_connecting = False
+        manager.full_sweep_running = False
+
+    def tearDown(self) -> None:
+        manager.is_connecting = self._saved_is_connecting
+        manager.full_sweep_running = self._saved_full_sweep
+        manager.DATA_DIR = self._saved_data_dir
+        manager.DEPLOYMENT_MODE = self._saved_deployment
+        if manager.maintenance_lock.locked():
+            manager.maintenance_lock.release()
+        self._tmp.cleanup()
+
+    def _make_install_dir(self, version: str = "1.1.0") -> Path:
+        install_dir = Path(self._tmp.name) / "install"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        (install_dir / ".git").mkdir(exist_ok=True)
+        (install_dir / "VERSION").write_text(version + "\n", encoding="utf-8")
+        return install_dir
+
+    def _fake_result(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
+        return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_score_button_tooltip_simplified_and_update_button_present(self) -> None:
+        html = manager.INDEX_HTML
+        self.assertIn('id="code_update_btn"', html)
+        self.assertIn("startCodeUpdate", html)
+        self.assertIn("一键更新", html)
+        self.assertIn("/api/update_code", html)
+        self.assertIn("/api/update_status", html)
+        self.assertIn('title="暂未启用"', html)
+        self.assertNotIn("评分功能为第三阶段，暂未启用", html)
+        self.assertIn("最长约 90 秒", html)
+        self.assertIn("出口 IP 可能变化", html)
+        self.assertIn("请用终端 ml update 重试", html)
+        self.assertIn("120000", html)
+        self.assertIn("aimili_code_update_done", html)
+
+    def test_update_worker_never_touches_scoring_gate(self) -> None:
+        source = (manager.ROOT_DIR / "vpngate_manager.py").read_text(encoding="utf-8")
+        self.assertIn("/api/update_code", source)
+        self.assertIn("/api/update_status", source)
+        self.assertNotIn("check_score", source)
+        self.assertNotIn("iplark_qualified", source)
+        self.assertNotIn("fetch_iplark_score", source)
+        start = source.index("def run_code_update_worker")
+        end = source.index("def spawn_code_updater")
+        self.assertNotIn("iplark", source[start:end])
+
+    def test_code_update_status_and_busy_reasons(self) -> None:
+        status = manager.read_code_update_status()
+        self.assertEqual("idle", status["result"])
+        manager.write_code_update_status(
+            "running", "fetch", "正在拉取 main 分支…", "1.1.0", ""
+        )
+        self.assertIn("进行中", manager.code_update_busy_reason() or "")
+        manager.write_code_update_status("idle", "", "", "1.1.0", "")
+        self.assertIsNone(manager.code_update_busy_reason())
+        manager.maintenance_lock.acquire()
+        try:
+            self.assertIn("维护", manager.code_update_busy_reason() or "")
+        finally:
+            manager.maintenance_lock.release()
+        manager.is_connecting = True
+        try:
+            self.assertIn("连接", manager.code_update_busy_reason() or "")
+        finally:
+            manager.is_connecting = False
+        manager.full_sweep_running = True
+        try:
+            self.assertIn("全量检测", manager.code_update_busy_reason() or "")
+        finally:
+            manager.full_sweep_running = False
+
+    def test_code_update_worker_already_latest_stops_without_reinstall(self) -> None:
+        install_dir = self._make_install_dir("1.1.0")
+        calls: list = []
+
+        def fake(cmd, cwd, timeout, env=None):
+            calls.append(list(cmd))
+            if cmd[:2] == ["git", "rev-parse"]:
+                return self._fake_result(0, "aaa111\n")
+            return self._fake_result(0)
+
+        result = manager.run_code_update_worker(
+            install_dir=install_dir, runner=fake, panel_healthy=lambda h, p, t: True
+        )
+        self.assertTrue(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("success", status["result"])
+        self.assertIn("已是最新", status["message"])
+        self.assertNotIn(["git", "checkout", "-B", "main", "origin/main"], calls)
+        self.assertNotIn(["bash", "install.sh"], calls)
+
+    def test_code_update_worker_temp_check_failure_keeps_old_code(self) -> None:
+        install_dir = self._make_install_dir("1.1.0")
+        calls: list = []
+
+        def fake(cmd, cwd, timeout, env=None):
+            calls.append(list(cmd))
+            if cmd[:2] == ["git", "rev-parse"] and cmd[2] == "HEAD":
+                return self._fake_result(0, "aaa111\n")
+            if cmd[:2] == ["git", "rev-parse"]:
+                return self._fake_result(0, "bbb222\n")
+            if cmd[:3] == ["git", "worktree", "add"]:
+                tmp_path = Path(cmd[4])
+                tmp_path.mkdir(parents=True, exist_ok=True)
+                (tmp_path / "vpngate_manager.py").write_text("def broken(:\n", encoding="utf-8")
+                return self._fake_result(0)
+            return self._fake_result(0)
+
+        result = manager.run_code_update_worker(
+            install_dir=install_dir, runner=fake, panel_healthy=lambda h, p, t: True
+        )
+        self.assertFalse(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("failed", status["result"])
+        self.assertEqual("check", status["stage"])
+        self.assertNotIn(["git", "checkout", "-B", "main", "origin/main"], calls)
+        self.assertNotIn(["bash", "install.sh"], calls)
+
+    def test_code_update_worker_post_checkout_failure_rolls_back(self) -> None:
+        install_dir = self._make_install_dir("1.1.0")
+        calls: list = []
+        install_calls = []
+
+        def fake(cmd, cwd, timeout, env=None):
+            calls.append(list(cmd))
+            if cmd[:2] == ["git", "rev-parse"] and cmd[2] == "HEAD":
+                return self._fake_result(0, "aaa111\n")
+            if cmd[:2] == ["git", "rev-parse"]:
+                return self._fake_result(0, "bbb222\n")
+            if cmd[:3] == ["git", "worktree", "add"]:
+                tmp_path = Path(cmd[4])
+                tmp_path.mkdir(parents=True, exist_ok=True)
+                (tmp_path / "vpngate_manager.py").write_text("x = 1\n", encoding="utf-8")
+                (tmp_path / "install.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+                return self._fake_result(0)
+            if cmd == ["bash", "install.sh"]:
+                install_calls.append(list(cmd))
+                # First install fails (post-checkout failure); the rollback
+                # reinstall succeeds.
+                return self._fake_result(1 if len(install_calls) == 1 else 0, "", "install boom")
+            return self._fake_result(0)
+
+        result = manager.run_code_update_worker(
+            install_dir=install_dir, runner=fake, panel_healthy=lambda h, p, t: True
+        )
+        self.assertFalse(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("failed", status["result"])
+        self.assertIn("已回滚", status["error"])
+        self.assertEqual(2, len(install_calls))
+        self.assertIn(["git", "checkout", "-B", "main", "aaa111"], calls)
+
+    def test_code_update_worker_docker_branch_uses_compose(self) -> None:
+        install_dir = self._make_install_dir("1.1.0")
+        calls: list = []
+
+        def fake(cmd, cwd, timeout, env=None):
+            calls.append(list(cmd))
+            return self._fake_result(0)
+
+        with mock.patch.object(manager, "DEPLOYMENT_MODE", "docker"):
+            result = manager.run_code_update_worker(
+                install_dir=install_dir, runner=fake, panel_healthy=lambda h, p, t: True
+            )
+        self.assertTrue(result)
+        self.assertIn(["docker", "compose", "pull"], calls)
+        self.assertIn(["docker", "compose", "up", "-d"], calls)
+        self.assertNotIn(["git", "checkout", "-B", "main", "origin/main"], calls)
+
+    def test_spawn_code_updater_prefers_systemd_scope_and_falls_back(self) -> None:
+        with (
+            mock.patch("subprocess.run", return_value=mock.Mock(returncode=0)) as run_mock,
+            mock.patch("subprocess.Popen") as popen_mock,
+        ):
+            self.assertTrue(manager.spawn_code_updater())
+            run_mock.assert_called_once()
+            popen_mock.assert_not_called()
+        with (
+            mock.patch("subprocess.run", side_effect=FileNotFoundError("no systemd-run")),
+            mock.patch("subprocess.Popen") as popen_mock,
+        ):
+            self.assertTrue(manager.spawn_code_updater())
+            popen_mock.assert_called_once()
+            _, kwargs = popen_mock.call_args
+            self.assertTrue(kwargs.get("start_new_session"))
+
+    def test_version_sync_1_2_0(self) -> None:
+        self.assertEqual("1.2.0", manager.APP_VERSION)
+        self.assertEqual("V1.2.0 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.2.0 正式版", manager.INDEX_HTML)
+        install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
+        self.assertIn('"1.2.0"', install_text)
+        self.assertNotIn('"1.1.0"', install_text)
+        compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
+        self.assertIn(":1.2.0", compose_text)
+        self.assertNotIn("1.1.0", compose_text)
+        version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
+        self.assertEqual("1.2.0", version_text)
+        changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## V1.2.0", changelog)
+        self.assertIn("## V1.1.0（2026-10-26，已发布正式版 v1.1.0）", changelog)
