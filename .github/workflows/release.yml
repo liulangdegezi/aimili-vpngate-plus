@@ -26,11 +26,20 @@ env:
 jobs:
   test:
     name: Test Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11", "3.13"]
+        include:
+          # Python 3.9 is no longer offered on the newest Ubuntu runner
+          # images (setup-python has no 3.9 build for Ubuntu 26.04), so
+          # pin this leg to ubuntu-22.04, where 3.9 is still available.
+          - python-version: "3.9"
+            os: ubuntu-22.04
+          - python-version: "3.11"
+            os: ubuntu-latest
+          - python-version: "3.13"
+            os: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
