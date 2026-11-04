@@ -176,7 +176,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.2.2"
+DEFAULT_APP_VERSION = "1.2.3"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -302,13 +302,25 @@ def upstream_proxy_auth_file() -> str | None:
 def write_json(path: Path, data: Any) -> None:
     with lock:
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        if path.name == "ui_auth.json":
+        try:
+            # Stream the document directly to the temporary file instead of
+            # first materializing the whole pretty-printed JSON string. The
+            # encoder settings are unchanged, so the resulting bytes are the
+            # same as json.dumps(..., ensure_ascii=False, indent=2).
+            with tmp.open("w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+            if path.name == "ui_auth.json":
+                try:
+                    tmp.chmod(0o600)
+                except OSError:
+                    pass
+            tmp.replace(path)
+        except Exception:
             try:
-                tmp.chmod(0o600)
+                tmp.unlink()
             except OSError:
                 pass
-        tmp.replace(path)
+            raise
         if path.name == "ui_auth.json":
             try:
                 path.chmod(0o600)
@@ -382,6 +394,7 @@ def load_ui_config() -> dict[str, Any]:
             "favorite_node_ids": [],
             "fav_fail_fallback": False,
             "discovery_countries": [],
+            "show_retained_pool_ips": True,
         }
         updated = False
         if auth_file.exists():
@@ -393,7 +406,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries", "show_retained_pool_ips"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -426,7 +439,11 @@ def load_ui_config() -> dict[str, Any]:
         if normalized_discovery_countries != config.get("discovery_countries"):
             config["discovery_countries"] = normalized_discovery_countries
             updated = True
-            
+
+        if not isinstance(config.get("show_retained_pool_ips"), bool):
+            config["show_retained_pool_ips"] = True
+            updated = True
+
         if not auth_file.exists() or updated:
             try:
                 DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -447,6 +464,25 @@ def persist_discovery_countries(value: Any) -> list[str]:
         DATA_DIR.mkdir(exist_ok=True, parents=True)
         write_json(auth_file, ui_cfg)
     return countries
+
+def persist_show_retained_pool_ips(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("显示保留池IP必须是布尔值")
+    ui_cfg = load_ui_config()
+    ui_cfg["show_retained_pool_ips"] = value
+    auth_file = DATA_DIR / "ui_auth.json"
+    with lock:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        write_json(auth_file, ui_cfg)
+    return value
+
+def filter_main_list_nodes(
+    nodes: list[dict[str, Any]], show_retained_pool_ips: bool
+) -> list[dict[str, Any]]:
+    """Apply the display-only retained-pool preference to the main list."""
+    if show_retained_pool_ips:
+        return list(nodes)
+    return [node for node in nodes if node.get("retention_status") != "observing"]
 
 # 初始化时优先从 ui_auth.json 加载保存的代理出站端口和网页端口配置以覆盖环境变量
 try:
@@ -583,6 +619,7 @@ def get_state() -> dict[str, Any]:
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["discovery_countries"] = normalize_discovery_countries(ui_cfg.get("discovery_countries"))
+    state["show_retained_pool_ips"] = bool(ui_cfg.get("show_retained_pool_ips", True))
     state["fav_fail_fallback"] = False
     
     return state
@@ -1750,8 +1787,20 @@ def read_snapshot_file(path: Path) -> str:
         raise ValueError(f"本地快照大小无效: {size}")
     return path.read_bytes().decode("utf-8", errors="strict")
 
-def cache_api_snapshot(text: str, source: str) -> None:
-    validated_rows = snapshot_utils.parse_and_validate_snapshot(text, max_rows=MAX_SCAN_ROWS)
+def cache_api_snapshot(
+    text: str,
+    source: str,
+    parsed_rows: list[dict[str, str]] | None = None,
+) -> None:
+    # Fetch paths have already parsed and validated this exact text. Reusing
+    # their row list only supplies the meta row count; it does not change the
+    # cached bytes or any meta field. Direct callers may omit the rows, in
+    # which case this function retains its original standalone behavior.
+    validated_rows = (
+        parsed_rows
+        if parsed_rows is not None
+        else snapshot_utils.parse_and_validate_snapshot(text, max_rows=MAX_SCAN_ROWS)
+    )
     encoded = text.encode("utf-8")
     with lock:
         DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -1799,8 +1848,14 @@ def rows_to_candidates(
         if not ip or ip in seen_ips:
             continue
         try:
-            config_text = decode_config(row.get("OpenVPN_ConfigData_Base64", ""))
-            snapshot_utils.validate_openvpn_config(config_text)
+            validated_config_text = getattr(row, "validated_config_text", None)
+            if isinstance(validated_config_text, str) and validated_config_text:
+                # parse_and_validate_snapshot already decoded and validated
+                # this exact row once; reuse that result here.
+                config_text = validated_config_text
+            else:
+                config_text = decode_config(row.get("OpenVPN_ConfigData_Base64", ""))
+                snapshot_utils.validate_openvpn_config(config_text)
             node = row_to_node(row, config_text)
         except Exception as row_exc:
             print(f"[fetch_candidates] 跳过损坏或不安全的节点配置记录: {row_exc}", flush=True)
@@ -1848,7 +1903,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
             # Plain HTTP remains available for older machines, but never replaces
             # the last snapshot obtained through an authenticated HTTPS channel.
             if url.startswith("https://"):
-                cache_api_snapshot(api_text, source_name)
+                cache_api_snapshot(api_text, source_name, rows)
 
             filtered_candidates = filter_candidates_by_discovery_countries(
                 candidates,
@@ -1900,7 +1955,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
             if not candidates:
                 raise ValueError("本地快照没有未被屏蔽的候选节点")
             if source_name == "bundled_initial" and not API_CACHE_FILE.exists():
-                cache_api_snapshot(api_text, source_name)
+                cache_api_snapshot(api_text, source_name, rows)
             filtered_candidates = filter_candidates_by_discovery_countries(
                 candidates,
                 discovery_countries,
@@ -2391,12 +2446,8 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # Phase 1 integration: retained pool + favorites-first selection (plan §三/§四)
 # ---------------------------------------------------------------------------
 
-def archive_retained_node(node: dict[str, Any], reason: str) -> None:
-    """Append a retained node's record to the history archive before it is
-    deleted (plan §三.2). The archive keeps the connection config plus the
-    last-seen / last-success times, so a good node can be restored manually
-    even after it disappears from the VPNGate list."""
-    record = {
+def _retained_archive_record(node: dict[str, Any], reason: str) -> dict[str, Any]:
+    return {
         "id": node.get("id"),
         "country": node.get("country"),
         "country_short": node.get("country_short"),
@@ -2412,17 +2463,47 @@ def archive_retained_node(node: dict[str, Any], reason: str) -> None:
         "archived_at": time.time(),
         "reason": reason,
     }
+
+
+def archive_retained_nodes(entries: list[tuple[dict[str, Any], str]]) -> int:
+    """Append a batch of retained-node records with one archive read/write.
+
+    Record construction, field order, append order, and the newest-1000 cap
+    are identical to repeated single-node archiving. If the single batch
+    write fails, the function falls back to the old per-node attempts so a
+    transient failure does not change which later records can be archived.
+    """
+    if not entries:
+        return 0
+    records = [_retained_archive_record(node, reason) for node, reason in entries]
     try:
         archive = read_json(RETAINED_ARCHIVE_FILE, [])
         if not isinstance(archive, list):
             archive = []
-        archive.append(record)
+        archive.extend(records)
         if len(archive) > 1000:
             archive = archive[-1000:]
         DATA_DIR.mkdir(exist_ok=True, parents=True)
         write_json(RETAINED_ARCHIVE_FILE, archive)
     except Exception as exc:
-        print(f"[保留池] 归档节点 {node.get('id')} 失败: {exc}", flush=True)
+        if len(entries) > 1:
+            # Preserve the old failure-path behavior: a transient batch
+            # failure should not prevent later records from being archived
+            # by their individual attempts. The successful hot path above
+            # remains exactly one read and one write for the whole batch.
+            for entry in entries:
+                archive_retained_nodes([entry])
+        else:
+            print(f"[保留池] 归档节点 {entries[0][0].get('id')} 失败: {exc}", flush=True)
+    return len(entries)
+
+
+def archive_retained_node(node: dict[str, Any], reason: str) -> None:
+    """Append a retained node's record to the history archive before it is
+    deleted (plan §三.2). The archive keeps the connection config plus the
+    last-seen / last-success times, so a good node can be restored manually
+    even after it disappears from the VPNGate list."""
+    archive_retained_nodes([(node, reason)])
 
 
 def composite_node_score(node: dict[str, Any], pool: list[dict[str, Any]]) -> float:
@@ -2523,13 +2604,21 @@ def rank_selection_candidates(
     return [n for n, _ in fav + rest]
 
 
-def sweep_retained_nodes(now: float | None = None) -> int:
+def sweep_retained_nodes(
+    now: float | None = None,
+    nodes: list[dict[str, Any]] | None = None,
+) -> int:
     """Archive + delete retained nodes that meet the failure + staleness
     thresholds (plan §三.5). A node is deleted only when BOTH its failure
     count and its absence from the source list exceed the thresholds:
     TCP nodes need >= 3 failures and 24h unseen, non-TCP nodes need
     >= 5 consecutive failures and 72h unseen. Never touches active,
-    favorite, blacklisted or fixed nodes. Returns the archived count."""
+    favorite, blacklisted or fixed nodes. Returns the archived count.
+
+    Callers that already hold the current node list may pass it in; the
+    kept list is then reflected back into that same list object after the
+    single batched archive/write, avoiding another full nodes-file parse.
+    """
     now = time.time() if now is None else now
     try:
         ui_cfg = load_ui_config()
@@ -2539,10 +2628,10 @@ def sweep_retained_nodes(now: float | None = None) -> int:
     fixed_id = str(ui_cfg.get("fixed_node_id") or "")
     blacklist = load_blacklist()
     with lock:
-        nodes = read_nodes()
+        source_nodes = read_nodes() if nodes is None else nodes
         kept: list[dict[str, Any]] = []
-        archived_count = 0
-        for n in nodes:
+        archive_entries: list[tuple[dict[str, Any], str]] = []
+        for n in source_nodes:
             nid = str(n.get("id") or "")
             if (
                 n.get("retention_status") == "observing"
@@ -2566,19 +2655,32 @@ def sweep_retained_nodes(now: float | None = None) -> int:
                         and stale_for >= RETAINED_NON_TCP_STALE_SECONDS
                     )
                 if dead:
-                    archive_retained_node(n, "liveness-threshold")
-                    archived_count += 1
+                    archive_entries.append((n, "liveness-threshold"))
                     continue
             kept.append(n)
+        archived_count = len(archive_entries)
         if archived_count:
+            archive_retained_nodes(archive_entries)
+            if nodes is not None:
+                nodes[:] = kept
             write_json(NODES_FILE, kept)
         return archived_count
 
 
-def enrich_stored_nodes() -> int:
-    """Enrich every listed IP, then merge only metadata into the latest state."""
-    with lock:
-        snapshot = read_nodes()
+def enrich_stored_nodes(nodes: list[dict[str, Any]] | None = None) -> int:
+    """Enrich every listed IP, then merge only metadata into the latest state.
+
+    A caller that has just loaded the node list may pass that snapshot in,
+    eliminating the first of this function's two reads. The second read is
+    deliberately retained: enrichment can take time, and only metadata may
+    be merged into the latest on-disk state so concurrent probe results are
+    not overwritten by the older enrichment snapshot.
+    """
+    if nodes is None:
+        with lock:
+            snapshot = read_nodes()
+    else:
+        snapshot = list(nodes)
     if not snapshot:
         return 0
 
@@ -2609,10 +2711,11 @@ def enrich_stored_nodes() -> int:
 
 def ip_enrichment_loop() -> None:
     while True:
-        nodes_exist = bool(read_nodes())
+        latest_nodes = read_nodes()
+        nodes_exist = bool(latest_nodes)
         if nodes_exist:
             try:
-                enrich_stored_nodes()
+                enrich_stored_nodes(latest_nodes)
             except Exception as exc:
                 print(f"[IP 类型] 后台批量识别失败: {exc}", flush=True)
                 log_to_json("WARNING", "Main", f"后台批量识别 IP 类型失败: {exc}")
@@ -2853,6 +2956,30 @@ def run_full_sweep(systemic_probe_failure: str = "") -> dict[str, Any]:
         }
     finally:
         full_sweep_running = False
+
+
+def _apply_probe_results(
+    nodes: list[dict[str, Any]], results: list[dict[str, Any]]
+) -> None:
+    """Reflect already-persisted probe results in a caller-held node list.
+
+    ``test_multiple_nodes`` remains responsible for persistence. This only
+    keeps ``maintain_valid_nodes`` from reparsing the whole nodes file after
+    each testing stage merely to make its next in-memory decision.
+    """
+    nodes_by_id = {
+        str(node.get("id") or ""): node for node in nodes if node.get("id")
+    }
+    for result in results:
+        node = nodes_by_id.get(str(result.get("id") or ""))
+        if node is None:
+            continue
+        node.update(result)
+        if result.get("probe_status") == "available":
+            node["consecutive_failures"] = 0
+            node["last_success_at"] = time.time()
+        elif result.get("probe_status") is not None:
+            node["consecutive_failures"] = int(node.get("consecutive_failures") or 0) + 1
 
 
 def current_fixed_node_id(ui_cfg: dict[str, Any]) -> str:
@@ -3636,6 +3763,7 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
             now = time.time()
                 
             merged: list[dict[str, Any]] = []
+            archive_entries: list[tuple[dict[str, Any], str]] = []
             seen_ids: set[str] = set()
             
             if active_node:
@@ -3699,11 +3827,11 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
                     seen_ids.add(oid)
                     continue
                 if not retention_eligible(old, retention_ui_cfg):
-                    archive_retained_node(old, "retention-filter-non-matching")
+                    archive_entries.append((old, "retention-filter-non-matching"))
                     continue
                 last_seen = float(old.get("last_seen_at") or old.get("fetched_at") or now)
                 if old.get("retention_status") == "observing" and now - last_seen > RETAINED_OBSERVING_GRACE_SECONDS:
-                    archive_retained_node(old, "observing-grace-expired")
+                    archive_entries.append((old, "observing-grace-expired"))
                     continue
                 old["retention_status"] = "observing"
                 old["source_present"] = 0
@@ -3717,15 +3845,18 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
                 evicted_ids = {str(n.get("id")) for n in observing[:len(observing) - RETAINED_POOL_MAX_NODES]}
                 for evicted in observing:
                     if str(evicted.get("id")) in evicted_ids:
-                        archive_retained_node(evicted, "retained-pool-capacity")
+                        archive_entries.append((evicted, "retained-pool-capacity"))
                 merged = [n for n in merged if str(n.get("id")) not in evicted_ids]
             if len(merged) > 1000:
                 dropped = merged[1000:]
                 for d in dropped:
                     if d.get("retention_status") == "observing" or str(d.get("id")) in fav_ids:
-                        archive_retained_node(d, "node-list-capacity")
+                        archive_entries.append((d, "node-list-capacity"))
                 merged = merged[:1000]
                 
+            if archive_entries:
+                archive_retained_nodes(archive_entries)
+
             for n in merged:
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
@@ -3733,8 +3864,9 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
                         config_path.write_text(n["config_text"], encoding="utf-8")
                     except Exception:
                         pass
-                        
+
             write_json(NODES_FILE, merged)
+            current_nodes = merged
             ip_enrichment_wakeup.set()
 
         # Phase 1 retention: liveness sweep, at most once per interval.
@@ -3743,7 +3875,7 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
         except Exception:
             last_sweep = 0
         if time.time() - last_sweep >= RETAINED_LIVENESS_SWEEP_SECONDS:
-            swept = sweep_retained_nodes()
+            swept = sweep_retained_nodes(nodes=current_nodes)
             set_state(last_retained_sweep_at=time.time())
             if swept:
                 log_to_json("INFO", "Main", f"保留池存活清理：归档并删除 {swept} 个失效节点")
@@ -3761,18 +3893,16 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
             and not active_openvpn_running()
         )
         if should_fast_connect:
-            with lock:
-                current_nodes = read_nodes()
-                fast_candidates = [
-                    n for n in current_nodes
-                    if not n.get("active") and n.get("probe_status") != "unavailable"
-                ]
-                fast_candidates = apply_routing_filters(fast_candidates, ui_cfg, include_unknown_ip_type=True)
-                fast_candidates.sort(key=probe_priority_key)
-                fast_test_ids = [
-                    n["id"] for n in fast_candidates
-                    if n.get("id")
-                ][:INITIAL_CONNECT_TEST_LIMIT]
+            fast_candidates = [
+                n for n in current_nodes
+                if not n.get("active") and n.get("probe_status") != "unavailable"
+            ]
+            fast_candidates = apply_routing_filters(fast_candidates, ui_cfg, include_unknown_ip_type=True)
+            fast_candidates.sort(key=probe_priority_key)
+            fast_test_ids = [
+                n["id"] for n in fast_candidates
+                if n.get("id")
+            ][:INITIAL_CONNECT_TEST_LIMIT]
 
             if fast_test_ids:
                 msg = f"首次快速连接模式：优先测试 {len(fast_test_ids)} 个高优先级节点，发现可用节点后立即连接"
@@ -3794,20 +3924,19 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
                     if result.get("id")
                 }
 
-                with lock:
-                    fast_nodes = read_nodes()
-                    available_candidates = [
-                        n for n in fast_nodes
-                        if n.get("probe_status") == "available" and not n.get("active")
-                    ]
-                    available_candidates = apply_routing_filters(available_candidates, ui_cfg)
+                _apply_probe_results(current_nodes, fast_results)
+                available_candidates = [
+                    n for n in current_nodes
+                    if n.get("probe_status") == "available" and not n.get("active")
+                ]
+                available_candidates = apply_routing_filters(available_candidates, ui_cfg)
 
                 if available_candidates:
                     is_connecting = False
                     set_state(is_connecting=False, last_check_message="快速首连已找到可用节点，正在建立连接...")
                     auto_switch_node()
                     if active_openvpn_running():
-                        valid_nodes_count = len([n for n in read_nodes() if n.get("probe_status") == "available"])
+                        valid_nodes_count = len([n for n in current_nodes if n.get("probe_status") == "available"])
                         message = f"Fetched {len(candidates)} nodes. Fast-tested {len(fast_results)} nodes and connected."
                         # 1.2.2 gating: same decision as the terminal
                         # sweep below; a skip is written into the message
@@ -3843,16 +3972,15 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
             log_to_json("ERROR", "VPN", msg)
             set_state(last_check_message=msg)
         else:
-            # Test remaining non-active nodes from the list
-            with lock:
-                current_nodes = read_nodes()
-                to_test = [
-                    n for n in current_nodes
-                    if not n.get("active") and n.get("id") not in initial_tested_ids
-                ]
-                to_test = apply_routing_filters(to_test, ui_cfg, include_unknown_ip_type=True)
-                to_test.sort(key=probe_priority_key)
-                to_test_ids = [n["id"] for n in to_test]
+            # Test remaining non-active nodes from the list already held by
+            # this maintenance run; fast-stage results were applied above.
+            to_test = [
+                n for n in current_nodes
+                if not n.get("active") and n.get("id") not in initial_tested_ids
+            ]
+            to_test = apply_routing_filters(to_test, ui_cfg, include_unknown_ip_type=True)
+            to_test.sort(key=probe_priority_key)
+            to_test_ids = [n["id"] for n in to_test]
 
             msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
             print(f"[周期检测] {msg}", flush=True)
@@ -3860,11 +3988,12 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
 
             set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
             tested_results = test_multiple_nodes(to_test_ids, target_available=TARGET_VALID_NODES)
+        _apply_probe_results(current_nodes, tested_results)
         is_connecting = False
-        
+
         with lock:
-            merged = read_nodes()
-            
+            merged = current_nodes
+
             # Identify available, unavailable, and active nodes
             available_nodes = [n["id"] for n in merged if n.get("probe_status") == "available"]
             unavailable_nodes = [n["id"] for n in merged if n.get("probe_status") == "unavailable"]
@@ -5430,12 +5559,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.2.2 正式版</span>
+        <span id="github_version_label">V1.2.3 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.2.2 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.2.3 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
@@ -5537,6 +5666,10 @@ INDEX_HTML = r"""<!doctype html>
     <button id="btn_retained" class="toolbar-btn" type="button" onclick="toggleRetainedView()" style="height: 42px; gap: 6px;">
       保留池
     </button>
+    <label class="toolbar-btn" for="show_retained_pool_ips" style="height: 42px; gap: 6px; display: inline-flex; align-items: center; cursor: pointer;">
+      <input id="show_retained_pool_ips" type="checkbox" checked onchange="toggleRetainedPoolVisibility(this)">
+      <span>显示保留池IP</span>
+    </label>
   </section>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
@@ -6278,7 +6411,8 @@ function stableSortNodes() {
 }
 
 function render(){
-  const versionLabel = state.app_version_label || "V1.2.2 正式版";
+  updateRetainedPoolVisibilityUI();
+  const versionLabel = state.app_version_label || "V1.2.3 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -6594,7 +6728,22 @@ async function fetchNodesSnapshot() {
   const request = (async () => {
     const response = await fetchWithTimeout("./api/nodes", { cache: "no-store" }, 20000);
     if (!response.ok) throw new Error(`节点状态请求失败 (${response.status})`);
-    return response.json();
+    const mainData = await response.json();
+    if (!showRetainedOnly) return mainData;
+    if (mainData.show_retained_pool_ips !== false) return mainData;
+
+    // Only when the display preference actually filtered /api/nodes does
+    // the dedicated retained-pool view fall back to its own endpoint, so it
+    // remains available without changing the main-list response. The main
+    // response still supplies current state.
+    const retainedResponse = await fetchWithTimeout("./api/retained", { cache: "no-store" }, 20000);
+    if (!retainedResponse.ok) throw new Error(`保留池请求失败 (${retainedResponse.status})`);
+    const retainedData = await retainedResponse.json();
+    return {
+      nodes: Array.isArray(retainedData.retained) ? retainedData.retained : [],
+      state: mainData.state || {},
+      show_retained_pool_ips: mainData.show_retained_pool_ips,
+    };
   })();
   nodesRequestPromise = request;
   try {
@@ -7124,7 +7273,31 @@ function toggleRetainedView() {
   showRetainedOnly = !showRetainedOnly;
   if (showRetainedOnly) showFavoritesOnly = false;
   currentPage = 1;
-  render();
+  load();
+}
+
+async function toggleRetainedPoolVisibility(input) {
+  const enabled = !!input.checked;
+  state.show_retained_pool_ips = enabled;
+  try {
+    const response = await fetchWithTimeout("./api/update_retained_pool_visibility", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ show_retained_pool_ips: enabled })
+    }, 20000);
+    const result = await readJsonResponse(response, "保存显示保留池IP设置失败");
+    if (!result.ok) throw new Error(result.error || "保存显示保留池IP设置失败");
+    state.show_retained_pool_ips = result.show_retained_pool_ips === true;
+    await load();
+  } catch (e) {
+    alert("保存显示保留池IP设置失败: " + (e.message || "未知错误"));
+    await load();
+  }
+}
+
+function updateRetainedPoolVisibilityUI() {
+  const input = $("show_retained_pool_ips");
+  if (input) input.checked = !state || state.show_retained_pool_ips !== false;
 }
 
 function updateRetainedButtonUI() {
@@ -8110,6 +8283,9 @@ class Handler(BaseHTTPRequestHandler):
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_nodes()
             connection_state = get_state()
+            show_retained_pool_ips = bool(
+                connection_state.get("show_retained_pool_ips", True)
+            )
             connection_ready = connection_ready_for_ui(connection_state)
             active_node = next((n for n in nodes if connection_ready and n.get("id") == active_openvpn_node_id), None)
             for n in nodes:
@@ -8135,13 +8311,18 @@ class Handler(BaseHTTPRequestHandler):
                         ).start()
                     if last_active_latency > 0:
                         active_node["latency_ms"] = last_active_latency
+            visible_nodes = filter_main_list_nodes(nodes, show_retained_pool_ips)
             stripped_nodes = []
-            for n in nodes:
+            for n in visible_nodes:
                 stripped = n.copy()
                 if "config_text" in stripped:
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
-            self.send_json({"nodes": stripped_nodes, "state": get_state()})
+            self.send_json({
+                "nodes": stripped_nodes,
+                "state": get_state(),
+                "show_retained_pool_ips": show_retained_pool_ips,
+            })
         elif effective_path == "/api/retained":
             # Phase 1 retained-pool overview: observing nodes + archive count.
             nodes = read_nodes()
@@ -8474,6 +8655,23 @@ class Handler(BaseHTTPRequestHandler):
                     threading.Thread(target=restart_server, daemon=True).start()
                 else:
                     self.send_json({"ok": True, "restart_needed": False, "reauth_required": reauth_required, "message": "账号密码配置更新成功，已即时生效！"})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        elif effective_path == "/api/update_retained_pool_visibility":
+            try:
+                payload = self.read_json_body()
+                enabled = persist_show_retained_pool_ips(
+                    payload.get("show_retained_pool_ips")
+                )
+                self.send_json({
+                    "ok": True,
+                    "show_retained_pool_ips": enabled,
+                    "message": "显示保留池IP设置已保存",
+                })
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return

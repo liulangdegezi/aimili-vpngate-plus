@@ -4,7 +4,8 @@ import base64
 import csv
 import io
 import re
-from typing import Any
+from itertools import chain
+from typing import Any, Iterator
 
 
 MAX_SNAPSHOT_BYTES = 12 * 1024 * 1024
@@ -134,18 +135,44 @@ def validate_openvpn_config(config_text: str) -> None:
         raise ValueError("OpenVPN certificate blocks are incomplete")
 
 
+class ValidatedSnapshotRow(dict[str, str]):
+    """A snapshot row whose OpenVPN config was decoded and validated once.
+
+    The decoded text travels as an attribute rather than a mapping key, so
+    the row's public CSV fields (and any equality/serialization behavior)
+    remain exactly the parsed fields. ``rows_to_candidates`` can therefore
+    reuse the validation result without adding a synthetic column.
+    """
+
+    validated_config_text: str
+
+
+def _snapshot_content_lines(text: str) -> Iterator[str]:
+    """Yield VPNGate content lines without materializing a joined copy."""
+    first_content_line = True
+    for raw_line in io.StringIO(text):
+        line = raw_line.rstrip("\r\n")
+        if not line or line.startswith("*"):
+            continue
+        if first_content_line:
+            first_content_line = False
+            if line.startswith("#"):
+                line = line[1:]
+        yield line
+
+
 def parse_and_validate_snapshot(text: str, max_rows: int | None = None) -> list[dict[str, str]]:
     raw_size = len(text.encode("utf-8"))
     if raw_size <= 0 or raw_size > MAX_SNAPSHOT_BYTES:
         raise ValueError("VPNGate snapshot size is invalid")
 
-    lines = [line for line in text.splitlines() if line and not line.startswith("*")]
-    if not lines:
-        raise ValueError("VPNGate snapshot is empty")
-    if lines[0].startswith("#"):
-        lines[0] = lines[0][1:]
+    lines = _snapshot_content_lines(text)
+    try:
+        first_line = next(lines)
+    except StopIteration:
+        raise ValueError("VPNGate snapshot is empty") from None
 
-    reader = csv.DictReader(io.StringIO("\n".join(lines)))
+    reader = csv.DictReader(chain([first_line], lines))
     fieldnames = set(reader.fieldnames or [])
     if not REQUIRED_COLUMNS.issubset(fieldnames):
         raise ValueError("VPNGate snapshot columns are incomplete")
@@ -160,7 +187,9 @@ def parse_and_validate_snapshot(text: str, max_rows: int | None = None) -> list[
             validate_openvpn_config(config_text)
         except (UnicodeError, ValueError):
             continue
-        rows.append(normalized)
+        validated_row = ValidatedSnapshotRow(normalized)
+        validated_row.validated_config_text = config_text
+        rows.append(validated_row)
         if max_rows is not None and len(rows) >= max_rows:
             break
     if not rows:
