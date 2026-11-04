@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -842,8 +843,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.2.2", manager.APP_VERSION)
-        self.assertEqual("V1.2.2 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.2.3", manager.APP_VERSION)
+        self.assertEqual("V1.2.3 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -918,8 +919,8 @@ class ManagerLogicTests(unittest.TestCase):
 
     def test_latest_release_check_reports_current_formal_version(self) -> None:
         release = {
-            "tag_name": "v1.2.2",
-            "name": "AimiliVPN V1.2.2 正式版",
+            "tag_name": "v1.2.3",
+            "name": "AimiliVPN V1.2.3 正式版",
             "draft": False,
             "prerelease": False,
         }
@@ -927,7 +928,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.2.2 正式版", result["current_version_label"])
+        self.assertEqual("V1.2.3 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -946,7 +947,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.2.2", result["current_version"])
+        self.assertEqual("1.2.3", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1461,19 +1462,20 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_2_2(self) -> None:
-        self.assertEqual("1.2.2", manager.APP_VERSION)
-        self.assertEqual("V1.2.2 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.2.2 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_2_3(self) -> None:
+        self.assertEqual("1.2.3", manager.APP_VERSION)
+        self.assertEqual("V1.2.3 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.2.3 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.2.2"', install_text)
-        self.assertNotIn('"1.2.1"', install_text)
+        self.assertIn('"1.2.3"', install_text)
+        self.assertNotIn('"1.2.2"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.2.2", compose_text)
-        self.assertNotIn("1.2.1", compose_text)
+        self.assertIn(":1.2.3", compose_text)
+        self.assertNotIn("1.2.2", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.2.2", version_text)
+        self.assertEqual("1.2.3", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## V1.2.3（2026-11-04，已发布正式版 v1.2.3）", changelog)
         self.assertIn("## V1.2.2", changelog)
         self.assertIn("## V1.2.1（2026-10-26，已发布正式版 v1.2.1）", changelog)
         self.assertIn("## V1.2.0（2026-10-26，已发布正式版 v1.2.0）", changelog)
@@ -2104,3 +2106,246 @@ class CodeUpdateWriteFailureTests(unittest.TestCase):
         self.assertIn("已回滚", status["error"])
         self.assertIn("code_update_status.json", err.getvalue())
         self.assertIn("已回滚", self._log_text())
+
+
+class SlimmingAndRetainedVisibilityTests(unittest.TestCase):
+    """Regression tests for the 1.2.3 memory slimming + display switch."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.root = root
+        self.path_patches = [
+            mock.patch.object(manager, "DATA_DIR", root),
+            mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
+            mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "STATE_FILE", root / "state.json"),
+            mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
+            mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
+            mock.patch.object(manager, "API_CACHE_FILE", root / "api_snapshot.csv"),
+            mock.patch.object(manager, "API_CACHE_META_FILE", root / "api_snapshot.meta.json"),
+            mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
+            mock.patch.object(manager, "RETAINED_ARCHIVE_FILE", root / "retained_archive.json"),
+            mock.patch.object(manager.vpn_utils, "DATA_DIR", root),
+            mock.patch.object(manager.vpn_utils, "IP_CACHE_FILE", root / "ip_cache.json"),
+        ]
+        for patcher in self.path_patches:
+            patcher.start()
+        manager.ensure_dirs()
+        manager.active_openvpn_process = None
+        manager.active_openvpn_node_id = ""
+        manager.is_connecting = False
+        manager.active_sessions.clear()
+
+    def tearDown(self) -> None:
+        manager.active_sessions.clear()
+        for patcher in reversed(self.path_patches):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _archive_node(index: int) -> dict:
+        return {
+            "id": f"archive-node-{index}",
+            "country": "Japan",
+            "country_short": "JP",
+            "ip": f"192.0.2.{index + 1}",
+            "remote_host": f"192.0.2.{index + 1}",
+            "remote_port": 1194,
+            "proto": "udp",
+            "ip_type": "residential",
+            "config_text": f"client\nremote 192.0.2.{index + 1} 1194 udp\n",
+            "config_file": f"/tmp/archive-node-{index}.ovpn",
+            "last_seen_at": 1000 + index,
+            "last_success_at": 900 + index,
+        }
+
+    def test_batch_archive_matches_repeated_single_archive_and_cap(self) -> None:
+        initial = [
+            {
+                "id": f"existing-{index}",
+                "country": "Japan",
+                "config_text": "existing-config",
+                "archived_at": 1,
+                "reason": "existing",
+            }
+            for index in range(999)
+        ]
+        entries = [(self._archive_node(index), f"reason-{index}") for index in range(3)]
+
+        single_path = self.root / "archive_single.json"
+        batch_path = self.root / "archive_batch.json"
+        with mock.patch.object(manager.time, "time", return_value=1234567890.0):
+            with mock.patch.object(manager, "RETAINED_ARCHIVE_FILE", single_path):
+                manager.write_json(single_path, initial)
+                for node, reason in entries:
+                    manager.archive_retained_node(node, reason)
+            with mock.patch.object(manager, "RETAINED_ARCHIVE_FILE", batch_path):
+                manager.write_json(batch_path, initial)
+                archived = manager.archive_retained_nodes(entries)
+
+        self.assertEqual(3, archived)
+        self.assertEqual(single_path.read_bytes(), batch_path.read_bytes())
+        batch_records = json.loads(batch_path.read_text(encoding="utf-8"))
+        self.assertEqual(1000, len(batch_records))
+        self.assertEqual("existing-2", batch_records[0]["id"])
+        self.assertEqual(
+            [f"archive-node-{index}" for index in range(3)],
+            [record["id"] for record in batch_records[-3:]],
+        )
+
+    def test_write_json_streams_same_bytes_as_pretty_dumps(self) -> None:
+        payload = {
+            "name": "日本ノード",
+            "items": [{"id": 1, "enabled": True}, {"id": 2, "note": None}],
+            "empty": [],
+        }
+        target = self.root / "payload.json"
+
+        manager.write_json(target, payload)
+
+        self.assertEqual(
+            json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+            target.read_bytes(),
+        )
+        self.assertEqual(payload, json.loads(target.read_text(encoding="utf-8")))
+
+    def test_parsed_snapshot_config_is_reused_by_rows_to_candidates(self) -> None:
+        rows = manager.parse_vpngate_rows(valid_snapshot())
+
+        with (
+            mock.patch.object(
+                manager,
+                "decode_config",
+                side_effect=AssertionError("config was decoded a second time"),
+            ),
+            mock.patch.object(
+                manager.snapshot_utils,
+                "validate_openvpn_config",
+                side_effect=AssertionError("config was validated a second time"),
+            ),
+        ):
+            candidates = manager.rows_to_candidates(rows, {})
+
+        self.assertEqual(1, len(candidates))
+        self.assertIn("remote 198.51.100.10 1194", candidates[0]["config_text"])
+        self.assertEqual(rows, [dict(row) for row in rows])
+
+    def test_cache_api_snapshot_accepts_preparsed_rows_without_reparsing(self) -> None:
+        text = valid_snapshot()
+        rows = manager.parse_vpngate_rows(text)
+
+        with mock.patch.object(
+            manager.snapshot_utils,
+            "parse_and_validate_snapshot",
+            side_effect=AssertionError("snapshot was parsed a third time"),
+        ):
+            manager.cache_api_snapshot(text, "test-source", rows)
+
+        meta = json.loads(manager.API_CACHE_META_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(text.encode("utf-8"), manager.API_CACHE_FILE.read_bytes())
+        self.assertEqual("test-source", meta["source"])
+        self.assertEqual(1, meta["row_count"])
+        self.assertEqual(len(text.encode("utf-8")), meta["byte_count"])
+
+    def test_retained_visibility_defaults_on_persists_and_filters_http_nodes(self) -> None:
+        nodes = [
+            {
+                "id": "latest-node",
+                "ip": "192.0.2.10",
+                "remote_host": "192.0.2.10",
+                "remote_port": 1194,
+                "retention_status": "normal",
+                "source_present": 1,
+                "probe_status": "not_checked",
+                "config_text": "latest-config",
+                "config_file": str(manager.CONFIG_DIR / "latest-node.ovpn"),
+                "active": False,
+            },
+            {
+                "id": "retained-node",
+                "ip": "192.0.2.11",
+                "remote_host": "192.0.2.11",
+                "remote_port": 1194,
+                "retention_status": "observing",
+                "source_present": 0,
+                "probe_status": "not_checked",
+                "config_text": "retained-config",
+                "config_file": str(manager.CONFIG_DIR / "retained-node.ovpn"),
+                "active": False,
+            },
+        ]
+        manager.write_json(manager.NODES_FILE, nodes)
+        self.assertTrue(manager.load_ui_config()["show_retained_pool_ips"])
+        self.assertTrue(manager.get_state()["show_retained_pool_ips"])
+
+        manager.active_sessions["slimming-test-token"] = manager.time.time() + 60
+        server = manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}/EJsW2EeBo9lY"
+
+        def request(path: str, payload: dict | None = None) -> tuple[int, dict]:
+            data = None
+            headers = {"Cookie": "session=slimming-test-token"}
+            if payload is not None:
+                data = json.dumps(payload).encode("utf-8")
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(
+                base_url + path,
+                data=data,
+                headers=headers,
+                method="POST" if payload is not None else "GET",
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+
+        try:
+            status, default_payload = request("/api/nodes")
+            self.assertEqual(200, status)
+            self.assertTrue(default_payload["show_retained_pool_ips"])
+            self.assertEqual(
+                {"latest-node", "retained-node"},
+                {node["id"] for node in default_payload["nodes"]},
+            )
+
+            status, off_payload = request(
+                "/api/update_retained_pool_visibility",
+                {"show_retained_pool_ips": False},
+            )
+            self.assertEqual(200, status)
+            self.assertFalse(off_payload["show_retained_pool_ips"])
+            self.assertFalse(manager.load_ui_config()["show_retained_pool_ips"])
+
+            status, filtered_payload = request("/api/nodes")
+            self.assertEqual(200, status)
+            self.assertFalse(filtered_payload["show_retained_pool_ips"])
+            self.assertFalse(filtered_payload["state"]["show_retained_pool_ips"])
+            self.assertEqual(
+                ["latest-node"],
+                [node["id"] for node in filtered_payload["nodes"]],
+            )
+
+            status, retained_payload = request("/api/retained")
+            self.assertEqual(200, status)
+            self.assertEqual(
+                ["retained-node"],
+                [node["id"] for node in retained_payload["retained"]],
+            )
+
+            status, on_payload = request(
+                "/api/update_retained_pool_visibility",
+                {"show_retained_pool_ips": True},
+            )
+            self.assertEqual(200, status)
+            self.assertTrue(on_payload["show_retained_pool_ips"])
+            status, restored_payload = request("/api/nodes")
+            self.assertEqual(200, status)
+            self.assertEqual(
+                {"latest-node", "retained-node"},
+                {node["id"] for node in restored_payload["nodes"]},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
