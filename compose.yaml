@@ -1,6 +1,6 @@
 services:
   aimilivpn:
-    image: ghcr.io/liulangdegezi/aimili-vpngate-plus:1.2.3
+    image: ghcr.io/liulangdegezi/aimili-vpngate-plus:1.2.4
     build:
       context: .
       args:
@@ -16,6 +16,7 @@ services:
       - /dev/net/tun:/dev/net/tun
     environment:
       DEPLOYMENT_MODE: docker
+      MALLOC_ARENA_MAX: "2"
       VPNGATE_DATA_DIR: /data
       UI_HOST: "0.0.0.0"
       UI_PORT: "8787"

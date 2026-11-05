@@ -176,7 +176,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.2.3"
+DEFAULT_APP_VERSION = "1.2.4"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -215,6 +215,21 @@ full_sweep_cancel_requested = False
 # even when the candidate id set hashes identically to before the restart.
 # Refill maintains never clear this flag (they never full-sweep).
 _first_maintain_after_startup = True
+# 1.2.4 scoped full sweep: the sweep only tests nodes in the country of
+# the current connection. Switch observation is centralized in
+# observe_active_node_switch(): the last-seen active node id is compared
+# at maintain gating time (and again at the sweep call sites); when it
+# changes to a new non-empty id, a scoped re-sweep for the new
+# connection's country is marked pending here and consumed by a later
+# maintain -- never inside the connect flow itself, so a switch is
+# never blocked or delayed by the sweep it schedules.
+_switch_watch_last_id = ""
+_switch_sweep_pending: tuple[str, str] = ("", "")  # (node_id, country_short)
+# 1.2.4 /api/retained archive-count cache, keyed by the archive file's
+# (path, mtime_ns, size). The archive is only rewritten by this
+# process's batch archive path (atomic tmp+replace), which changes the
+# key, so a key hit means the cached count is exact.
+_retained_count_cache: dict[str, Any] = {"key": None, "count": 0}
 connection_attempt_lock = threading.Lock()
 background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
@@ -333,6 +348,36 @@ def read_json(path: Path, default: Any) -> Any:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return default
+
+_libc_for_trim: Any = None
+_libc_trim_unavailable = False
+
+
+def malloc_trim() -> bool:
+    """Best-effort glibc ``malloc_trim(0)``: return freed arena pages to the OS.
+
+    The 2026-11-05 memory analysis measured that a large share of the
+    steady RSS platform is allocator high-water rather than live data
+    (per-round trim took the full-maintenance platform from ~80.8MB to
+    ~48MB locally). Silent no-op on non-glibc libcs (no malloc_trim
+    symbol) or whenever ctypes/libc cannot be loaded, so callers never
+    need to guard it. Returns True when the trim call succeeded.
+    """
+    global _libc_for_trim, _libc_trim_unavailable
+    if _libc_trim_unavailable:
+        return False
+    try:
+        if _libc_for_trim is None:
+            import ctypes
+
+            try:
+                _libc_for_trim = ctypes.CDLL("libc.so.6", use_errno=True)
+            except OSError:
+                _libc_for_trim = ctypes.CDLL(None, use_errno=True)
+        return bool(_libc_for_trim.malloc_trim(0))
+    except Exception:
+        _libc_trim_unavailable = True
+        return False
 
 import hashlib
 
@@ -2871,6 +2916,136 @@ def full_sweep_order(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any]) -> lis
     )
 
 
+def _country_key(node: dict[str, Any]) -> str:
+    return str(node.get("country_short") or "").strip().upper()
+
+
+def _connection_scope(nodes: list[dict[str, Any]]) -> tuple[str, str]:
+    """(node_id, country_short) of the current connection, for sweep scoping.
+
+    The authoritative source is the ``active_openvpn_node_id`` global: it
+    is set synchronously by connect_node when the tunnel process starts
+    and is mirrored into the panel state by get_state(). The node
+    table's ``active`` flag is only a fallback -- it is a display flag
+    recomputed from the global at /api/nodes read time and can be stale
+    on disk. Returns ("", "") when there is no connection reference at
+    all, and (node_id, "") when the connected node is missing from the
+    table or carries no country (data anomaly; callers then keep the
+    legacy unscoped behaviour instead of guessing a country).
+    """
+    if active_openvpn_node_id:
+        node = next(
+            (n for n in nodes if str(n.get("id") or "") == active_openvpn_node_id),
+            None,
+        )
+        if node is not None:
+            return active_openvpn_node_id, _country_key(node)
+        return active_openvpn_node_id, ""
+    flagged = next((n for n in nodes if n.get("active") and n.get("id")), None)
+    if flagged is not None:
+        return str(flagged.get("id") or ""), _country_key(flagged)
+    return "", ""
+
+
+def current_connection_country() -> str:
+    """Country short code (upper) of the current connection, or ""."""
+    return _connection_scope(read_nodes())[1]
+
+
+def observe_active_node_switch() -> None:
+    """Record a completed connection switch as a pending scoped sweep.
+
+    Called from maintain gating and from the sweep call sites -- only
+    ever from the collector/maintenance flow, never from the connect
+    path, so observing can never delay a switch. Consecutive switches
+    coalesce: only the latest connection stays pending, and a pending
+    entry is consumable only while that exact node is still the active
+    connection.
+    """
+    global _switch_watch_last_id, _switch_sweep_pending
+    active_id = active_openvpn_node_id
+    if active_id == _switch_watch_last_id:
+        return
+    _switch_watch_last_id = active_id
+    if not active_id:
+        return
+    country = current_connection_country()
+    _switch_sweep_pending = (active_id, country)
+    log_to_json(
+        "INFO",
+        "Main",
+        f"连接已切换至 {active_id}（{country or '未知国家'}），将在维护时补做该国全量检测",
+    )
+
+
+def pending_switch_sweep_country() -> str:
+    """Country of a pending post-switch scoped sweep for the CURRENT
+    connection, or "" when none is pending (or the connection moved on).
+    Observes the latest switch first, so a switch completed during the
+    current maintain is seen too."""
+    observe_active_node_switch()
+    pending_id, pending_country = _switch_sweep_pending
+    if pending_id and pending_id == active_openvpn_node_id:
+        return pending_country
+    return ""
+
+
+def clear_switch_sweep_pending() -> None:
+    global _switch_sweep_pending
+    _switch_sweep_pending = ("", "")
+
+
+def _late_switch_sweep(
+    trigger: str, should_sweep: bool, sweep_reason: str
+) -> tuple[bool, str]:
+    """Re-evaluate the sweep decision at a sweep call site.
+
+    A switch may have completed during this very maintain (fast-connect
+    path), after the gating decision was computed. If a post-switch
+    scoped sweep is pending for the current connection, upgrade the
+    decision so the sweep runs with the switch reason. Refill maintains
+    never sweep, so they never consume the pending marker either.
+    """
+    if should_sweep or trigger == "refill":
+        return should_sweep, sweep_reason
+    country = pending_switch_sweep_country()
+    if country:
+        return True, f"连接切换后补检（{country}）"
+    return should_sweep, sweep_reason
+
+
+def retained_archive_count() -> int:
+    """Record count of the retained-pool archive, cached by file identity.
+
+    The archive reaches ~10.65MB at the 1000-record cap; parsing it on
+    every /api/retained request just to count records cost a ~22MB
+    transient. The (path, mtime_ns, size) key changes on every archive
+    rewrite (the only writer is this process's batch archive path,
+    which replaces the file atomically), so a key match means the
+    cached count is exact; any doubt falls back to a real read.
+    """
+    try:
+        stat = RETAINED_ARCHIVE_FILE.stat()
+        key: tuple[str, int, int] | None = (
+            str(RETAINED_ARCHIVE_FILE),
+            stat.st_mtime_ns,
+            stat.st_size,
+        )
+    except OSError:
+        key = None
+    if key is not None and _retained_count_cache.get("key") == key:
+        return int(_retained_count_cache.get("count") or 0)
+    try:
+        archive = read_json(RETAINED_ARCHIVE_FILE, [])
+        count = len(archive) if isinstance(archive, list) else 0
+    except Exception:
+        count = 0
+    if key is not None:
+        _retained_count_cache["key"] = key
+        _retained_count_cache["count"] = count
+    return count
+
+
 def _candidate_list_hash(candidates: list[dict[str, Any]]) -> str:
     """Stable hash of a fetched candidate id set (1.2.2 detection gating).
 
@@ -2886,7 +3061,7 @@ def _candidate_list_hash(candidates: list[dict[str, Any]]) -> str:
 
 
 def should_run_full_sweep(
-    trigger: str, list_changed: bool, restart_first: bool
+    trigger: str, list_changed: bool, restart_first: bool, switch_country: str = ""
 ) -> tuple[bool, str]:
     """Full-sweep gating decision for 1.2.2 detection frequency (A).
 
@@ -2895,6 +3070,10 @@ def should_run_full_sweep(
     whether the (already ordered) full sweep runs at all:
     - manual / check: always sweep once (explicit user action).
     - refill: never sweep (prioritized testing only, in maintain).
+    - 1.2.4: a completed connection switch leaves a pending scoped
+      re-sweep for the new connection's country (switch_country);
+      its priority is comparable to restart_first, below manual/check
+      and below the refill veto.
     - auto (and any unknown trigger, treated as auto): sweep once when
       the candidate list changed or on the first maintain after a
       service restart (pre-restart probe results may be stale);
@@ -2905,6 +3084,8 @@ def should_run_full_sweep(
         return True, "手动触发"
     if trigger == "refill":
         return False, "后台补齐不触发全量检测"
+    if switch_country:
+        return True, f"连接切换后补检（{switch_country}）"
     if restart_first and list_changed:
         return True, "服务重启后首次维护（节点列表亦有变化）"
     if restart_first:
@@ -2921,41 +3102,88 @@ def run_full_sweep(systemic_probe_failure: str = "") -> dict[str, Any]:
         print(f"[全量检测] {msg}", flush=True)
         log_to_json("WARNING", "Main", msg)
         return {"tested": 0, "available": 0, "unavailable": 0, "skipped": True, "interrupted": False}
-    ui_cfg = load_ui_config()
-    candidates = [n for n in read_nodes() if not n.get("active")]
-    ordered = full_sweep_order(candidates, ui_cfg)
-    candidate_ids = [str(n.get("id")) for n in ordered if n.get("id")]
-    if not candidate_ids:
-        return {"tested": 0, "available": 0, "unavailable": 0, "skipped": False, "interrupted": False}
-    full_sweep_running = True
-    full_sweep_cancel_requested = False
     try:
-        set_state(is_connecting=False, last_check_message="正在全量检测所有节点可用性…")
-        results = test_multiple_nodes(
-            candidate_ids,
-            target_available=None,
-            stop_requested=lambda: full_sweep_cancel_requested,
-        )
-        tested = len(results)
-        available = sum(1 for r in results if r.get("probe_status") == "available")
-        unavailable = sum(1 for r in results if r.get("probe_status") == "unavailable")
-        interrupted = bool(full_sweep_cancel_requested)
-        summary = (
-            f"全量检测完成：共 {tested} 个，可用 {available} 个，不可用 {unavailable} 个"
-            + ("（连接请求打断）" if interrupted else "")
-        )
-        print(f"[全量检测] {summary}", flush=True)
-        log_to_json("INFO", "Main", summary)
-        set_state(last_check_message=summary)
-        return {
-            "tested": tested,
-            "available": available,
-            "unavailable": unavailable,
-            "skipped": False,
-            "interrupted": interrupted,
-        }
+        ui_cfg = load_ui_config()
+        nodes = read_nodes()
+        # 1.2.4: the sweep is scoped to the current connection's
+        # country -- nodes outside it are not probed at all. With no
+        # connection reference there is nothing to scope to, so the
+        # sweep is skipped outright. When a connection exists but its
+        # country cannot be determined (data anomaly), the legacy
+        # unscoped candidate set is kept rather than guessing.
+        conn_id, conn_country = _connection_scope(nodes)
+        if not conn_id:
+            msg = "无当前连接，跳过全量检测"
+            print(f"[全量检测] {msg}", flush=True)
+            log_to_json("WARNING", "Main", msg)
+            set_state(last_check_message=msg)
+            return {
+                "tested": 0,
+                "available": 0,
+                "unavailable": 0,
+                "skipped": True,
+                "interrupted": False,
+                "skip_reason": "no_connection",
+                "message": msg,
+            }
+        if conn_country:
+            candidates = [
+                n
+                for n in nodes
+                if not n.get("active")
+                and str(n.get("id") or "") != conn_id
+                and _country_key(n) == conn_country
+            ]
+        else:
+            candidates = [n for n in nodes if not n.get("active")]
+        ordered = full_sweep_order(candidates, ui_cfg)
+        candidate_ids = [str(n.get("id")) for n in ordered if n.get("id")]
+        if not candidate_ids:
+            if conn_country:
+                msg = f"全量检测（{conn_country}）：当前连接国家无其他待检测节点"
+                print(f"[全量检测] {msg}", flush=True)
+                log_to_json("INFO", "Main", msg)
+            return {"tested": 0, "available": 0, "unavailable": 0, "skipped": False, "interrupted": False}
+        full_sweep_running = True
+        full_sweep_cancel_requested = False
+        try:
+            if conn_country:
+                set_state(is_connecting=False, last_check_message=f"正在全量检测（{conn_country}）节点可用性…")
+            else:
+                set_state(is_connecting=False, last_check_message="正在全量检测所有节点可用性…")
+            results = test_multiple_nodes(
+                candidate_ids,
+                target_available=None,
+                stop_requested=lambda: full_sweep_cancel_requested,
+            )
+            tested = len(results)
+            available = sum(1 for r in results if r.get("probe_status") == "available")
+            unavailable = sum(1 for r in results if r.get("probe_status") == "unavailable")
+            interrupted = bool(full_sweep_cancel_requested)
+            if conn_country:
+                summary = (
+                    f"全量检测完成（{conn_country}）：共 {tested} 个，可用 {available} 个，不可用 {unavailable} 个"
+                    + ("（连接请求打断）" if interrupted else "")
+                )
+            else:
+                summary = (
+                    f"全量检测完成：共 {tested} 个，可用 {available} 个，不可用 {unavailable} 个"
+                    + ("（连接请求打断）" if interrupted else "")
+                )
+            print(f"[全量检测] {summary}", flush=True)
+            log_to_json("INFO", "Main", summary)
+            set_state(last_check_message=summary)
+            return {
+                "tested": tested,
+                "available": available,
+                "unavailable": unavailable,
+                "skipped": False,
+                "interrupted": interrupted,
+            }
+        finally:
+            full_sweep_running = False
     finally:
-        full_sweep_running = False
+        malloc_trim()
 
 
 def _apply_probe_results(
@@ -3185,7 +3413,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
     with lock:
         nodes = read_nodes()
         to_test = [n for n in nodes if n.get("id") in node_ids]
-        
+
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
         node_id = n_info["id"]
@@ -3193,7 +3421,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
         h = str(n_info.get("remote_host") or n_info.get("ip"))
         p = parse_int(n_info.get("remote_port"))
         fallback_ping = parse_int(n_info.get("ping"))
-        
+
         temp_path = test_config_path(node_id)
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
@@ -3206,7 +3434,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
                 "probe_message": f"Failed to write configuration: {e}",
                 "probed_at": time.time(),
             }
-            
+
         latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
         tun_idx = None
         try:
@@ -3221,7 +3449,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
                     temp_path.unlink()
             except Exception:
                 pass
-            
+
         temp_node = {
             "id": node_id,
             "ip": n_info.get("ip") or h,
@@ -3238,69 +3466,123 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
     available_count = 0
     systemic_failure = ""
     max_workers = min(NODE_PROBE_WORKERS, max(1, len(to_test)))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for batch_start in range(0, len(to_test), max_workers):
-            if stop_requested is not None and stop_requested():
-                print("[节点检测] 全量检测收到连接请求，提前停止剩余批次", flush=True)
-                log_to_json("INFO", "Main", "全量检测收到连接请求，提前停止剩余批次")
-                break
-            if systemic_failure or (target_available is not None and available_count >= target_available):
-                break
 
-            batch = to_test[batch_start : batch_start + max_workers]
-            batch_ids = {str(n.get("id") or "") for n in batch}
-            with lock:
-                current_nodes = read_nodes()
-                now = time.time()
-                for current in current_nodes:
-                    if current.get("id") in batch_ids and not current.get("active"):
-                        current["probe_status"] = "testing"
-                        current["probe_message"] = "正在检测节点连通性..."
-                        current["probed_at"] = now
-                write_json(NODES_FILE, sort_all_nodes(current_nodes))
+    # 1.2.4 batched persistence (the slimming item deferred from
+    # 1.2.3): probe results are held in memory and flushed
+    # periodically -- every 20 results or ~5 seconds, whichever comes
+    # first -- instead of one full-table read+write for every batch
+    # marker and every result (a 387-node sweep previously cost ~467
+    # reads + ~466 writes of the whole node table). A flush re-reads
+    # the CURRENT table and merges only the probe fields of the nodes
+    # this call tested, so concurrent writes from other paths (panel
+    # favorites, connection state changes) are preserved; a stale
+    # whole-table snapshot is never written back. Every exit path --
+    # normal end, stop request, systemic-failure stop, exception --
+    # flushes before returning, so callers that re-read the table
+    # afterwards always see the final results. The panel's probe
+    # progress still comes from nodes.json probe_status, so its
+    # refresh granularity becomes the flush cadence, not per-result.
+    pending_results: dict[str, dict[str, Any]] = {}
+    pending_testing: set[str] = set()
+    counters_applied: set[str] = set()
+    last_flush_at = time.time()
 
-            futures = {
-                executor.submit(test_worker, (batch_start + idx, node)): node["id"]
-                for idx, node in enumerate(batch)
+    def flush_probe_state(force: bool = False) -> None:
+        nonlocal last_flush_at
+        last_flush_at = time.time()
+        if not force and not pending_results and not pending_testing:
+            return
+        with lock:
+            current_nodes = read_nodes()
+            by_id = {
+                str(n.get("id") or ""): n for n in current_nodes if n.get("id")
             }
-            for future in concurrent.futures.as_completed(futures):
-                nid = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = {
-                        "id": nid,
-                        "probe_status": "unavailable",
-                        "probe_message": f"Test exception: {exc}",
-                        "latency_ms": 0,
-                    }
-                updated_nodes_map[nid] = result
+            now = time.time()
+            for nid in pending_testing:
+                row = by_id.get(nid)
+                if (
+                    row is not None
+                    and not row.get("active")
+                    and nid not in updated_nodes_map
+                ):
+                    row["probe_status"] = "testing"
+                    row["probe_message"] = "正在检测节点连通性..."
+                    row["probed_at"] = now
+            for nid, result in pending_results.items():
+                row = by_id.get(nid)
+                if row is None:
+                    continue
+                row.update(result)
+                # Phase 1: per-node failure counters feed the
+                # retained-pool liveness sweep (plan §三.5). Applied
+                # exactly once per result, against the fresh row, so
+                # a later merge flush (e.g. the post-enrichment one)
+                # can re-apply result fields without double-counting.
+                if nid in counters_applied:
+                    continue
+                counters_applied.add(nid)
                 if result.get("probe_status") == "available":
-                    available_count += 1
-                if is_systemic_probe_failure(result.get("probe_message")):
-                    systemic_failure = str(result.get("probe_message") or "")
-                with lock:
-                    current_nodes = read_nodes()
-                    for current in current_nodes:
-                        if current.get("id") == nid:
-                            current.update(result)
-                            # Phase 1: per-node failure counters feed the
-                            # retained-pool liveness sweep (plan §三.5).
-                            if result.get("probe_status") == "available":
-                                current["consecutive_failures"] = 0
-                                current["last_success_at"] = time.time()
-                            else:
-                                current["consecutive_failures"] = int(current.get("consecutive_failures") or 0) + 1
-                            break
-                    write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                    row["consecutive_failures"] = 0
+                    row["last_success_at"] = now
+                elif result.get("probe_status") is not None:
+                    row["consecutive_failures"] = int(row.get("consecutive_failures") or 0) + 1
+            write_json(NODES_FILE, sort_all_nodes(current_nodes))
+        pending_results.clear()
+        pending_testing.clear()
 
-            if systemic_failure:
-                message = f"检测到系统级 OpenVPN 故障，已停止剩余节点探测: {systemic_failure}"
-                print(f"[节点检测] {message}", flush=True)
-                log_to_json("ERROR", "VPN", message)
-                set_state(last_check_message=message)
-                break
-                
+    def maybe_flush() -> None:
+        if len(pending_results) >= 20 or time.time() - last_flush_at >= 5.0:
+            flush_probe_state()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for batch_start in range(0, len(to_test), max_workers):
+                if stop_requested is not None and stop_requested():
+                    print("[节点检测] 全量检测收到连接请求，提前停止剩余批次", flush=True)
+                    log_to_json("INFO", "Main", "全量检测收到连接请求，提前停止剩余批次")
+                    break
+                if systemic_failure or (target_available is not None and available_count >= target_available):
+                    break
+
+                batch = to_test[batch_start : batch_start + max_workers]
+                for node in batch:
+                    nid = str(node.get("id") or "")
+                    if nid and nid not in updated_nodes_map and not node.get("active"):
+                        pending_testing.add(nid)
+                maybe_flush()
+
+                futures = {
+                    executor.submit(test_worker, (batch_start + idx, node)): node["id"]
+                    for idx, node in enumerate(batch)
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    nid = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = {
+                            "id": nid,
+                            "probe_status": "unavailable",
+                            "probe_message": f"Test exception: {exc}",
+                            "latency_ms": 0,
+                        }
+                    updated_nodes_map[nid] = result
+                    pending_results[nid] = result
+                    if result.get("probe_status") == "available":
+                        available_count += 1
+                    if is_systemic_probe_failure(result.get("probe_message")):
+                        systemic_failure = str(result.get("probe_message") or "")
+                    maybe_flush()
+
+                if systemic_failure:
+                    message = f"检测到系统级 OpenVPN 故障，已停止剩余节点探测: {systemic_failure}"
+                    print(f"[节点检测] {message}", flush=True)
+                    log_to_json("ERROR", "VPN", message)
+                    set_state(last_check_message=message)
+                    break
+    finally:
+        flush_probe_state()
+
     # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
     successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
     if successful_nodes:
@@ -3309,15 +3591,14 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
         except Exception as ee:
             print(f"[test_multiple_nodes] 批量富化 IP 失败: {ee}", flush=True)
 
-    with lock:
-        current_nodes = read_nodes()
-        for n in current_nodes:
-            nid = n.get("id")
-            if nid in updated_nodes_map:
-                n.update(updated_nodes_map[nid])
-        sorted_nodes = sort_all_nodes(current_nodes)
-        write_json(NODES_FILE, sorted_nodes)
-        
+    # Final merge flush: apply the (possibly enriched) results onto
+    # the current table one last time, like the previous final
+    # whole-table write, but merge-style, so nothing written
+    # concurrently since the last flush is lost. Unconditional, as
+    # the old final write was.
+    pending_results.update(updated_nodes_map)
+    flush_probe_state(force=True)
+
     return list(updated_nodes_map.values())
 
 def cancel_background_refill() -> None:
@@ -3732,7 +4013,17 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
         # The restart-first flag is NOT cleared here -- only a completed
         # full sweep clears it, so a refill maintain (which never sweeps)
         # cannot consume the first-after-restart sweep.
-        candidate_hash = _candidate_list_hash(candidates)
+        # 1.2.4: the change hash is computed over the scoped subset --
+        # the fetched candidates in the current connection's country --
+        # so list churn in other countries no longer counts as a change
+        # and cannot trigger a sweep. When no connection country can be
+        # determined, the legacy full-set hash is kept (_connection_scope).
+        scope_country = current_connection_country()
+        if scope_country:
+            hash_candidates = [c for c in candidates if _country_key(c) == scope_country]
+        else:
+            hash_candidates = candidates
+        candidate_hash = _candidate_list_hash(hash_candidates)
         try:
             previous_candidate_hash = str(get_state().get("last_candidate_hash") or "")
         except Exception:
@@ -3740,7 +4031,12 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
         list_changed = candidate_hash != previous_candidate_hash
         restart_first = _first_maintain_after_startup
         set_state(last_candidate_hash=candidate_hash)
-        should_sweep, sweep_reason = should_run_full_sweep(trigger, list_changed, restart_first)
+        # 1.2.4: a switch completed since the last observation leaves a
+        # pending scoped re-sweep; it joins the same reason chain here.
+        switch_country = pending_switch_sweep_country()
+        should_sweep, sweep_reason = should_run_full_sweep(
+            trigger, list_changed, restart_first, switch_country=switch_country
+        )
 
         # Phase 1 retention: favorites are loaded before the merge so the
         # disappeared-node handling below can exempt them (plan §三.3).
@@ -3941,7 +4237,14 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
                         # 1.2.2 gating: same decision as the terminal
                         # sweep below; a skip is written into the message
                         # and the panel log so it is observable, not silent.
+                        # 1.2.4: the fast-connect above may itself have
+                        # completed a switch, so re-check for a pending
+                        # post-switch scoped sweep before deciding.
+                        should_sweep, sweep_reason = _late_switch_sweep(
+                            trigger, should_sweep, sweep_reason
+                        )
                         if should_sweep:
+                            log_to_json("INFO", "Main", f"全量检测执行（{sweep_reason}）")
                             _sweep = run_full_sweep(systemic_probe_failure)
                             if not _sweep.get("skipped"):
                                 message = (
@@ -3952,6 +4255,9 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
                                 )
                                 full_sweep_done = True
                                 _first_maintain_after_startup = False
+                                clear_switch_sweep_pending()
+                            elif _sweep.get("skip_reason") == "no_connection":
+                                message = f"{message} 全量检测已跳过（无当前连接），保留上次探测结果。"
                         else:
                             skip_msg = f"全量检测已跳过（{sweep_reason}），保留上次探测结果。"
                             message = f"{message} {skip_msg}"
@@ -4037,20 +4343,31 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
         # sweep itself is unchanged (full_sweep_order/priority untouched).
         if full_sweep_done:
             pass
-        elif should_sweep:
-            _sweep = run_full_sweep(systemic_probe_failure)
-            if not _sweep.get("skipped"):
-                message = (
-                    f"{message} 全量检测：共 {_sweep['tested']} 个，"
-                    f"可用 {_sweep['available']} 个，不可用 {_sweep['unavailable']} 个"
-                    + ("（连接请求打断）" if _sweep.get("interrupted") else "")
-                    + "。"
-                )
-                _first_maintain_after_startup = False
         else:
-            skip_msg = f"全量检测已跳过（{sweep_reason}），保留上次探测结果。"
-            message = f"{message} {skip_msg}"
-            log_to_json("INFO", "Main", skip_msg)
+            # 1.2.4: a switch may have completed during this maintain
+            # (auto-switch after the periodic tests); re-check for a
+            # pending post-switch scoped sweep before deciding.
+            should_sweep, sweep_reason = _late_switch_sweep(
+                trigger, should_sweep, sweep_reason
+            )
+            if should_sweep:
+                log_to_json("INFO", "Main", f"全量检测执行（{sweep_reason}）")
+                _sweep = run_full_sweep(systemic_probe_failure)
+                if not _sweep.get("skipped"):
+                    message = (
+                        f"{message} 全量检测：共 {_sweep['tested']} 个，"
+                        f"可用 {_sweep['available']} 个，不可用 {_sweep['unavailable']} 个"
+                        + ("（连接请求打断）" if _sweep.get("interrupted") else "")
+                        + "。"
+                    )
+                    _first_maintain_after_startup = False
+                    clear_switch_sweep_pending()
+                elif _sweep.get("skip_reason") == "no_connection":
+                    message = f"{message} 全量检测已跳过（无当前连接），保留上次探测结果。"
+            else:
+                skip_msg = f"全量检测已跳过（{sweep_reason}），保留上次探测结果。"
+                message = f"{message} {skip_msg}"
+                log_to_json("INFO", "Main", skip_msg)
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
@@ -4063,6 +4380,10 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
     finally:
         is_connecting = False
         maintenance_lock.release()
+        # 1.2.4: hand the round's freed arena pages back to the OS so
+        # the RSS platform tracks live data instead of the high-water
+        # mark of this round's transients (see malloc_trim()).
+        malloc_trim()
 
 
 def collector_loop() -> None:
@@ -5559,12 +5880,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.2.3 正式版</span>
+        <span id="github_version_label">V1.2.4 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.2.3 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.2.4 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
@@ -6412,7 +6733,7 @@ function stableSortNodes() {
 
 function render(){
   updateRetainedPoolVisibilityUI();
-  const versionLabel = state.app_version_label || "V1.2.3 正式版";
+  const versionLabel = state.app_version_label || "V1.2.4 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -8339,11 +8660,10 @@ class Handler(BaseHTTPRequestHandler):
                     )}
                     item["is_favorite"] = n.get("id") in fav_ids
                     retained.append(item)
-            try:
-                archive = read_json(RETAINED_ARCHIVE_FILE, [])
-                archive_count = len(archive) if isinstance(archive, list) else 0
-            except Exception:
-                archive_count = 0
+            # 1.2.4: the archive (~10.65MB at cap) is no longer parsed
+            # per request just for its record count; the count is
+            # cached by file identity (see retained_archive_count()).
+            archive_count = retained_archive_count()
             self.send_json({"retained": retained, "retained_count": len(retained), "archive_count": archive_count})
         elif effective_path == "/api/check_update":
             try:

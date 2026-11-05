@@ -138,6 +138,7 @@ ExecStart=/usr/bin/python3 vpngate_manager.py
 Restart=always
 RestartSec=5
 Environment=DEPLOYMENT_MODE=source
+Environment=MALLOC_ARENA_MAX=2
 EnvironmentFile=-/etc/default/aimilivpn
 
 [Install]
@@ -204,9 +205,9 @@ def get_app_version():
     try:
         with open(os.path.join(INSTALL_DIR, "VERSION"), "r", encoding="utf-8") as f:
             version = f.read().strip().lstrip("vV")
-        return version or "1.2.3"
+        return version or "1.2.4"
     except Exception:
-        return "1.2.3"
+        return "1.2.4"
 
 def load_ui_cfg():
     import json
