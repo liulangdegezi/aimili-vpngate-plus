@@ -166,24 +166,30 @@ RETAINED_POOL_MAX_NODES = env_int("RETAINED_POOL_MAX_NODES", 500, 1)
 SCORE_WEIGHT_LATENCY = 0.3
 SCORE_WEIGHT_AVAILABILITY = 0.3
 SCORE_WEIGHT_IPLARK = 0.4
-# 1.2.5 stage 4: manual per-node risk-score lookup (FFraud, plan §三).
-# Display-only: results land in the node's risk_display_* fields, which
-# composite_node_score() never reads, so a fetched score can never move
-# selection ordering. One fetch per button click -- no worker, no queue,
-# no automatic recheck.
-FFRAUD_API_URL_TEMPLATE = "https://api.ffraud.com/public/ip/{ip}"
-FFRAUD_FETCH_TIMEOUT_SECONDS = 15
-# Human-readable FFraud flag fields, in display order: JSON field name ->
-# short label used in the panel tooltip / flags list.
-FFRAUD_FLAG_LABELS = (
-    ("proxy", "代理"),
-    ("vpn", "VPN"),
-    ("tor", "Tor"),
-    ("relay", "中继"),
-    ("hosting", "机房托管"),
-    ("is_abuser", "滥用记录"),
-    ("recent_abuse", "近期滥用"),
-    ("is_residential_proxy", "住宅代理"),
+# Manual per-node risk-score lookup (1.2.5 stage 4 introduced it
+# against FFraud; 1.2.6 stage 2 swaps the source to IP Coffee --
+# ip.net.coffee, plan §一). Display-only: results land in the node's
+# risk_display_* fields, which composite_node_score() never reads, so
+# a fetched score can never move selection ordering. One fetch per
+# button click -- no worker, no queue, no automatic recheck.
+COFFEE_API_URL_TEMPLATE = "https://ip.net.coffee/api/ipv2/lookup/{ip}"
+COFFEE_FETCH_TIMEOUT_SECONDS = 15
+# Closed set of IP-type short labels a coffee-written record can carry
+# in risk_display_connection_type, in derivation priority order (see
+# coffee_ip_type_label(), plan §一.3). The legacy FFraud-score voiding
+# in read_nodes() uses this set to tell the two sources' records
+# apart: coffee code writes exactly one of these labels on success
+# and never writes flags/reason at all.
+COFFEE_IP_TYPE_LABELS = (
+    "Tor 出口",
+    "代理",
+    "VPN",
+    "移动网络",
+    "住宅",
+    "机房",
+    "企业",
+    "运营商",
+    "未知",
 )
 # Default risk_display_* values for a node that was never checked.
 RISK_DISPLAY_DEFAULTS: dict[str, Any] = {
@@ -206,7 +212,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.2.5"
+DEFAULT_APP_VERSION = "1.2.6"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -219,6 +225,11 @@ GITHUB_MAIN_BRANCH_URL = f"{GITHUB_REPOSITORY_URL}/tree/main"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 CONFIG_DIR = DATA_DIR / "configs"
+# 1.2.6 stage 1: node OpenVPN configs live in this dedicated store --
+# one JSON document mapping node id -> config text -- instead of being
+# embedded in every node record (the embedded copy was ~88-89% of
+# nodes.json). See store_node_config()/get_node_config() below.
+CONFIG_STORE_FILE = DATA_DIR / "node_configs.json"
 NODES_FILE = DATA_DIR / "nodes.json"
 # Phase 1: history archive for retained nodes deleted after their grace
 # period or liveness thresholds (config + last-seen / last-success times).
@@ -707,7 +718,306 @@ def read_nodes() -> list[dict[str, Any]]:
     raw = read_json(NODES_FILE, [])
     if not isinstance(raw, list):
         return []
-    return [item for item in raw if isinstance(item, dict)]
+    nodes = [item for item in raw if isinstance(item, dict)]
+    if any("config_text" in item for item in nodes):
+        # 1.2.6 stage 1: records are metadata-only from here on. Any
+        # embedded config (a legacy pre-upgrade table, or an in-flight
+        # list persisted by an older build) is migrated into the
+        # config store by read_config_store() -- which also strips the
+        # file -- and popped from the in-memory copies, so no caller
+        # can ever write an embedded config back into nodes.json.
+        read_config_store()
+        for item in nodes:
+            item.pop("config_text", None)
+    if any(_is_ffraud_legacy_score(item) for item in nodes):
+        # 1.2.6 stage 2: FFraud-era scores are voided on first read
+        # (plan §八.2, 甲案). The on-disk table is stripped by
+        # _void_ffraud_legacy_scores() and the in-memory copies are
+        # cleared here, so no caller can observe -- or write back --
+        # a legacy score; after this pass no record matches the
+        # legacy shape any more, which is what makes it idempotent.
+        _void_ffraud_legacy_scores()
+        for item in nodes:
+            if _is_ffraud_legacy_score(item):
+                _clear_risk_display(item)
+    return nodes
+
+
+# Risk tiers the 1.2.5 FFraud lookup stored verbatim in
+# risk_display_level (its `risk` field: attested values "none",
+# "medium", "critical"; the full set is FFraud's lowercase tiers).
+# Coffee code stores the parenthesised abuser tier instead ("Very
+# High" style), which never equals one of these lowercase tokens.
+_FFRAUD_LEGACY_LEVELS = frozenset(
+    {"none", "low", "medium", "high", "critical"}
+)
+
+
+def _is_ffraud_legacy_score(record: dict[str, Any]) -> bool:
+    """True if the record's risk_display_* state was written by the
+    1.2.5 FFraud lookup and must be voided (plan §八.2).
+
+    The two sources' record shapes are structurally disjoint. A
+    coffee-written record ALWAYS has empty risk_display_flags and
+    risk_display_reason (the coffee parse never produces them), a
+    risk_display_connection_type drawn from COFFEE_IP_TYPE_LABELS
+    (or "" before any successful check), and an abuser-tier level.
+    An FFraud-written record carries at least one trace coffee code
+    can never produce:
+
+    - a non-empty flags list (FFraud booleans mapped to labels), or
+    - a non-empty reason (FFraud's narrative sentence), or
+    - a non-empty connection_type outside the coffee label set
+      (FFraud's English values, e.g. "Data Center"), or
+    - a level in FFraud's lowercase tier set.
+
+    Error-only records (score None, only error/checked_at written by
+    a failed lookup) carry no source-distinguishing trace -- the four
+    failure categories are identical across both versions -- so they
+    are deliberately NOT voided; voiding is scoped to records that
+    carry a legacy score state, exactly as the plan orders.
+    """
+    flags = record.get("risk_display_flags")
+    if isinstance(flags, list) and flags:
+        return True
+    if str(record.get("risk_display_reason") or ""):
+        return True
+    connection_type = str(record.get("risk_display_connection_type") or "")
+    if connection_type and connection_type not in COFFEE_IP_TYPE_LABELS:
+        return True
+    if str(record.get("risk_display_level") or "") in _FFRAUD_LEGACY_LEVELS:
+        return True
+    return False
+
+
+def _clear_risk_display(record: dict[str, Any]) -> None:
+    """Reset every risk_display_* field to its never-checked default."""
+    for key, default in RISK_DISPLAY_DEFAULTS.items():
+        record[key] = list(default) if isinstance(default, list) else default
+
+
+def _void_ffraud_legacy_scores() -> None:
+    """Persist the FFraud-score voiding in nodes.json.
+
+    Operates on the raw table under the global lock, like the stage-1
+    config migration in read_config_store(); a pure no-op once no
+    legacy-shaped record remains.
+    """
+    with lock:
+        raw = read_json(NODES_FILE, [])
+        if not isinstance(raw, list):
+            return
+        changed = False
+        for item in raw:
+            if isinstance(item, dict) and _is_ffraud_legacy_score(item):
+                _clear_risk_display(item)
+                changed = True
+        if changed:
+            write_json(NODES_FILE, raw)
+
+
+# ---------------------------------------------------------------------------
+# 1.2.6 stage 1: node config store (plan §四 -- nodes.json no longer
+# embeds config_text; configs live here, keyed by node id).
+#
+# Design: ONE JSON document, DATA_DIR/node_configs.json, mapping
+# node id -> OpenVPN config text. Chosen over per-node files and over a
+# JSONL/append layout because (a) it reuses the established
+# read_json/write_json + global-RLock persistence discipline (atomic
+# tmp+replace, no new file-format code), (b) the store's lifecycle
+# events are exactly the node table's batch events -- fetch merge,
+# archive batch, liveness sweep, pool purge -- so it is rewritten at
+# most once per batch, never per probe result (probes only READ), and
+# (c) consumers fetch a single node's config per call, so no caller
+# ever needs random access into a larger structure. An in-process cache
+# keyed by the store file's (mtime_ns, size) -- the same trick as the
+# 1.2.4 retained-archive count cache -- keeps repeated reads from
+# re-parsing the document; every write goes through write_json's
+# atomic replace, which changes the key, so a key hit is exact.
+# ---------------------------------------------------------------------------
+
+_config_store_cache: dict[str, Any] = {"key": None, "data": {}}
+
+
+def _config_store_key() -> tuple[str, int, int] | None:
+    try:
+        stat = CONFIG_STORE_FILE.stat()
+    except OSError:
+        return None
+    return (str(CONFIG_STORE_FILE), stat.st_mtime_ns, stat.st_size)
+
+
+def read_config_store() -> dict[str, str]:
+    """The whole id -> config mapping ({} when the store is absent).
+
+    Legacy migration is folded in (plan §四.4): entries still embedded
+    in nodes.json or retained_archive.json are merged UNDER the store
+    (stored entries win) and then stripped from those files, so the
+    first read on an upgraded install heals both files exactly once;
+    every later read finds nothing embedded and is a pure cache/file
+    read. Runs under the global lock; re-entrant callers are fine.
+    """
+    with lock:
+        key = _config_store_key()
+        if key is not None and _config_store_cache.get("key") == key:
+            cached = _config_store_cache.get("data")
+            if isinstance(cached, dict):
+                store = dict(cached)
+            else:
+                store = {}
+        else:
+            raw = read_json(CONFIG_STORE_FILE, {})
+            store = (
+                {
+                    str(k): v
+                    for k, v in raw.items()
+                    if isinstance(v, str) and v
+                }
+                if isinstance(raw, dict)
+                else {}
+            )
+            _config_store_cache["key"] = key
+            _config_store_cache["data"] = dict(store)
+        migrated = False
+        raw_nodes = read_json(NODES_FILE, [])
+        if isinstance(raw_nodes, list) and any(
+            isinstance(item, dict) and item.get("config_text")
+            for item in raw_nodes
+        ):
+            for item in raw_nodes:
+                if not isinstance(item, dict):
+                    continue
+                text = item.pop("config_text", None)
+                nid = str(item.get("id") or "")
+                if nid and isinstance(text, str) and text and nid not in store:
+                    store[nid] = text
+            write_json(NODES_FILE, raw_nodes)
+            migrated = True
+        raw_archive = read_json(RETAINED_ARCHIVE_FILE, [])
+        if isinstance(raw_archive, list) and any(
+            isinstance(item, dict) and item.get("config_text")
+            for item in raw_archive
+        ):
+            for item in raw_archive:
+                if not isinstance(item, dict):
+                    continue
+                text = item.pop("config_text", None)
+                nid = str(item.get("id") or "")
+                if nid and isinstance(text, str) and text and nid not in store:
+                    store[nid] = text
+            write_json(RETAINED_ARCHIVE_FILE, raw_archive)
+            migrated = True
+        if migrated:
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            write_json(CONFIG_STORE_FILE, store)
+            _config_store_cache["key"] = _config_store_key()
+            _config_store_cache["data"] = dict(store)
+        return store
+
+
+def write_config_store(store: dict[str, str]) -> None:
+    """Replace the whole store and refresh the read cache."""
+    with lock:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        write_json(CONFIG_STORE_FILE, store)
+        _config_store_cache["key"] = _config_store_key()
+        _config_store_cache["data"] = dict(store)
+
+
+def store_node_config(node_id: str, config_text: str) -> None:
+    """Insert/replace one node's config (fetch path). A no-op for empty
+    text, mirroring the old behaviour where an empty embedded config
+    simply behaved as "no config" at every consumer."""
+    nid = str(node_id or "")
+    if not nid or not config_text:
+        return
+    with lock:
+        store = read_config_store()
+        if store.get(nid) != config_text:
+            store[nid] = config_text
+            write_config_store(store)
+
+
+def get_node_config(node_id: str) -> str:
+    """The single lookup entry point for every config consumer
+    (probes, connect, config download). Returns "" when the node has
+    no stored config, which every consumer already treats exactly
+    like the old empty embedded config_text."""
+    return read_config_store().get(str(node_id or ""), "")
+
+
+def get_node_config_for(node: dict[str, Any] | None) -> str:
+    """Config lookup for callers holding a node record.
+
+    A record that still carries an embedded config_text (an in-flight
+    list built before the strip, or a caller-constructed record) has
+    that text stored on the fly and returned, so no caller can observe
+    "node present, config gone" mid-migration; otherwise the store is
+    consulted by id.
+    """
+    if not node:
+        return ""
+    embedded = node.get("config_text")
+    if isinstance(embedded, str) and embedded:
+        store_node_config(str(node.get("id") or ""), embedded)
+        return embedded
+    return get_node_config(str(node.get("id") or ""))
+
+
+def delete_node_configs(node_ids: Any) -> int:
+    """Drop configs for ids that left the node/archive lifecycle.
+
+    Callers pass the ids archived or evicted in the same batch that
+    removed them from the table/archive; the store is rewritten at
+    most once per call. Ids still referenced by the node table or the
+    archive are never dropped here -- archive_retained_nodes re-checks
+    references itself before pruning.
+    """
+    targets = {str(nid) for nid in node_ids if nid}
+    if not targets:
+        return 0
+    with lock:
+        store = read_config_store()
+        removed = 0
+        for nid in targets:
+            if nid in store:
+                del store[nid]
+                removed += 1
+        if removed:
+            write_config_store(store)
+        return removed
+
+
+def sync_config_store_lifecycle() -> int:
+    """Prune store entries no longer referenced by the node table or
+    the retained archive; returns the number pruned.
+
+    Last-resort consistency net for removal paths that predate the
+    store (e.g. an imported table dropped records between runs). It is
+    deliberately NOT called on hot paths: the batch lifecycle paths
+    prune precisely at removal time, so this sweep exists for explicit
+    maintenance/tests rather than as a per-read tax.
+    """
+    with lock:
+        referenced = {
+            str(n.get("id"))
+            for n in read_nodes()
+            if n.get("id")
+        }
+        archive = read_json(RETAINED_ARCHIVE_FILE, [])
+        if isinstance(archive, list):
+            referenced.update(
+                str(item.get("id"))
+                for item in archive
+                if isinstance(item, dict) and item.get("id")
+            )
+        store = read_config_store()
+        orphans = [nid for nid in store if nid not in referenced]
+        if orphans:
+            for nid in orphans:
+                del store[nid]
+            write_config_store(store)
+        return len(orphans)
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
@@ -716,6 +1026,13 @@ def get_state() -> dict[str, Any]:
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["is_connecting"] = is_connecting
     state["maintenance_running"] = maintenance_lock.locked()
+    # 1.2.6 stage 3 (plan §五.1): display-only tri-state signals for
+    # the connection card. proxy_consecutive_failures mirrors the
+    # background checker's counter verbatim; nothing consumes these
+    # fields for selection or switching decisions.
+    state["proxy_consecutive_failures"] = int(consecutive_proxy_failures or 0)
+    state["proxy_failure_threshold"] = PROXY_FAILURE_THRESHOLD
+    state["connection_display_status"] = connection_display_status(state)
     state.setdefault("api_url", API_URL)
     state.setdefault("mirror_url", MIRROR_HTTPS_URL)
     state.setdefault("last_fetch_source", "")
@@ -2147,7 +2464,6 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "quality": "",
         "latency_ms": 0,
         "config_file": str(config_path),
-        "config_text": config_text,
         "proto": proto,
         "remote_host": remote_host,
         "remote_port": remote_port,
@@ -2165,9 +2481,10 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "consecutive_failures": 0,
         "last_success_at": 0,
         "iplark_score": None,
-        # 1.2.5 stage 4 display-only risk score (FFraud); see
-        # RISK_DISPLAY_DEFAULTS. Keys are spelled out here because
-        # node dicts are serialized to nodes.json verbatim.
+        # Display-only risk score (1.2.5 stage 4; IP Coffee since
+        # 1.2.6 stage 2); see RISK_DISPLAY_DEFAULTS. Keys are spelled
+        # out here because node dicts are serialized to nodes.json
+        # verbatim.
         "risk_display_score": None,
         "risk_display_level": "",
         "risk_display_checked_at": 0,
@@ -2273,6 +2590,10 @@ def rows_to_candidates(
                 config_text = decode_config(row.get("OpenVPN_ConfigData_Base64", ""))
                 snapshot_utils.validate_openvpn_config(config_text)
             node = row_to_node(row, config_text)
+            # 1.2.6 stage 1: the validated config goes straight into
+            # the config store; the node record itself stays metadata
+            # only (row_to_node parsed remote/proto from the text).
+            store_node_config(str(node.get("id") or ""), config_text)
         except Exception as row_exc:
             print(f"[fetch_candidates] 跳过损坏或不安全的节点配置记录: {row_exc}", flush=True)
             log_to_json("WARNING", "Main", f"跳过损坏或不安全的节点配置记录: {row_exc}")
@@ -2839,15 +3160,49 @@ def connection_ready_for_ui(state: dict[str, Any] | None = None) -> bool:
         and not current.get("is_connecting")
     )
 
+def connection_display_status(state: dict[str, Any] | None = None) -> str:
+    """Tri-state connection status for the panel card (1.2.6 stage 3,
+    plan §五.1). Display-only: it never feeds selection, switching or
+    the /api/nodes active marking -- connection_ready_for_ui() keeps
+    its exact pre-1.2.6 meaning for those.
+
+    "connected"  -- connection_ready_for_ui() holds.
+    "degraded"   -- every readiness signal holds except proxy_ok, and
+                    the background checker's consecutive-failure count
+                    is still below the switch threshold: the tunnel is
+                    up, only the exit probes are failing, so the card
+                    stays "已连接" and gains a 探测异常 badge instead
+                    of flipping to 未连接 on a single failed probe.
+    "disconnected" -- anything else (no node, dead process, threshold
+                    reached, still connecting, ...).
+    """
+    current = get_state() if state is None else state
+    if connection_ready_for_ui(current):
+        return "connected"
+    if (
+        active_openvpn_node_id
+        and active_openvpn_running()
+        and current.get("tunnel_ready")
+        and current.get("proxy_ready")
+        and not current.get("proxy_ok")
+        and not current.get("is_connecting")
+        and 0 < int(consecutive_proxy_failures or 0) < PROXY_FAILURE_THRESHOLD
+    ):
+        return "degraded"
+    return "disconnected"
+
 # ---------------------------------------------------------------------------
-# 1.2.5 stage 4: manual FFraud risk-score lookup (display-only, plan §三)
+# Manual risk-score lookup (display-only). Introduced in 1.2.5 stage 4
+# against FFraud; the source is IP Coffee since 1.2.6 stage 2 (plan §一).
 #
 # The score is fetched only when the user clicks a node's 查评分 button
 # (POST /api/check_score): exactly one direct HTTPS request for that one
 # IP, no queue, no worker thread, no automatic recheck. Results are
 # stored in the node's risk_display_* fields; composite_node_score()
 # never reads them (the iplark_score hook stays None), so checking a
-# score cannot change selection ordering.
+# score cannot change selection ordering. IP Coffee's trust_score runs
+# opposite to the panel's risk semantics (higher = more trustworthy),
+# so it is stored converted: risk = 100 - trust_score (plan §八.1, 甲案).
 # ---------------------------------------------------------------------------
 
 # Failure categories recorded in risk_display_error and shown in the UI.
@@ -2858,7 +3213,7 @@ RISK_ERROR_BAD_RESPONSE = "响应异常"
 
 
 class RiskScoreFetchError(RuntimeError):
-    """A FFraud lookup failure carrying its display category."""
+    """A risk-score lookup failure carrying its display category."""
 
     def __init__(self, category: str, detail: str = "") -> None:
         super().__init__(f"{category}：{detail}" if detail else category)
@@ -2869,12 +3224,14 @@ class RiskScoreFetchError(RuntimeError):
 def _validate_public_ip_literal(value: Any) -> str:
     """Return the canonical literal if `value` is a public IP, else raise.
 
-    FFraud answers even garbage input with success + score 0 (verified
-    2026-11-05: "notanip" was called a home internet address), so the
-    panel must refuse to send anything that is not a literal public IP.
-    Non-literals (hostnames) and private / reserved / loopback /
-    link-local / multicast / unspecified addresses are rejected before
-    any request is made.
+    The score service answers arbitrary path segments without any
+    client-side contract about what it scored, so the panel must
+    refuse to send anything that is not a literal public IP (the
+    discipline dates from the 1.2.5 FFraud integration, where garbage
+    input was verifiably answered with success + score 0). Non-literals
+    (hostnames) and private / reserved / loopback / link-local /
+    multicast / unspecified addresses are rejected before any request
+    is made.
     """
     text = str(value or "").strip()
     try:
@@ -2890,43 +3247,87 @@ def _validate_public_ip_literal(value: Any) -> str:
     return str(addr)
 
 
-def parse_ffraud_response(payload: Any, target_ip: str) -> dict[str, Any]:
-    """Validate a FFraud JSON payload and map it to risk_display_* fields.
+def coffee_ip_type_label(payload: dict[str, Any]) -> str:
+    """Derive the IP-type short label for an IP Coffee payload.
 
-    Every guard from the verification record is enforced: the payload
-    must be an object with success == True, fraud_score must be a real
-    number in 0..100 (bool is not a number), and the echoed ip must
-    match the requested one. Any violation raises RiskScoreFetchError
-    with category 响应异常; nothing is ever guessed.
+    Priority order is plan §一.3: Tor > proxy > VPN > mobile >
+    residential > datacenter/hosting > business > ISP > unknown. The
+    result is always one of COFFEE_IP_TYPE_LABELS -- a coffee-written
+    record can be recognised by exactly that (see
+    _is_ffraud_legacy_score).
+    """
+    if payload.get("is_tor") is True:
+        return "Tor 出口"
+    if payload.get("is_proxy") is True:
+        return "代理"
+    if payload.get("is_vpn") is True:
+        return "VPN"
+    if payload.get("is_mobile") is True:
+        return "移动网络"
+    if payload.get("isResidential") is True:
+        return "住宅"
+    company_type = str(payload.get("company_type") or "")
+    if payload.get("is_datacenter") is True or company_type == "hosting":
+        return "机房"
+    if company_type == "business":
+        return "企业"
+    if company_type == "isp":
+        return "运营商"
+    return "未知"
+
+
+def _coffee_abuser_tier(raw: Any) -> str:
+    """Extract the abuse tier text from an IP Coffee abuser_score.
+
+    The field reads like "1 (Very High)" (or "" when the IP has no
+    abuse record); the stored level is the parenthesised tier text
+    ("Very High"), or the raw text when it carries no parentheses.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"\(([^()]*)\)", text)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def parse_coffee_response(payload: Any, target_ip: str) -> dict[str, Any]:
+    """Validate an IP Coffee JSON payload and map it to risk_display_*.
+
+    Guards (plan §一.1): the payload must be an object, trust_score
+    must be a real number in 0..100 (bool is not a number), and the
+    echoed ip must match the requested one. Any violation raises
+    RiskScoreFetchError with category 响应异常; nothing is ever
+    guessed. The stored score is the converted risk coefficient,
+    100 - trust_score (plan §八.1); risk_display_level keeps the
+    abuser tier and the connection-type slot keeps the derived
+    IP-type label. flags/reason are NOT produced any more (plan §一.2)
+    -- a successful write therefore leaves them at their defaults.
     """
     if not isinstance(payload, dict):
         raise RiskScoreFetchError(RISK_ERROR_BAD_RESPONSE, "响应不是 JSON 对象")
-    if payload.get("success") is not True:
-        raise RiskScoreFetchError(RISK_ERROR_BAD_RESPONSE, "响应 success 不为 true")
-    score = payload.get("fraud_score")
-    if isinstance(score, bool) or not isinstance(score, (int, float)):
-        raise RiskScoreFetchError(RISK_ERROR_BAD_RESPONSE, "fraud_score 不是数值")
-    if not 0 <= float(score) <= 100:
-        raise RiskScoreFetchError(RISK_ERROR_BAD_RESPONSE, f"fraud_score 越界：{score}")
+    trust_score = payload.get("trust_score")
+    if isinstance(trust_score, bool) or not isinstance(trust_score, (int, float)):
+        raise RiskScoreFetchError(RISK_ERROR_BAD_RESPONSE, "trust_score 不是数值")
+    if not 0 <= float(trust_score) <= 100:
+        raise RiskScoreFetchError(
+            RISK_ERROR_BAD_RESPONSE, f"trust_score 越界：{trust_score}"
+        )
     if str(payload.get("ip") or "") != target_ip:
         raise RiskScoreFetchError(
             RISK_ERROR_BAD_RESPONSE,
             f"响应 IP 与请求不一致：{payload.get('ip')!r} != {target_ip}",
         )
-    flags = [
-        label for field, label in FFRAUD_FLAG_LABELS if payload.get(field) is True
-    ]
     return {
-        "risk_display_score": score,
-        "risk_display_level": str(payload.get("risk") or ""),
-        "risk_display_connection_type": str(payload.get("connection_type") or ""),
-        "risk_display_flags": flags,
-        "risk_display_reason": str(payload.get("reason") or ""),
+        "risk_display_score": 100 - trust_score,
+        "risk_display_level": _coffee_abuser_tier(payload.get("abuser_score")),
+        "risk_display_connection_type": coffee_ip_type_label(payload),
     }
 
 
-def _ffraud_build_opener() -> urllib.request.OpenerDirector:
-    """Build the direct (proxy-bypassing) opener for FFraud lookups.
+def _coffee_build_opener() -> urllib.request.OpenerDirector:
+    """Build the direct (proxy-bypassing) opener for IP Coffee lookups.
 
     A named seam so tests can inject a fake opener and never touch the
     network (patching urllib.request.build_opener itself would be
@@ -2935,10 +3336,10 @@ def _ffraud_build_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def fetch_ffraud_score(
-    target_ip: str, timeout: int = FFRAUD_FETCH_TIMEOUT_SECONDS
+def fetch_coffee_score(
+    target_ip: str, timeout: int = COFFEE_FETCH_TIMEOUT_SECONDS
 ) -> dict[str, Any]:
-    """Fetch one IP's risk score from FFraud (direct, single attempt).
+    """Fetch one IP's risk score from IP Coffee (direct, single attempt).
 
     The target is strictly validated as a public IP literal BEFORE any
     request. The opener bypasses all proxies (ProxyHandler({})), so the
@@ -2947,12 +3348,12 @@ def fetch_ffraud_score(
     category on every failure path.
     """
     validated_ip = _validate_public_ip_literal(target_ip)
-    url = FFRAUD_API_URL_TEMPLATE.format(
+    url = COFFEE_API_URL_TEMPLATE.format(
         ip=urllib.parse.quote(validated_ip, safe="")
     )
     # Direct opener: ProxyHandler({}) bypasses any proxy env so the check
     # never goes through the node under test (or the local proxy).
-    opener = _ffraud_build_opener()
+    opener = _coffee_build_opener()
     request = urllib.request.Request(
         url, headers={"User-Agent": f"Mozilla/5.0 AimiliVPN/{APP_VERSION}"}
     )
@@ -2962,14 +3363,14 @@ def fetch_ffraud_score(
             raw = response.read()
     except urllib.error.HTTPError as exc:
         raise RiskScoreFetchError(
-            RISK_ERROR_REJECTED, f"FFraud HTTP {exc.code}"
+            RISK_ERROR_REJECTED, f"IP Coffee HTTP {exc.code}"
         ) from exc
     except Exception as exc:
         raise RiskScoreFetchError(
-            RISK_ERROR_NETWORK, f"FFraud 请求失败：{exc}"
+            RISK_ERROR_NETWORK, f"IP Coffee 请求失败：{exc}"
         ) from exc
     if status != 200:
-        raise RiskScoreFetchError(RISK_ERROR_REJECTED, f"FFraud HTTP {status}")
+        raise RiskScoreFetchError(RISK_ERROR_REJECTED, f"IP Coffee HTTP {status}")
     try:
         payload = json.loads(
             raw.decode("utf-8", errors="replace")
@@ -2980,7 +3381,7 @@ def fetch_ffraud_score(
         raise RiskScoreFetchError(
             RISK_ERROR_BAD_RESPONSE, "响应不是合法 JSON"
         ) from exc
-    return parse_ffraud_response(payload, validated_ip)
+    return parse_coffee_response(payload, validated_ip)
 
 
 # In-flight guard for check_score: one lookup per node at a time. The
@@ -3026,7 +3427,7 @@ def check_node_risk_score(node_id: str) -> dict[str, Any]:
     error_category = ""
     error_detail = ""
     try:
-        fetched = fetch_ffraud_score(target_ip)
+        fetched = fetch_coffee_score(target_ip)
     except RiskScoreFetchError as exc:
         error_category = exc.category
         error_detail = exc.detail
@@ -3109,7 +3510,6 @@ def _retained_archive_record(node: dict[str, Any], reason: str) -> dict[str, Any
         "remote_port": node.get("remote_port"),
         "proto": node.get("proto"),
         "ip_type": node.get("ip_type"),
-        "config_text": node.get("config_text"),
         "config_file": node.get("config_file"),
         "last_seen_at": node.get("last_seen_at"),
         "last_success_at": node.get("last_success_at"),
@@ -3125,17 +3525,32 @@ def archive_retained_nodes(entries: list[tuple[dict[str, Any], str]]) -> int:
     are identical to repeated single-node archiving. If the single batch
     write fails, the function falls back to the old per-node attempts so a
     transient failure does not change which later records can be archived.
+
+    1.2.6 stage 1: configs no longer travel inside the records. Each
+    entry's config is written to the config store (under the same
+    global lock, from the record's embedded text when it has one), and
+    after the archive write the store entries pushed out by the
+    newest-1000 cap are pruned -- unless the id is back in the node
+    table or still archived. The prune runs only when the archive
+    write actually happened, so a failed archive never costs a config.
     """
     if not entries:
         return 0
     records = [_retained_archive_record(node, reason) for node, reason in entries]
+    evicted_ids: list[str] = []
     try:
         archive = read_json(RETAINED_ARCHIVE_FILE, [])
         if not isinstance(archive, list):
             archive = []
         archive.extend(records)
         if len(archive) > 1000:
+            evicted = archive[:-1000]
             archive = archive[-1000:]
+            evicted_ids = [
+                str(item.get("id"))
+                for item in evicted
+                if isinstance(item, dict) and item.get("id")
+            ]
         DATA_DIR.mkdir(exist_ok=True, parents=True)
         write_json(RETAINED_ARCHIVE_FILE, archive)
     except Exception as exc:
@@ -3148,14 +3563,48 @@ def archive_retained_nodes(entries: list[tuple[dict[str, Any], str]]) -> int:
                 archive_retained_nodes([entry])
         else:
             print(f"[保留池] 归档节点 {entries[0][0].get('id')} 失败: {exc}", flush=True)
+        return len(entries)
+    with lock:
+        # Configs for the just-archived nodes must survive in the store
+        # (archived nodes are liveness-probed / restorable by id).
+        store = read_config_store()
+        changed = False
+        for node, _reason in entries:
+            nid = str(node.get("id") or "")
+            text = node.get("config_text")
+            if nid and isinstance(text, str) and text and store.get(nid) != text:
+                store[nid] = text
+                changed = True
+        if changed:
+            write_config_store(store)
+        if evicted_ids:
+            referenced = {
+                str(n.get("id")) for n in read_nodes() if n.get("id")
+            }
+            referenced.update(
+                str(item.get("id"))
+                for item in archive
+                if isinstance(item, dict) and item.get("id")
+            )
+            pruned = [
+                nid
+                for nid in evicted_ids
+                if nid not in referenced and nid in store
+            ]
+            if pruned:
+                for nid in pruned:
+                    del store[nid]
+                write_config_store(store)
     return len(entries)
 
 
 def archive_retained_node(node: dict[str, Any], reason: str) -> None:
     """Append a retained node's record to the history archive before it is
-    deleted (plan §三.2). The archive keeps the connection config plus the
-    last-seen / last-success times, so a good node can be restored manually
-    even after it disappears from the VPNGate list."""
+    deleted (plan §三.2). The archive keeps the last-seen / last-success
+    times so a good node can be restored manually even after it
+    disappears from the VPNGate list; since 1.2.6 stage 1 the
+    connection config itself lives in the config store, retained under
+    the same node id for as long as the archive record survives."""
     archive_retained_nodes([(node, reason)])
 
 
@@ -3933,7 +4382,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
-        config_text = node.get("config_text") or ""
+        config_text = get_node_config_for(node)
         h = str(node.get("remote_host") or node.get("ip"))
         p = parse_int(node.get("remote_port"))
         fallback_ping = parse_int(node.get("ping"))
@@ -4025,7 +4474,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
         node_id = n_info["id"]
-        config_text = n_info.get("config_text") or ""
+        config_text = get_node_config_for(n_info)
         h = str(n_info.get("remote_host") or n_info.get("ip"))
         p = parse_int(n_info.get("remote_port"))
         fallback_ping = parse_int(n_info.get("ping"))
@@ -4381,7 +4830,7 @@ def connect_node(node_id: str) -> str:
         config_path = Path(node["config_file"])
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            config_path.write_text(node.get("config_text") or "", encoding="utf-8")
+            config_path.write_text(get_node_config_for(node), encoding="utf-8")
         except Exception as e:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
@@ -4783,7 +5232,15 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
                     try:
-                        config_path.write_text(n["config_text"], encoding="utf-8")
+                        # 1.2.6 stage 1: materialize from the config
+                        # store. A merged record that still embeds its
+                        # config (an in-flight pre-strip list) feeds the
+                        # text back into the store via the same lookup,
+                        # so this heal loop can never observe an empty
+                        # config for a node that has one.
+                        config_path.write_text(
+                            get_node_config_for(n), encoding="utf-8"
+                        )
                     except Exception:
                         pass
 
@@ -6106,6 +6563,12 @@ INDEX_HTML = r"""<!doctype html>
       border-color: rgba(59, 130, 246, 0.24);
     }
 
+    .degraded {
+      background: rgba(245, 158, 11, 0.15);
+      color: #f59e0b;
+      border-color: rgba(245, 158, 11, 0.3);
+    }
+
     .current-badge {
       background: rgba(99, 102, 241, 0.15);
       color: #818cf8;
@@ -6173,6 +6636,41 @@ INDEX_HTML = r"""<!doctype html>
       font-family: 'JetBrains Mono', Consolas, monospace;
       font-size: 13px;
       color: #e2e8f0;
+    }
+
+    /* 1.2.6 stage 3 (plan §三): the IP is the primary, never-truncated
+       information; the port is a de-emphasised suffix. The whole cell
+       is click-to-copy (IP only). */
+    .ip-cell {
+      white-space: nowrap;
+      cursor: pointer;
+    }
+
+    .ip-cell:hover .ip-main,
+    .active-ip-value:hover .ip-main {
+      text-decoration: underline;
+    }
+
+    .ip-main {
+      font-weight: 600;
+    }
+
+    .ip-port {
+      color: var(--text-secondary);
+      font-size: 11px;
+      margin-left: 6px;
+      font-weight: 400;
+    }
+
+    .ip-copied-tip {
+      color: #34d399;
+      font-size: 11px;
+      margin-left: 6px;
+      font-weight: 600;
+    }
+
+    .active-ip-value {
+      cursor: pointer;
     }
 
     .latency-val {
@@ -6524,12 +7022,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.2.5 正式版</span>
+        <span id="github_version_label">V1.2.6 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.2.5 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.2.6 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <div class="update-action-row">
@@ -6674,7 +7172,7 @@ INDEX_HTML = r"""<!doctype html>
         <thead>
           <tr>
             <th style="width: 90px;">状态</th>
-            <th style="width: 220px;">IP 地址 : 端口</th>
+            <th>IP 地址 : 端口</th>
             <th style="width: 125px;">延迟</th>
             <th>物理位置</th>
             <th>运营主体 / ISP</th>
@@ -7000,6 +7498,7 @@ let discoveryCountriesInitialized = false;
 let discoveryCountriesDirty = false;
 let countryFilterSignature = "";
 let lastNodesSnapshotSignature = "";
+let lastStateSnapshotSignature = "";
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -7385,7 +7884,7 @@ function stableSortNodes() {
 function render(){
   updateRetainedPoolVisibilityUI();
   updateRetainedPoolEnabledUI();
-  const versionLabel = state.app_version_label || "V1.2.5 正式版";
+  const versionLabel = state.app_version_label || "V1.2.6 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -7394,7 +7893,18 @@ function render(){
   }
 
   const activeNode = nodes.find(n => n && n.active);
-  
+
+  // 1.2.6 stage 3 (plan §五.1): tri-state connection card. When the
+  // background probe is failing below the switch threshold the
+  // backend reports connection_display_status="degraded"; the card
+  // then keeps showing that node as connected, with a 探测异常
+  // badge, instead of flipping to 未连接 on a transient probe
+  // failure. Only a reached threshold or a dead process (status
+  // "disconnected") flips the card.
+  const probeDegraded = Boolean(!activeNode && state.connection_display_status === "degraded" && state.active_openvpn_node_id);
+  const degradedNode = probeDegraded ? nodes.find(n => n && n.id === state.active_openvpn_node_id) : null;
+  const cardNode = activeNode || degradedNode;
+
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
   let activeCardHtml = "";
@@ -7420,12 +7930,12 @@ function render(){
         </div>
       </div>
     `;
-  } else if (activeNode) {
-    const latencyText = nodeLatencyHtml(activeNode);
-    const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
-    const declaredFlag = countryFlag(activeNode.country_short);
-    const locationFlag = countryFlag(activeNode.geo_country_short || activeNode.country_short);
-    const ipTypeTitle = `${translateIpType(activeNode.ip_type)} · 置信度：${translateConfidence(activeNode.ip_type_confidence)} · 来源：${(activeNode.ip_type_sources || []).join(" + ") || "未知"}`;
+  } else if (cardNode) {
+    const latencyText = nodeLatencyHtml(cardNode);
+    const displayLocation = cardNode.location || translateCountry(cardNode.country) || "-";
+    const declaredFlag = countryFlag(cardNode.country_short);
+    const locationFlag = countryFlag(cardNode.geo_country_short || cardNode.country_short);
+    const ipTypeTitle = `${translateIpType(cardNode.ip_type)} · 置信度：${translateConfidence(cardNode.ip_type_confidence)} · 来源：${(cardNode.ip_type_sources || []).join(" + ") || "未知"}`;
     activeCardHtml = `
       <div class="active-card">
         <div class="active-card-info">
@@ -7434,17 +7944,15 @@ function render(){
           </div>
           <div class="active-card-details">
             <div class="active-card-title">
-              <span class="badge available"><span class="badge-pulse"></span>已连接</span>
-              <strong>${declaredFlag ? `${esc(declaredFlag)} ` : ""}${esc(translateCountry(activeNode.country))} 节点</strong>
+              <span class="badge available"><span class="badge-pulse"></span>已连接</span>${probeDegraded ? `<span class="badge degraded" title="后台代理探测连续失败 ${state.proxy_consecutive_failures || 0}/${state.proxy_failure_threshold || 3} 次，未达切换阈值，暂不切换">探测异常</span>` : ""}
+              <strong>${declaredFlag ? `${esc(declaredFlag)} ` : ""}${esc(translateCountry(cardNode.country))} 节点</strong>
             </div>
-            <div class="active-card-value mono" style="font-size: 20px; margin-top: 2px;">
-              ${esc(activeNode.ip || activeNode.remote_host)}:${activeNode.remote_port || ""}
-            </div>
+            <div class="active-card-value mono active-ip-value" style="font-size: 20px; margin-top: 2px;" title="点击复制 IP：${esc(cardNode.ip || cardNode.remote_host)}" onclick="copyIpText('${esc(cardNode.ip || cardNode.remote_host)}', this, event)"><span class="ip-main">${esc(cardNode.ip || cardNode.remote_host)}</span>${cardNode.remote_port ? `<span class="ip-port" style="font-size: 14px;">:${cardNode.remote_port}</span>` : ""}</div>
             <div class="active-card-meta" style="margin-top: 4px;">
               <span title="IP 情报源推测位置；节点申报国家见标题">物理位置: <strong>${locationFlag ? `${esc(locationFlag)} ` : ""}${esc(displayLocation)}</strong></span>
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
-              <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
-              <span style="margin-left: 12px;" title="${esc(ipTypeTitle)}">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
+              <span style="margin-left: 12px;">运营主体: <strong>${esc(cardNode.owner || cardNode.as_name || "-")}</strong></span>
+              <span style="margin-left: 12px;" title="${esc(ipTypeTitle)}">IP 类型: <strong>${esc(translateIpType(cardNode.ip_type))}</strong></span>
             </div>
           </div>
         </div>
@@ -7479,10 +7987,10 @@ function render(){
   
   if ($("total")) $("total").textContent = nodes.length; 
   if ($("target")) $("target").textContent = state.target_valid_nodes || 3;
-  if ($("active")) $("active").textContent = activeNode ? 1 : 0; 
+  if ($("active")) $("active").textContent = cardNode ? 1 : 0;
   
   const statusMessage = state.last_check_message || "";
-  const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${esc(activeNode.id)})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
+  const activeNodeInfo = cardNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(cardNode.country))} (${esc(cardNode.id)})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const localProxy = state.local_proxy || `http://127.0.0.1:${state.proxy_port || 7928}`;
   if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${esc(localProxy)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}`; }
   
@@ -7556,7 +8064,7 @@ function render(){
   } else {
     rowsHtml = currentPageNodes.map(n=>{
       if (!n) return '';
-      const isCurrentlyActive = activeNode && n.id === activeNode.id;
+      const isCurrentlyActive = (activeNode && n.id === activeNode.id) || (degradedNode && n.id === degradedNode.id);
       const isPending = Boolean(state.is_connecting && state.pending_node_id === n.id);
       const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
       
@@ -7597,7 +8105,7 @@ function render(){
 
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span>${n.retention_status === "observing" ? ` <span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);" title="观察期节点：已从 VPNGate 列表消失，宽限期内继续探测">观察期</span>` : ""}</td>
-        <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="mono ip-cell" title="点击复制 IP：${esc(n.ip||n.remote_host)}" onclick="copyIpText('${esc(n.ip||n.remote_host)}', this, event)"><span class="ip-main">${esc(n.ip||n.remote_host)}</span>${n.remote_port ? `<span class="ip-port">:${n.remote_port}</span>` : ""}</td>
         <td style="white-space: nowrap;">${latencyText}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
@@ -7645,25 +8153,25 @@ $("btn_last_page").onclick = () => {
 };
 
 function riskScoreTitle(n) {
-  const checked = n.risk_display_checked_at ? new Date(n.risk_display_checked_at * 1000).toLocaleString() : "";
+  // 1.2.6 plan §二: the tooltip narrates exactly four items -- risk
+  // coefficient, query time, IP type, score citation. The three
+  // states' wording is the plan's finalized text, verbatim.
+  let checked = "";
+  if (n.risk_display_checked_at) {
+    const d = new Date(n.risk_display_checked_at * 1000);
+    const pad = (v) => String(v).padStart(2, "0");
+    checked = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
   if (n.risk_display_error) {
-    return `查询失败：${n.risk_display_error}${checked ? "（" + checked + "）" : ""}。来源：FFraud。此分数只作为参考`;
+    return `查询失败：${n.risk_display_error}${checked ? "（" + checked + "）" : ""}。评分引用：IP Coffee（ip.net.coffee）。此分数只作为参考。`;
   }
   if (n.risk_display_score === null || n.risk_display_score === undefined) {
-    return "尚未查询。点击「查评分」从 FFraud 拉取该 IP 的风险分（0–100，越高越危险）。此分数只作为参考。";
+    return "尚未查询。点击「查评分」拉取该 IP 的风险系数。评分引用：IP Coffee（ip.net.coffee）。此分数只作为参考。";
   }
-  const parts = [`风险分 ${n.risk_display_score}（0–100，越高越危险）`];
-  if (n.risk_display_level) parts.push(`档位：${n.risk_display_level}`);
+  const parts = [`风险系数 ${n.risk_display_score}（0–100，越高越危险）`];
   if (checked) parts.push(`查询时间：${checked}`);
-  if (n.risk_display_connection_type) parts.push(`连接类型：${n.risk_display_connection_type}`);
-  const flags = Array.isArray(n.risk_display_flags) ? n.risk_display_flags : [];
-  if (flags.length) parts.push(`标记：${flags.join("、")}`);
-  if (n.risk_display_reason) {
-    const reason = String(n.risk_display_reason);
-    parts.push(`说明：${reason.length > 200 ? reason.slice(0, 200) + "…" : reason}`);
-  }
-  parts.push("来源：FFraud");
-  parts.push("此分数只作为参考");
+  if (n.risk_display_connection_type) parts.push(`IP 类型：${n.risk_display_connection_type}`);
+  parts.push("评分引用：IP Coffee（ip.net.coffee）。此分数只作为参考。");
   return parts.join("；");
 }
 
@@ -7800,6 +8308,43 @@ function applyNodesSnapshot(data) {
   return true;
 }
 
+// 1.2.6 stage 3 (plan §五.3): busy-period polling fetches state and
+// node data separately, state first. /api/state never reads the node
+// table, so it answers quickly even while a maintenance round keeps
+// the box busy; the full snapshot is attempted afterwards and its
+// timeout no longer voids the round -- the refreshed state (and with
+// it the card and the 更新中 button) stays in place.
+async function fetchStateSnapshot() {
+  const response = await fetchWithTimeout("./api/state", { cache: "no-store" }, 5000);
+  if (!response.ok) throw new Error(`状态请求失败 (${response.status})`);
+  const data = await response.json();
+  return data && data.state ? data.state : {};
+}
+
+function applyStateSnapshot(nextState) {
+  if (!nextState || typeof nextState !== "object") return false;
+  const signature = JSON.stringify(nextState);
+  if (signature === lastStateSnapshotSignature) return false;
+  lastStateSnapshotSignature = signature;
+  state = { ...state, ...nextState };
+  render();
+  return true;
+}
+
+async function refreshStateFirst() {
+  let refreshed = false;
+  try {
+    applyStateSnapshot(await fetchStateSnapshot());
+    refreshed = true;
+  } catch (e) {}
+  try {
+    const data = await fetchNodesSnapshot();
+    applyNodesSnapshot(data);
+    refreshed = true;
+  } catch (e) {}
+  return refreshed;
+}
+
 function refreshButtonBusy(message = "正在后台更新...") {
   const btn = $("refresh");
   if (!btn) return;
@@ -7821,8 +8366,12 @@ function startRefreshPolling() {
     if (refreshPollInFlight || !isPageVisible()) return;
     refreshPollInFlight = true;
     try {
-      const data = await fetchNodesSnapshot();
-      applyNodesSnapshot(data);
+      // State first, node data second (plan §五.3): the button stops
+      // only when a *fresh* state says maintenance is over, so one
+      // slow full-snapshot round can no longer leave the button
+      // spinning against a finished -- or still running -- round.
+      const refreshed = await refreshStateFirst();
+      if (!refreshed) throw new Error("状态与节点数据均获取失败");
 
       if (!state.maintenance_running) {
         clearInterval(refreshPollInterval);
@@ -7845,9 +8394,11 @@ function startConnectionPolling() {
     if (connectionPollInFlight || !isPageVisible()) return;
     connectionPollInFlight = true;
     try {
-      const data = await fetchNodesSnapshot();
-      applyNodesSnapshot(data);
-      
+      // State first, node data second (plan §五.3), same split as
+      // the refresh polling: completion is judged on fresh state.
+      const refreshed = await refreshStateFirst();
+      if (!refreshed) throw new Error("状态与节点数据均获取失败");
+
       if (!state.is_connecting && !state.maintenance_running) {
         clearInterval(pollInterval);
         pollInterval = null;
@@ -8812,19 +9363,28 @@ async function logoutAdmin() {
 // 页面加载时自动初始化数据
 load().catch(error => console.error("初始化节点数据失败", error));
 
-// 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
+// 每 10 秒在前台自动更新节点与状态，无需手动刷新页面。
+// 空闲期行为不变：整包快照，一次取齐。维护/连接期间不再整段停更
+// （1.2.6 阶段三，规划 §五.3）：状态与节点数据分开取、状态先行
+// 持续刷新，整包超时作废也不会把已刷新的状态一起丢掉，卡片与
+// 「更新中」按钮的呈现始终与服务器的真实维护状态对齐。
 let backgroundPollInFlight = false;
 setInterval(async () => {
   if (backgroundPollInFlight || !isPageVisible()) return;
-  if (typeof state !== "undefined" && !state.is_connecting && !state.maintenance_running && (!testingNodeIds || !testingNodeIds.size)) {
-    backgroundPollInFlight = true;
-    try {
+  if (typeof state === "undefined") return;
+  const busy = Boolean(state.is_connecting || state.maintenance_running);
+  if (!busy && testingNodeIds && testingNodeIds.size) return;
+  backgroundPollInFlight = true;
+  try {
+    if (busy) {
+      await refreshStateFirst();
+    } else {
       const data = await fetchNodesSnapshot();
       applyNodesSnapshot(data);
-    } catch(e) {
-    } finally {
-      backgroundPollInFlight = false;
     }
+  } catch(e) {
+  } finally {
+    backgroundPollInFlight = false;
   }
 }, 10000);
 let gatewayPollInterval = null;
@@ -8965,6 +9525,55 @@ function filterAndRenderLogs() {
   
   if (changed && isAtBottom) {
     term.scrollTop = term.scrollHeight;
+  }
+}
+
+// 1.2.6 stage 3 (plan §三): click-to-copy for node IPs (the IP only,
+// never the port). Uses the Clipboard API where available and falls
+// back to execCommand -- the panel is often served over plain HTTP
+// on a LAN, where navigator.clipboard may be missing entirely. A
+// failed copy never raises into the UI; success shows a brief
+// 已复制 tip next to the clicked IP.
+function copyIpText(ip, el, event) {
+  if (event) event.stopPropagation();
+  if (!ip) return;
+  const showCopied = () => {
+    if (!el) return;
+    let tip = el.querySelector(".ip-copied-tip");
+    if (!tip) {
+      tip = document.createElement("span");
+      tip.className = "ip-copied-tip";
+      tip.textContent = "已复制";
+      el.appendChild(tip);
+    }
+    tip.style.display = "";
+    window.setTimeout(() => { tip.style.display = "none"; }, 1500);
+  };
+  const fallbackCopy = () => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = ip;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return Boolean(ok);
+    } catch (e) {
+      return false;
+    }
+  };
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      navigator.clipboard.writeText(ip).then(showCopied).catch(() => {
+        if (fallbackCopy()) showCopied();
+      });
+    } else if (fallbackCopy()) {
+      showCopied();
+    }
+  } catch (e) {
+    if (fallbackCopy()) showCopied();
   }
 }
 
@@ -9185,6 +9794,17 @@ def background_proxy_checker() -> None:
             res = check_proxy_health()
             if checked_node_id != active_openvpn_node_id:
                 continue
+            if not res["ok"]:
+                # 1.2.6 stage 3 (plan §五.2): a failed probe is retested
+                # once, immediately, before it counts as a failure
+                # event. Only when the retest also fails does the code
+                # below record exactly one failure -- the retest never
+                # touches the consecutive-failure counter, so the
+                # counting semantics and the switch threshold are
+                # exactly what they were before 1.2.6.
+                res = check_proxy_health()
+                if checked_node_id != active_openvpn_node_id:
+                    continue
             if res["ok"]:
                 reset_proxy_failure_counter(checked_node_id)
                 set_state(
@@ -9414,6 +10034,13 @@ class Handler(BaseHTTPRequestHandler):
                     connection_state.get("retained_pool_enabled", True)
                 ),
             })
+        elif effective_path == "/api/state":
+            # 1.2.6 stage 3 (plan §五.3): lightweight state-only view
+            # for the panel's busy-period polling. Unlike /api/nodes it
+            # never reads the node table, so it stays cheap and fast
+            # while a maintenance round keeps the box busy; the panel
+            # refreshes state first and fetches node data separately.
+            self.send_json({"state": get_state()})
         elif effective_path == "/api/retained":
             # Phase 1 retained-pool overview: observing nodes + archive count.
             nodes = read_nodes()
@@ -9450,8 +10077,10 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 nodes = read_nodes()
                 node = next((n for n in nodes if Path(n.get("config_file", "")).name == filename), None)
-            if node and node.get("config_text"):
-                self.send_bytes(node["config_text"].encode("utf-8"), "application/x-openvpn-profile")
+            # 1.2.6 stage 1: the download serves the config store copy.
+            config_text = get_node_config_for(node) if node else ""
+            if node and config_text:
+                self.send_bytes(config_text.encode("utf-8"), "application/x-openvpn-profile")
             else:
                 self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         elif effective_path == "/api/gateway_status":
@@ -10118,7 +10747,7 @@ class Handler(BaseHTTPRequestHandler):
                 ).start()
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/check_score":
-            # 1.2.5 stage 4: manual per-node risk-score lookup (FFraud).
+            # Manual per-node risk-score lookup (IP Coffee).
             # Display-only; one synchronous fetch on this request thread.
             # Response form follows the /api/test_node convention:
             # success -> 200 {"ok": True, "node": row}; fetch failure ->
