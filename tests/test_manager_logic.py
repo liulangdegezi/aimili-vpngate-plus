@@ -843,8 +843,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.2.5", manager.APP_VERSION)
-        self.assertEqual("V1.2.5 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.2.6", manager.APP_VERSION)
+        self.assertEqual("V1.2.6 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -928,7 +928,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.2.5 正式版", result["current_version_label"])
+        self.assertEqual("V1.2.6 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -947,7 +947,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.2.5", result["current_version"])
+        self.assertEqual("1.2.6", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1471,19 +1471,20 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_2_5(self) -> None:
-        self.assertEqual("1.2.5", manager.APP_VERSION)
-        self.assertEqual("V1.2.5 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.2.5 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_2_6(self) -> None:
+        self.assertEqual("1.2.6", manager.APP_VERSION)
+        self.assertEqual("V1.2.6 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.2.6 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.2.5"', install_text)
+        self.assertIn('"1.2.6"', install_text)
         self.assertNotIn('"1.2.2"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.2.5", compose_text)
+        self.assertIn(":1.2.6", compose_text)
         self.assertNotIn("1.2.2", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.2.5", version_text)
+        self.assertEqual("1.2.6", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## V1.2.6（2026-11-05，已发布正式版 v1.2.6）", changelog)
         self.assertIn("## V1.2.5（2026-11-05，已发布正式版 v1.2.5）", changelog)
         self.assertIn("## V1.2.2", changelog)
         self.assertIn("## V1.2.1（2026-10-26，已发布正式版 v1.2.1）", changelog)
@@ -2237,7 +2238,15 @@ class SlimmingAndRetainedVisibilityTests(unittest.TestCase):
             candidates = manager.rows_to_candidates(rows, {})
 
         self.assertEqual(1, len(candidates))
-        self.assertIn("remote 198.51.100.10 1194", candidates[0]["config_text"])
+        # 1.2.6 stage 1 rewrite: candidate records no longer embed the
+        # config (the old assertion read candidates[0]["config_text"]).
+        # The reused parsed config must instead be retrievable verbatim
+        # from the config store under the candidate's id.
+        self.assertNotIn("config_text", candidates[0])
+        self.assertIn(
+            "remote 198.51.100.10 1194",
+            manager.get_node_config(candidates[0]["id"]),
+        )
         self.assertEqual(rows, [dict(row) for row in rows])
 
     def test_cache_api_snapshot_accepts_preparsed_rows_without_reparsing(self) -> None:
@@ -3055,13 +3064,13 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
 
     def test_worker_stale_process_fails_and_needs_terminal(self) -> None:
         install_dir = self._make_update_install_dir("1.2.4")
-        fake, calls, state = self._update_fake("same", "1.2.5")
+        fake, calls, state = self._update_fake("same", "1.2.6")
         result = manager.run_code_update_worker(
             install_dir=install_dir,
             runner=fake,
             panel_healthy=lambda h, p, t: True,
             release_check=lambda: {
-                "ok": True, "latest_version": "1.2.5", "no_release": False,
+                "ok": True, "latest_version": "1.2.6", "no_release": False,
             },
         )
         self.assertFalse(result)
@@ -3081,13 +3090,13 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
 
     def test_worker_fresh_process_succeeds_and_traces_install_output(self) -> None:
         install_dir = self._make_update_install_dir("1.2.4")
-        fake, calls, state = self._update_fake("change", "1.2.5")
+        fake, calls, state = self._update_fake("change", "1.2.6")
         result = manager.run_code_update_worker(
             install_dir=install_dir,
             runner=fake,
             panel_healthy=lambda h, p, t: True,
             release_check=lambda: {
-                "ok": True, "latest_version": "1.2.5", "no_release": False,
+                "ok": True, "latest_version": "1.2.6", "no_release": False,
             },
         )
         self.assertTrue(result)
@@ -3108,13 +3117,13 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
 
     def test_worker_degraded_verification_when_systemd_unreadable(self) -> None:
         install_dir = self._make_update_install_dir("1.2.4")
-        fake, calls, state = self._update_fake("no-systemd", "1.2.5")
+        fake, calls, state = self._update_fake("no-systemd", "1.2.6")
         result = manager.run_code_update_worker(
             install_dir=install_dir,
             runner=fake,
             panel_healthy=lambda h, p, t: True,
             release_check=lambda: {
-                "ok": True, "latest_version": "1.2.5", "no_release": False,
+                "ok": True, "latest_version": "1.2.6", "no_release": False,
             },
             panel_http_check=lambda h, p, t: True,
         )
@@ -3131,7 +3140,7 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
             runner=fake,
             panel_healthy=lambda h, p, t: True,
             release_check=lambda: {
-                "ok": True, "latest_version": "1.2.5", "no_release": False,
+                "ok": True, "latest_version": "1.2.6", "no_release": False,
             },
         )
         self.assertFalse(result)
@@ -3146,7 +3155,7 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
 
     def test_worker_release_check_unreachable_aborts(self) -> None:
         install_dir = self._make_update_install_dir("1.2.4")
-        fake, calls, state = self._update_fake("change", "1.2.5")
+        fake, calls, state = self._update_fake("change", "1.2.6")
 
         def broken_release_check():
             raise RuntimeError("network down (test)")
@@ -3181,21 +3190,24 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
 
 
-class Plus125Stage4RiskScoreTests(unittest.TestCase):
-    """1.2.5 stage 4: manual FFraud risk-score lookup (display-only).
+class Plus126Stage2CoffeeScoreTests(unittest.TestCase):
+    """1.2.6 stage 2: risk-score source swap FFraud -> IP Coffee
+    (plan §一/§二/§八), replacing the 1.2.5 stage-4 FFraud tests.
 
-    Scores land in risk_display_* fields; the iplark_score hook stays
-    None and composite ordering must be byte-identical before/after a
-    check. All network access is faked (opener injection), so no test
-    in this class ever leaves the machine.
+    Scores still land in risk_display_* fields; the iplark_score hook
+    stays None and composite ordering must be identical before/after
+    a check. IP Coffee's trust_score is stored converted (risk =
+    100 - trust, plan §八.1); FFraud-era records are voided on first
+    read (plan §八.2). All network access is faked (opener injection),
+    so no test in this class ever leaves the machine.
     """
 
-    # Fixtures live inside the repo (tests/fixtures/ffraud_samples) so
+    # Fixtures live inside the repo (tests/fixtures/coffee_samples) so
     # the suite is self-contained anywhere it is checked out; the
     # pre-1.2.5 path pointed outside the repo at the developer's goal
     # hidden_files and failed in CI with FileNotFoundError.
     SAMPLES_DIR = (
-        Path(__file__).resolve().parent / "fixtures" / "ffraud_samples"
+        Path(__file__).resolve().parent / "fixtures" / "coffee_samples"
     )
 
     def setUp(self) -> None:
@@ -3205,6 +3217,7 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
         self.path_patches = [
             mock.patch.object(manager, "DATA_DIR", root),
             mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
+            mock.patch.object(manager, "CONFIG_STORE_FILE", root / "node_configs.json"),
             mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
             mock.patch.object(manager, "STATE_FILE", root / "state.json"),
             mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
@@ -3220,6 +3233,8 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
         for patcher in self.path_patches:
             patcher.start()
         manager.ensure_dirs()
+        manager._config_store_cache["key"] = None
+        manager._config_store_cache["data"] = {}
         manager.active_openvpn_process = None
         manager.active_openvpn_node_id = ""
         manager.is_connecting = False
@@ -3233,6 +3248,8 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         manager._risk_check_inflight.clear()
         manager.active_openvpn_node_id = ""
+        manager._config_store_cache["key"] = None
+        manager._config_store_cache["data"] = {}
         manager._retained_count_cache["key"] = None
         manager._retained_count_cache["count"] = 0
         manager.active_sessions.clear()
@@ -3291,12 +3308,12 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
     def _fake_opener(self, responder):
         """Patch the manager's fetch opener with a recording fake.
 
-        fetch_ffraud_score builds its opener via the manager-level
-        _ffraud_build_opener() seam, so ONLY the FFraud fetch is faked;
-        the shared urllib.request module (used by this class's own HTTP
-        test client) is never touched. responder(url) -> _FakeResponse,
-        or raises. Returns the list of requested URLs so tests can
-        assert on (non-)network activity.
+        fetch_coffee_score builds its opener via the manager-level
+        _coffee_build_opener() seam, so ONLY the coffee fetch is
+        faked; the shared urllib.request module (used by this class's
+        own HTTP test client) is never touched. responder(url) ->
+        _FakeResponse, or raises. Returns the list of requested URLs
+        so tests can assert on (non-)network activity.
         """
         calls: list = []
 
@@ -3307,7 +3324,7 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
                 return responder(url)
 
         patcher = mock.patch.object(
-            manager, "_ffraud_build_opener", return_value=_Opener()
+            manager, "_coffee_build_opener", return_value=_Opener()
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -3331,36 +3348,92 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
     # -- parsing of the archived real samples -------------------------
 
     def test_parse_clean_sample(self) -> None:
-        parsed = manager.parse_ffraud_response(
+        parsed = manager.parse_coffee_response(
             self._sample("clean_8.8.8.8"), "8.8.8.8"
         )
-        self.assertEqual(5, parsed["risk_display_score"])
-        self.assertEqual("none", parsed["risk_display_level"])
-        self.assertEqual("Data Center", parsed["risk_display_connection_type"])
-        self.assertEqual(["机房托管"], parsed["risk_display_flags"])
-        self.assertTrue(
-            parsed["risk_display_reason"].startswith("Datacenter/hosting IP")
+        # trust_score 63 -> risk 37 (plan §八.1 conversion).
+        self.assertEqual(37, parsed["risk_display_score"])
+        self.assertEqual("", parsed["risk_display_level"])
+        self.assertEqual("机房", parsed["risk_display_connection_type"])
+        # flags/reason are no longer produced at all (plan §一.2).
+        self.assertEqual(
+            {"risk_display_score", "risk_display_level",
+             "risk_display_connection_type"},
+            set(parsed),
         )
 
     def test_parse_vpn_sample(self) -> None:
-        parsed = manager.parse_ffraud_response(
+        parsed = manager.parse_coffee_response(
             self._sample("vpn_1.1.1.1"), "1.1.1.1"
         )
-        self.assertEqual(5, parsed["risk_display_score"])
-        self.assertEqual("none", parsed["risk_display_level"])
-        self.assertEqual("Data Center", parsed["risk_display_connection_type"])
-        self.assertEqual(["VPN", "机房托管"], parsed["risk_display_flags"])
+        # trust_score 41 -> risk 59; the payload's own flags say
+        # datacenter (the sample is Cloudflare DNS), so 机房.
+        self.assertEqual(59, parsed["risk_display_score"])
+        self.assertEqual("", parsed["risk_display_level"])
+        self.assertEqual("机房", parsed["risk_display_connection_type"])
 
     def test_parse_tor_sample(self) -> None:
-        parsed = manager.parse_ffraud_response(
+        parsed = manager.parse_coffee_response(
             self._sample("tor_185.220.101.34"), "185.220.101.34"
         )
-        self.assertEqual(100, parsed["risk_display_score"])
-        self.assertEqual("critical", parsed["risk_display_level"])
+        # trust_score 39 -> risk 61; abuser_score "1 (Very High)"
+        # yields the tier text; is_tor outranks is_proxy/isResidential.
+        self.assertEqual(61, parsed["risk_display_score"])
+        self.assertEqual("Very High", parsed["risk_display_level"])
+        self.assertEqual("Tor 出口", parsed["risk_display_connection_type"])
+
+    def test_ip_type_label_priority(self) -> None:
+        def label(**fields):
+            payload = {
+                "ip": "8.8.8.8", "trust_score": 50, "abuser_score": "",
+                "is_tor": False, "is_proxy": False, "is_vpn": False,
+                "is_mobile": False, "isResidential": False,
+                "is_datacenter": False, "company_type": "",
+            }
+            payload.update(fields)
+            return manager.coffee_ip_type_label(payload)
+
+        self.assertEqual("未知", label())
+        self.assertEqual("机房", label(company_type="hosting"))
+        self.assertEqual("机房", label(is_datacenter=True))
+        self.assertEqual("企业", label(company_type="business"))
+        self.assertEqual("运营商", label(company_type="isp"))
+        self.assertEqual("住宅", label(isResidential=True))
+        self.assertEqual("移动网络", label(is_mobile=True))
+        self.assertEqual("VPN", label(is_vpn=True))
+        self.assertEqual("代理", label(is_proxy=True))
+        self.assertEqual("Tor 出口", label(is_tor=True))
+        # Priority conflicts, plan §一.3 order.
         self.assertEqual(
-            ["代理", "VPN", "Tor", "机房托管", "滥用记录", "近期滥用"],
-            parsed["risk_display_flags"],
+            "Tor 出口",
+            label(is_tor=True, is_proxy=True, isResidential=True),
         )
+        self.assertEqual("代理", label(is_proxy=True, is_vpn=True))
+        self.assertEqual("VPN", label(is_vpn=True, is_mobile=True))
+        self.assertEqual(
+            "移动网络", label(is_mobile=True, isResidential=True)
+        )
+        self.assertEqual(
+            "住宅", label(isResidential=True, is_datacenter=True)
+        )
+        self.assertEqual(
+            "住宅", label(isResidential=True, company_type="hosting")
+        )
+        self.assertEqual(
+            "机房", label(is_datacenter=True, company_type="business")
+        )
+
+    def test_parse_score_boundaries(self) -> None:
+        low = manager.parse_coffee_response(
+            {"ip": "8.8.8.8", "trust_score": 0}, "8.8.8.8"
+        )
+        self.assertEqual(100, low["risk_display_score"])
+        self.assertEqual("未知", low["risk_display_connection_type"])
+        self.assertEqual("", low["risk_display_level"])
+        high = manager.parse_coffee_response(
+            {"ip": "8.8.8.8", "trust_score": 100}, "8.8.8.8"
+        )
+        self.assertEqual(0, high["risk_display_score"])
 
     # -- response guards ------------------------------------------------
 
@@ -3368,20 +3441,20 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
         base = self._sample("clean_8.8.8.8")
         cases = {
             "not a dict": ["not", "a", "dict"],
-            "success missing": {k: v for k, v in base.items() if k != "success"},
-            "success false": {**base, "success": False},
-            "score missing": {k: v for k, v in base.items() if k != "fraud_score"},
-            "score too high": {**base, "fraud_score": 101},
-            "score negative": {**base, "fraud_score": -1},
-            "score is bool": {**base, "fraud_score": True},
-            "score is string": {**base, "fraud_score": "5"},
+            "trust_score missing": {
+                k: v for k, v in base.items() if k != "trust_score"
+            },
+            "trust_score too high": {**base, "trust_score": 101},
+            "trust_score negative": {**base, "trust_score": -1},
+            "trust_score is bool": {**base, "trust_score": True},
+            "trust_score is string": {**base, "trust_score": "63"},
             "ip mismatch": {**base, "ip": "1.1.1.1"},
             "ip missing": {k: v for k, v in base.items() if k != "ip"},
         }
         for label, payload in cases.items():
             with self.subTest(case=label):
                 with self.assertRaises(manager.RiskScoreFetchError) as ctx:
-                    manager.parse_ffraud_response(payload, "8.8.8.8")
+                    manager.parse_coffee_response(payload, "8.8.8.8")
                 self.assertEqual(
                     manager.RISK_ERROR_BAD_RESPONSE, ctx.exception.category
                 )
@@ -3399,7 +3472,7 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
         ):
             with self.subTest(target=target):
                 with self.assertRaises(manager.RiskScoreFetchError) as ctx:
-                    manager.fetch_ffraud_score(target)
+                    manager.fetch_coffee_score(target)
                 self.assertEqual(
                     manager.RISK_ERROR_TARGET_INVALID, ctx.exception.category
                 )
@@ -3408,10 +3481,10 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
     def test_fetch_success_uses_direct_api_url(self) -> None:
         body = json.dumps(self._sample("clean_8.8.8.8")).encode("utf-8")
         calls = self._fake_opener(lambda url: self._FakeResponse(body))
-        parsed = manager.fetch_ffraud_score("8.8.8.8")
-        self.assertEqual(5, parsed["risk_display_score"])
+        parsed = manager.fetch_coffee_score("8.8.8.8")
+        self.assertEqual(37, parsed["risk_display_score"])
         self.assertEqual(
-            ["https://api.ffraud.com/public/ip/8.8.8.8"], calls
+            ["https://ip.net.coffee/api/ipv2/lookup/8.8.8.8"], calls
         )
 
     def test_fetch_http_error_is_rejected_category(self) -> None:
@@ -3420,7 +3493,15 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
 
         self._fake_opener(responder)
         with self.assertRaises(manager.RiskScoreFetchError) as ctx:
-            manager.fetch_ffraud_score("8.8.8.8")
+            manager.fetch_coffee_score("8.8.8.8")
+        self.assertEqual(manager.RISK_ERROR_REJECTED, ctx.exception.category)
+
+    def test_fetch_non_200_status_is_rejected_category(self) -> None:
+        self._fake_opener(
+            lambda url: self._FakeResponse(b"{}", status=503)
+        )
+        with self.assertRaises(manager.RiskScoreFetchError) as ctx:
+            manager.fetch_coffee_score("8.8.8.8")
         self.assertEqual(manager.RISK_ERROR_REJECTED, ctx.exception.category)
 
     def test_fetch_network_error_category(self) -> None:
@@ -3429,13 +3510,13 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
 
         self._fake_opener(responder)
         with self.assertRaises(manager.RiskScoreFetchError) as ctx:
-            manager.fetch_ffraud_score("8.8.8.8")
+            manager.fetch_coffee_score("8.8.8.8")
         self.assertEqual(manager.RISK_ERROR_NETWORK, ctx.exception.category)
 
     def test_fetch_malformed_json_is_bad_response(self) -> None:
         self._fake_opener(lambda url: self._FakeResponse(b"<html>nope</html>"))
         with self.assertRaises(manager.RiskScoreFetchError) as ctx:
-            manager.fetch_ffraud_score("8.8.8.8")
+            manager.fetch_coffee_score("8.8.8.8")
         self.assertEqual(manager.RISK_ERROR_BAD_RESPONSE, ctx.exception.category)
 
     # -- endpoint orchestration (function level) -------------------------
@@ -3446,48 +3527,88 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
             [self._score_node("score-1", "8.8.8.8"),
              self._score_node("other-1", "203.0.113.7")],
         )
-        fake_fields = manager.parse_ffraud_response(
+        fake_fields = manager.parse_coffee_response(
             self._sample("clean_8.8.8.8"), "8.8.8.8"
         )
         with mock.patch.object(
-            manager, "fetch_ffraud_score", return_value=fake_fields
+            manager, "fetch_coffee_score", return_value=fake_fields
         ) as fetch_mock:
             outcome = manager.check_node_risk_score("score-1")
         self.assertTrue(outcome["ok"])
         fetch_mock.assert_called_once_with("8.8.8.8")
         stored = {n["id"]: n for n in manager.read_nodes()}
         row = stored["score-1"]
-        self.assertEqual(5, row["risk_display_score"])
-        self.assertEqual("none", row["risk_display_level"])
+        self.assertEqual(37, row["risk_display_score"])
+        self.assertEqual("", row["risk_display_level"])
+        self.assertEqual("机房", row["risk_display_connection_type"])
         self.assertGreater(row["risk_display_checked_at"], 0)
         self.assertEqual("", row["risk_display_error"])
+        # flags/reason are never written by the coffee path.
+        self.assertEqual([], row["risk_display_flags"])
+        self.assertEqual("", row["risk_display_reason"])
         # The hook field is never written and the other node is untouched.
         self.assertIsNone(row["iplark_score"])
         self.assertIsNone(stored["other-1"]["risk_display_score"])
         self.assertEqual(0, stored["other-1"]["risk_display_checked_at"])
 
+    def test_check_success_replaces_voided_ffraud_state(self) -> None:
+        # A node still carrying a 1.2.5 FFraud score: the read inside
+        # check_node_risk_score voids it (plan §八.2), then the coffee
+        # result lands -- no FFraud trace may survive the write-back.
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._score_node(
+                "tor-1", "185.220.101.34",
+                risk_display_score=100, risk_display_level="critical",
+                risk_display_connection_type="Data Center",
+                risk_display_flags=["代理", "VPN", "Tor", "机房托管"],
+                risk_display_reason="Tor exit node actively routing traffic.",
+                risk_display_checked_at=111.0,
+            )],
+        )
+        body = json.dumps(self._sample("tor_185.220.101.34")).encode("utf-8")
+        calls = self._fake_opener(lambda url: self._FakeResponse(body))
+        outcome = manager.check_node_risk_score("tor-1")
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(
+            ["https://ip.net.coffee/api/ipv2/lookup/185.220.101.34"], calls
+        )
+        row = manager.read_nodes()[0]
+        self.assertEqual(61, row["risk_display_score"])
+        self.assertEqual("Very High", row["risk_display_level"])
+        self.assertEqual("Tor 出口", row["risk_display_connection_type"])
+        self.assertEqual([], row["risk_display_flags"])
+        self.assertEqual("", row["risk_display_reason"])
+        self.assertEqual("", row["risk_display_error"])
+        self.assertGreater(row["risk_display_checked_at"], 111.0)
+
     def test_check_failure_keeps_previous_score(self) -> None:
+        # The kept "previous score" is a coffee-written one (an
+        # FFraud-era one would have been voided on the read inside
+        # check_node_risk_score before the fetch even runs).
         manager.write_json(
             manager.NODES_FILE,
             [self._score_node(
                 "score-1", "8.8.8.8",
-                risk_display_score=42, risk_display_level="medium",
+                risk_display_score=42, risk_display_level="Very High",
+                risk_display_connection_type="住宅",
                 risk_display_checked_at=111.0,
             )],
         )
 
         def failing_fetch(ip):
             raise manager.RiskScoreFetchError(
-                manager.RISK_ERROR_REJECTED, "FFraud HTTP 403"
+                manager.RISK_ERROR_REJECTED, "IP Coffee HTTP 403"
             )
 
-        with mock.patch.object(manager, "fetch_ffraud_score", failing_fetch):
+        with mock.patch.object(manager, "fetch_coffee_score", failing_fetch):
             outcome = manager.check_node_risk_score("score-1")
         self.assertFalse(outcome["ok"])
         self.assertEqual(manager.RISK_ERROR_REJECTED, outcome["error"])
         row = manager.read_nodes()[0]
         self.assertEqual(42, row["risk_display_score"])
-        self.assertEqual("medium", row["risk_display_level"])
+        self.assertEqual("Very High", row["risk_display_level"])
+        self.assertEqual("住宅", row["risk_display_connection_type"])
         self.assertEqual(manager.RISK_ERROR_REJECTED, row["risk_display_error"])
         self.assertGreater(row["risk_display_checked_at"], 111.0)
         self.assertIsNone(row["iplark_score"])
@@ -3534,13 +3655,16 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
             }
 
         before_order, before_scores = order(), composites()
-        # Simulate completed lookups writing ONLY display fields, with
-        # wildly different scores (including the Tor 100).
-        pool[0].update(risk_display_score=5, risk_display_level="none",
+        # Simulate completed coffee lookups writing ONLY display
+        # fields, with wildly different scores (including the Tor 61).
+        pool[0].update(risk_display_score=37, risk_display_level="",
+                       risk_display_connection_type="机房",
                        risk_display_checked_at=999.0)
-        pool[1].update(risk_display_score=88, risk_display_level="high",
+        pool[1].update(risk_display_score=59, risk_display_level="",
+                       risk_display_connection_type="机房",
                        risk_display_checked_at=999.0)
-        pool[2].update(risk_display_score=100, risk_display_level="critical",
+        pool[2].update(risk_display_score=61, risk_display_level="Very High",
+                       risk_display_connection_type="Tor 出口",
                        risk_display_checked_at=999.0)
         self.assertEqual(before_order, order())
         self.assertEqual(before_scores, composites())
@@ -3551,25 +3675,168 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
 
     def test_merge_preserves_risk_display_fields(self) -> None:
         checked = self._score_node(
-            "score-1", "8.8.8.8",
-            risk_display_score=5, risk_display_level="none",
+            "score-1", "185.220.101.34",
+            risk_display_score=61, risk_display_level="Very High",
             risk_display_checked_at=1234567.0,
-            risk_display_connection_type="Data Center",
-            risk_display_flags=["机房托管"],
-            risk_display_reason="Datacenter/hosting IP operated by Google Cloud.",
+            risk_display_connection_type="Tor 出口",
+            risk_display_flags=[],
+            risk_display_reason="",
         )
         manager.write_json(manager.NODES_FILE, [checked])
-        candidate = self._score_node("score-1", "8.8.8.8")  # fresh, defaults
+        candidate = self._score_node("score-1", "185.220.101.34")  # fresh
         self._run_maintain([candidate])
         stored = {n["id"]: n for n in manager.read_nodes()}
         row = stored["score-1"]
-        self.assertEqual(5, row["risk_display_score"])
-        self.assertEqual("none", row["risk_display_level"])
+        self.assertEqual(61, row["risk_display_score"])
+        self.assertEqual("Very High", row["risk_display_level"])
         self.assertEqual(1234567.0, row["risk_display_checked_at"])
-        self.assertEqual("Data Center", row["risk_display_connection_type"])
-        self.assertEqual(["机房托管"], row["risk_display_flags"])
-        self.assertTrue(row["risk_display_reason"].startswith("Datacenter"))
+        self.assertEqual("Tor 出口", row["risk_display_connection_type"])
+        self.assertEqual([], row["risk_display_flags"])
+        self.assertEqual("", row["risk_display_reason"])
         self.assertIsNone(row["iplark_score"])
+
+    # -- legacy FFraud-score voiding (plan §八.2) -------------------------
+
+    def _bare_node(self, node_id: str, ip: str, **overrides) -> dict:
+        """A node record without config_text, so the stage-1 config
+        migration stays out of these stage-2 voiding assertions."""
+        node = self._score_node(node_id, ip, **overrides)
+        node.pop("config_text", None)
+        return node
+
+    def _assert_risk_cleared(self, row: dict) -> None:
+        for key, default in manager.RISK_DISPLAY_DEFAULTS.items():
+            self.assertEqual(default, row[key], key)
+
+    def test_ffraud_legacy_scores_voided_on_first_read(self) -> None:
+        full_trace = self._bare_node(
+            "legacy-full", "8.8.8.8",
+            risk_display_score=5, risk_display_level="none",
+            risk_display_connection_type="Data Center",
+            risk_display_flags=["机房托管"],
+            risk_display_reason="Datacenter/hosting IP operated by Google.",
+            risk_display_checked_at=1700000000.0,
+        )
+        tor_trace = self._bare_node(
+            "legacy-tor", "185.220.101.34",
+            risk_display_score=100, risk_display_level="critical",
+            risk_display_connection_type="Data Center",
+            risk_display_flags=["代理", "VPN", "Tor", "机房托管", "滥用记录"],
+            risk_display_reason="Tor exit node actively routing traffic.",
+            risk_display_checked_at=1700000000.0,
+        )
+        # Single-trace shapes: each FFraud-only marker on its own
+        # must already trigger the voiding.
+        level_only = self._bare_node(
+            "legacy-level", "203.0.113.8",
+            risk_display_score=42, risk_display_level="medium",
+            risk_display_checked_at=1700000000.0,
+        )
+        conn_only = self._bare_node(
+            "legacy-conn", "203.0.113.9",
+            risk_display_score=7,
+            risk_display_connection_type="Residential",
+            risk_display_checked_at=1700000000.0,
+        )
+        flags_only = self._bare_node(
+            "legacy-flags", "203.0.113.10",
+            risk_display_score=88, risk_display_flags=["住宅代理"],
+            risk_display_checked_at=1700000000.0,
+        )
+        reason_only = self._bare_node(
+            "legacy-reason", "203.0.113.11",
+            risk_display_score=15,
+            risk_display_reason="VPN connection detected (unknown provider).",
+            risk_display_checked_at=1700000000.0,
+        )
+        legacy = [full_trace, tor_trace, level_only, conn_only,
+                  flags_only, reason_only]
+        manager.write_json(manager.NODES_FILE, legacy)
+        rows = {n["id"]: n for n in manager.read_nodes()}
+        self.assertEqual(len(legacy), len(rows))
+        for node in legacy:
+            row = rows[node["id"]]
+            self._assert_risk_cleared(row)
+            # Non-risk fields are not the migration's business.
+            self.assertEqual(node["ip"], row["ip"])
+            self.assertIsNone(row["iplark_score"])
+        # The voiding is persisted, not just an in-memory view.
+        on_disk = {
+            n["id"]: n
+            for n in json.loads(manager.NODES_FILE.read_text(encoding="utf-8"))
+        }
+        for node in legacy:
+            self._assert_risk_cleared(on_disk[node["id"]])
+
+    def test_coffee_records_survive_reads_untouched(self) -> None:
+        coffee_clean = self._bare_node(
+            "coffee-1", "8.8.8.8",
+            risk_display_score=37, risk_display_connection_type="机房",
+            risk_display_checked_at=1700000000.0,
+        )
+        coffee_tor = self._bare_node(
+            "coffee-2", "185.220.101.34",
+            risk_display_score=61, risk_display_level="Very High",
+            risk_display_connection_type="Tor 出口",
+            risk_display_checked_at=1700000000.0,
+        )
+        # A failed re-check after a coffee success: score state kept,
+        # error written -- still coffee-shaped, must not be voided.
+        coffee_failed_recheck = self._bare_node(
+            "coffee-3", "1.1.1.1",
+            risk_display_score=59, risk_display_connection_type="机房",
+            risk_display_error=manager.RISK_ERROR_NETWORK,
+            risk_display_checked_at=1700000100.0,
+        )
+        # Error-only records carry no source-distinguishing trace and
+        # are out of the voiding's scope by design.
+        error_only = self._bare_node(
+            "error-only", "203.0.113.12",
+            risk_display_error=manager.RISK_ERROR_REJECTED,
+            risk_display_checked_at=1700000000.0,
+        )
+        fresh = self._bare_node("fresh-1", "203.0.113.13")
+        seeds = [coffee_clean, coffee_tor, coffee_failed_recheck,
+                 error_only, fresh]
+        manager.write_json(manager.NODES_FILE, seeds)
+        before = manager.NODES_FILE.read_bytes()
+        rows = {n["id"]: n for n in manager.read_nodes()}
+        for seed in seeds:
+            row = rows[seed["id"]]
+            for key in manager.RISK_DISPLAY_DEFAULTS:
+                self.assertEqual(seed[key], row[key], f"{seed['id']}:{key}")
+        # No record matched the legacy shape, so the file is not
+        # rewritten at all.
+        self.assertEqual(before, manager.NODES_FILE.read_bytes())
+
+    def test_voiding_is_idempotent_and_new_scores_stick(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._bare_node(
+                "legacy-1", "8.8.8.8",
+                risk_display_score=5, risk_display_level="none",
+                risk_display_connection_type="Data Center",
+                risk_display_flags=["机房托管"],
+                risk_display_reason="Datacenter/hosting IP.",
+                risk_display_checked_at=1700000000.0,
+            )],
+        )
+        self._assert_risk_cleared(manager.read_nodes()[0])
+        after_first = manager.NODES_FILE.read_bytes()
+        self._assert_risk_cleared(manager.read_nodes()[0])
+        self.assertEqual(after_first, manager.NODES_FILE.read_bytes())
+        # A coffee score written after the voiding is not re-voided.
+        fake_fields = manager.parse_coffee_response(
+            self._sample("clean_8.8.8.8"), "8.8.8.8"
+        )
+        with mock.patch.object(
+            manager, "fetch_coffee_score", return_value=fake_fields
+        ):
+            outcome = manager.check_node_risk_score("legacy-1")
+        self.assertTrue(outcome["ok"])
+        row = manager.read_nodes()[0]
+        self.assertEqual(37, row["risk_display_score"])
+        self.assertEqual("机房", row["risk_display_connection_type"])
 
     # -- HTTP endpoint, full path -----------------------------------------
 
@@ -3579,7 +3846,7 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
             [self._score_node("score-1", "8.8.8.8"),
              self._score_node("bad-1", "notanip")],
         )
-        manager.active_sessions["plus125-stage4-token"] = manager.time.time() + 60
+        manager.active_sessions["plus126-stage2-token"] = manager.time.time() + 60
         server = manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -3587,7 +3854,7 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
 
         def request(path: str, payload: dict | None = None) -> tuple[int, dict]:
             data = None
-            headers = {"Cookie": "session=plus125-stage4-token"}
+            headers = {"Cookie": "session=plus126-stage2-token"}
             if payload is not None:
                 data = json.dumps(payload).encode("utf-8")
                 headers["Content-Type"] = "application/json"
@@ -3612,16 +3879,19 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
             status, payload = request("/api/check_score", {"id": "score-1"})
             self.assertEqual(200, status)
             self.assertTrue(payload["ok"])
-            self.assertEqual(5, payload["node"]["risk_display_score"])
+            self.assertEqual(37, payload["node"]["risk_display_score"])
             self.assertNotIn("config_text", payload["node"])
             self.assertEqual(
-                ["https://api.ffraud.com/public/ip/8.8.8.8"], calls
+                ["https://ip.net.coffee/api/ipv2/lookup/8.8.8.8"], calls
             )
             status, nodes_payload = request("/api/nodes")
             self.assertEqual(200, status)
             rows = {n["id"]: n for n in nodes_payload["nodes"]}
-            self.assertEqual(5, rows["score-1"]["risk_display_score"])
-            self.assertEqual("none", rows["score-1"]["risk_display_level"])
+            self.assertEqual(37, rows["score-1"]["risk_display_score"])
+            self.assertEqual("", rows["score-1"]["risk_display_level"])
+            self.assertEqual(
+                "机房", rows["score-1"]["risk_display_connection_type"]
+            )
             self.assertIsNone(rows["score-1"]["iplark_score"])
 
             # Invalid target: rejected before any network use.
@@ -3663,7 +3933,7 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
         manager.write_json(
             manager.NODES_FILE, [self._score_node("score-1", "8.8.8.8")]
         )
-        manager.active_sessions["plus125-stage4-token"] = manager.time.time() + 60
+        manager.active_sessions["plus126-stage2-token"] = manager.time.time() + 60
         server = manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -3678,7 +3948,7 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
                 base_url + "/api/check_score",
                 data=json.dumps({"id": "score-1"}).encode("utf-8"),
                 headers={
-                    "Cookie": "session=plus125-stage4-token",
+                    "Cookie": "session=plus126-stage2-token",
                     "Content-Type": "application/json",
                 },
                 method="POST",
@@ -3698,13 +3968,49 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-    # -- panel markers ------------------------------------------------------
+    # -- panel narrative (plan §二) and markers ---------------------------
+
+    def test_risk_score_title_narrative_matches_plan_verbatim(self) -> None:
+        html = manager.INDEX_HTML
+        start = html.index("function riskScoreTitle")
+        end = html.index("async function checkNodeScore")
+        fn = html[start:end]
+        # Unqueried state is one fully static string in the source;
+        # assert it character-for-character (plan §二).
+        self.assertIn(
+            "尚未查询。点击「查评分」拉取该 IP 的风险系数。"
+            "评分引用：IP Coffee（ip.net.coffee）。此分数只作为参考。",
+            fn,
+        )
+        # Checked state: exactly the four items -- risk coefficient,
+        # query time, IP type, citation -- assembled in plan order.
+        self.assertIn("风险系数 ", fn)
+        self.assertIn("（0–100，越高越危险）", fn)
+        self.assertIn("查询时间：", fn)
+        self.assertIn("IP 类型：", fn)
+        self.assertIn(
+            "评分引用：IP Coffee（ip.net.coffee）。此分数只作为参考。", fn
+        )
+        # Failure state: category + time + citation, nothing else.
+        self.assertIn("查询失败：", fn)
+        self.assertIn(
+            "。评分引用：IP Coffee（ip.net.coffee）。此分数只作为参考。", fn
+        )
+        # Nothing beyond the four items may be narrated: no tier, no
+        # flags, no reason, no old source name, no legacy field reads.
+        for banned in (
+            "档位", "标记", "说明：", "连接类型", "来源：", "FFraud",
+            "risk_display_level", "risk_display_flags",
+            "risk_display_reason",
+        ):
+            self.assertNotIn(banned, fn)
 
     def test_panel_risk_score_ui_markers(self) -> None:
         html = manager.INDEX_HTML
         self.assertIn('<th style="width: 90px;">风险分</th>', html)
         self.assertNotIn("iplark 评分</th>", html)
         self.assertNotIn("暂未启用", html)
+        self.assertNotIn("FFraud", html)
         self.assertIn("checkNodeScore", html)
         self.assertIn("riskScoreTitle", html)
         self.assertIn("scoreRequestIds", html)
@@ -3722,3 +4028,917 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
         for key, default in manager.RISK_DISPLAY_DEFAULTS.items():
             self.assertEqual(default, fresh[key])
         self.assertIsNone(fresh["iplark_score"])
+
+
+CONFIG_STORE_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "config_store"
+
+
+class Plus126ConfigStoreTests(unittest.TestCase):
+    """1.2.6 stage 1: node configs move out of nodes.json into the
+    dedicated config store (plan §四). Covers the fetch write path,
+    the probe/connect/download consumers, legacy migration, lifecycle
+    synchronisation, and the panel output contract."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.root = root
+        self.path_patches = [
+            mock.patch.object(manager, "DATA_DIR", root),
+            mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
+            mock.patch.object(manager, "CONFIG_STORE_FILE", root / "node_configs.json"),
+            mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "STATE_FILE", root / "state.json"),
+            mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
+            mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
+            mock.patch.object(manager, "API_CACHE_FILE", root / "api_snapshot.csv"),
+            mock.patch.object(manager, "API_CACHE_META_FILE", root / "api_snapshot.meta.json"),
+            mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
+            mock.patch.object(manager, "RETAINED_ARCHIVE_FILE", root / "retained_archive.json"),
+            mock.patch.object(manager.vpn_utils, "DATA_DIR", root),
+            mock.patch.object(manager.vpn_utils, "IP_CACHE_FILE", root / "ip_cache.json"),
+        ]
+        for patcher in self.path_patches:
+            patcher.start()
+        manager.ensure_dirs()
+        manager._config_store_cache["key"] = None
+        manager._config_store_cache["data"] = {}
+        self._saved_restart_first = manager._first_maintain_after_startup
+        manager._first_maintain_after_startup = True
+        manager.active_openvpn_process = None
+        manager.pending_openvpn_process = None
+        manager.active_openvpn_node_id = ""
+        manager.active_connection_cancel_event = None
+        manager.is_connecting = False
+        manager.consecutive_proxy_failures = 0
+        manager.last_proxy_failure_node_id = ""
+        manager.background_refill_thread = None
+        manager.background_refill_cancel_event.clear()
+        manager.active_sessions.clear()
+        manager.full_sweep_running = False
+        manager.full_sweep_cancel_requested = False
+        manager._switch_watch_last_id = ""
+        manager.clear_switch_sweep_pending()
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+
+    def tearDown(self) -> None:
+        if manager.connection_attempt_lock.locked():
+            manager.connection_attempt_lock.release()
+        manager.background_refill_cancel_event.set()
+        manager.background_refill_thread = None
+        manager._first_maintain_after_startup = self._saved_restart_first
+        manager.active_openvpn_node_id = ""
+        manager._switch_watch_last_id = ""
+        manager.clear_switch_sweep_pending()
+        manager._config_store_cache["key"] = None
+        manager._config_store_cache["data"] = {}
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+        for patcher in reversed(self.path_patches):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    # -- helpers ------------------------------------------------------
+
+    def _node(self, node_id: str, ip: str, port: int = 1194, proto: str = "udp", **extra) -> dict:
+        node = {
+            "id": node_id,
+            "country": "日本",
+            "country_short": "JP",
+            "ip": ip,
+            "remote_host": ip,
+            "remote_port": port,
+            "proto": proto,
+            "ping": 10,
+            "score": 100,
+            "latency_ms": 0,
+            "config_file": str(manager.CONFIG_DIR / f"{node_id}.ovpn"),
+            "probe_status": "not_checked",
+            "probe_message": "",
+            "probed_at": 0,
+            "retention_status": "normal",
+            "last_seen_at": manager.time.time(),
+            "source_present": 1,
+            "consecutive_failures": 0,
+            "last_success_at": 0,
+            "active": False,
+        }
+        node.update(extra)
+        return node
+
+    def _write_table_with_configs(self, specs) -> list[dict]:
+        """Write a metadata-only node table and store each spec's
+        config text in the config store (the post-1.2.6 on-disk form).
+        specs: list of (node_id, ip) or (node_id, ip, config_text)."""
+        nodes = []
+        store = {}
+        for spec in specs:
+            node_id, ip = spec[0], spec[1]
+            nodes.append(self._node(node_id, ip))
+            if len(spec) > 2 and spec[2]:
+                store[node_id] = spec[2]
+        manager.write_json(manager.NODES_FILE, nodes)
+        manager.write_config_store(store)
+        return nodes
+
+    def _run_maintain(self, candidates):
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "active_openvpn_running", return_value=True),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+            mock.patch.object(manager, "sweep_retained_nodes", return_value=0),
+            mock.patch.object(
+                manager, "run_full_sweep",
+                return_value={"skipped": True, "tested": 0, "available": 0, "unavailable": 0},
+            ),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            return manager.maintain_valid_nodes(force=False, trigger="auto")
+
+    def _load_fixture(self, name: str) -> list:
+        text = (CONFIG_STORE_FIXTURES / name).read_text(encoding="utf-8")
+        return json.loads(text.replace("CONFIGS_DIR", str(manager.CONFIG_DIR)))
+
+    # -- fetch path ---------------------------------------------------
+
+    def test_fetch_stores_config_and_candidate_record_is_metadata_only(self) -> None:
+        candidates = manager.rows_to_candidates(
+            manager.parse_vpngate_rows(valid_snapshot()), {}
+        )
+        self.assertEqual(1, len(candidates))
+        candidate = candidates[0]
+        self.assertNotIn("config_text", candidate)
+        self.assertEqual("198.51.100.10", candidate["remote_host"])
+        self.assertEqual(1194, candidate["remote_port"])
+        stored = manager.get_node_config(candidate["id"])
+        self.assertIn("remote 198.51.100.10 1194", stored)
+        self.assertEqual(
+            stored,
+            manager.read_config_store()[candidate["id"]],
+        )
+
+    # -- consumers: probe chains --------------------------------------
+
+    def test_probe_chains_read_config_from_store(self) -> None:
+        config_a = "client\nremote 192.0.2.11 1194 udp\n# store-a\n"
+        config_b = "client\nremote 192.0.2.12 1194 udp\n# store-b\n"
+        self._write_table_with_configs([
+            ("store-node-a", "192.0.2.11", config_a),
+            ("store-node-b", "192.0.2.12", config_b),
+        ])
+        seen: dict[str, str] = {}
+
+        def fake_openvpn(config_file, **kwargs):
+            seen[Path(config_file).name] = Path(config_file).read_text(encoding="utf-8")
+            return True, "ready", None
+
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+        ):
+            single = manager.test_node_by_id("store-node-a")
+            batch = manager.test_multiple_nodes(["store-node-a", "store-node-b"])
+
+        self.assertEqual("available", single["probe_status"])
+        self.assertEqual(
+            {"store-node-a", "store-node-b"},
+            {result["id"] for result in batch},
+        )
+        temp_contents = set(seen.values())
+        self.assertIn(config_a, temp_contents)
+        self.assertIn(config_b, temp_contents)
+        for node in manager.read_nodes():
+            self.assertNotIn("config_text", node)
+
+    def test_probe_of_configless_node_behaves_like_empty_config(self) -> None:
+        # No store entry at all: both probe chains must take the old
+        # empty-config failure path (temp file written empty, openvpn
+        # reports failure, node ends unavailable) -- no new crash.
+        node = self._node("store-node-none", "192.0.2.99")
+        manager.write_json(manager.NODES_FILE, [node])
+        seen: list[str] = []
+
+        def fake_openvpn(config_file, **kwargs):
+            seen.append(Path(config_file).read_text(encoding="utf-8"))
+            return False, "cannot read config", None
+
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=0),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+        ):
+            single = manager.test_node_by_id("store-node-none")
+            batch = manager.test_multiple_nodes(["store-node-none"])
+
+        self.assertEqual("unavailable", single["probe_status"])
+        self.assertEqual("unavailable", batch[0]["probe_status"])
+        self.assertEqual(["", ""], seen)
+        self.assertEqual("", manager.get_node_config("store-node-none"))
+
+    # -- consumers: connect + stop ------------------------------------
+
+    def test_connect_writes_store_config_and_stop_removes_it(self) -> None:
+        config = "client\nremote 192.0.2.21 1194 udp\n# store-connect\n"
+        nodes = self._write_table_with_configs([
+            ("store-node-c", "192.0.2.21", config),
+        ])
+        process = FakeProcess()
+        written: dict[str, str] = {}
+
+        def fake_openvpn(config_file, **kwargs):
+            written["content"] = Path(config_file).read_text(encoding="utf-8")
+            return True, "ready", process
+
+        with (
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+            mock.patch.object(manager, "setup_policy_routing", return_value=True),
+            mock.patch.object(manager, "cleanup_policy_routing"),
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+            mock.patch.object(
+                manager, "check_proxy_health",
+                return_value={"ok": True, "ip": "192.0.2.21", "latency_ms": 10},
+            ),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            manager.connect_node("store-node-c")
+
+        self.assertEqual(config, written["content"])
+        config_path = Path(nodes[0]["config_file"])
+        self.assertEqual(config, config_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            config, manager.get_node_config("store-node-c")
+        )
+        # Disconnecting deletes the materialized connection file but
+        # must NOT delete the store copy (the node still lives).
+        manager.stop_active_openvpn()
+        self.assertFalse(config_path.exists())
+        self.assertEqual(config, manager.get_node_config("store-node-c"))
+
+    def test_connect_without_store_config_fails_like_empty_config(self) -> None:
+        node = self._node("store-node-d", "192.0.2.22")
+        manager.write_json(manager.NODES_FILE, [node])
+        process = FakeProcess()
+
+        def fake_openvpn(config_file, **kwargs):
+            return True, "ready", process
+
+        with (
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+            mock.patch.object(manager, "setup_policy_routing", return_value=False),
+            mock.patch.object(manager, "cleanup_policy_routing"),
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+            mock.patch.object(manager, "check_proxy_health", return_value={"ok": False, "error": "no route"}),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "代理出口不可用"):
+                manager.connect_node("store-node-d")
+
+        self.assertFalse(process.running)
+        self.assertEqual("", manager.active_openvpn_node_id)
+        stored = manager.read_nodes()
+        self.assertEqual("unavailable", stored[0]["probe_status"])
+
+    # -- consumers: download + panel output ----------------------------
+
+    def _serve(self):
+        manager.active_sessions["cfg-store-token"] = manager.time.time() + 60
+        server = manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, timeout=5)
+        return f"http://127.0.0.1:{server.server_address[1]}/EJsW2EeBo9lY"
+
+    def test_download_and_nodes_api_use_store_without_leaking(self) -> None:
+        config = "client\nremote 192.0.2.31 1194 udp\n# store-download\n"
+        nodes = self._write_table_with_configs([
+            ("store-node-e", "192.0.2.31", config),
+            ("store-node-f", "192.0.2.32"),
+        ])
+        base_url = self._serve()
+        headers = {"Cookie": "session=cfg-store-token"}
+
+        filename = Path(nodes[0]["config_file"]).name
+        req = urllib.request.Request(base_url + f"/configs/{filename}", headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            self.assertEqual(200, response.status)
+            self.assertEqual(config.encode("utf-8"), response.read())
+
+        # A node without a stored config 404s, exactly as a node with
+        # an empty embedded config did before.
+        missing_name = Path(nodes[1]["config_file"]).name
+        req = urllib.request.Request(base_url + f"/configs/{missing_name}", headers=headers)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(404, ctx.exception.code)
+
+        # /api/nodes output: identical shape to the baseline contract --
+        # same fields as the stored records minus nothing (the baseline
+        # stripped config_text; records no longer carry it at all), and
+        # no config content anywhere in the payload.
+        req = urllib.request.Request(base_url + "/api/nodes", headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        rows = {n["id"]: n for n in payload["nodes"]}
+        self.assertEqual({"store-node-e", "store-node-f"}, set(rows))
+        expected_keys = set(nodes[0].keys()) | {"active"}
+        self.assertEqual(expected_keys, set(rows["store-node-e"].keys()))
+        for row in payload["nodes"]:
+            self.assertNotIn("config_text", row)
+        self.assertNotIn("store-download", json.dumps(payload))
+
+    # -- migration ------------------------------------------------------
+
+    def test_legacy_tables_migrate_on_first_store_read(self) -> None:
+        legacy_nodes = self._load_fixture("legacy_nodes.json")
+        legacy_archive = self._load_fixture("legacy_archive.json")
+        manager.write_json(manager.NODES_FILE, legacy_nodes)
+        manager.write_json(manager.RETAINED_ARCHIVE_FILE, legacy_archive)
+
+        store = manager.read_config_store()
+        self.assertEqual(
+            "client\nremote 198.51.100.10 1194 udp\n",
+            store["JP_198.51.100.10_1194_udp"],
+        )
+        self.assertEqual(
+            "client\nremote 198.51.100.20 443 tcp\n",
+            store["KR_198.51.100.20_443_tcp"],
+        )
+        self.assertEqual(
+            "client\nremote 203.0.113.7 1194 udp\n",
+            store["US_203.0.113.7_1194_udp"],
+        )
+        # Both files are stripped; every other field survives verbatim.
+        stripped_nodes = manager.read_json(manager.NODES_FILE, [])
+        self.assertEqual(2, len(stripped_nodes))
+        for raw, stripped in zip(legacy_nodes, stripped_nodes):
+            expected = {k: v for k, v in raw.items() if k != "config_text"}
+            self.assertEqual(expected, stripped)
+        stripped_archive = manager.read_json(manager.RETAINED_ARCHIVE_FILE, [])
+        self.assertEqual(2, len(stripped_archive))
+        for raw, stripped in zip(legacy_archive, stripped_archive):
+            expected = {k: v for k, v in raw.items() if k != "config_text"}
+            self.assertEqual(expected, stripped)
+        # The store file itself was persisted.
+        on_disk = json.loads(manager.CONFIG_STORE_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(store, on_disk)
+
+    def test_migration_is_idempotent_and_store_wins(self) -> None:
+        legacy_nodes = self._load_fixture("legacy_nodes.json")
+        manager.write_json(manager.NODES_FILE, legacy_nodes)
+        manager.write_config_store(
+            {"JP_198.51.100.10_1194_udp": "client\nremote 198.51.100.10 9999 udp\n"}
+        )
+        first = manager.read_config_store()
+        # Pre-existing store content wins over the stale embedded copy.
+        self.assertEqual(
+            "client\nremote 198.51.100.10 9999 udp\n",
+            first["JP_198.51.100.10_1194_udp"],
+        )
+        nodes_bytes = manager.NODES_FILE.read_bytes()
+        store_bytes = manager.CONFIG_STORE_FILE.read_bytes()
+        second = manager.read_config_store()
+        self.assertEqual(first, second)
+        # Second read performs no rewrites at all.
+        self.assertEqual(nodes_bytes, manager.NODES_FILE.read_bytes())
+        self.assertEqual(store_bytes, manager.CONFIG_STORE_FILE.read_bytes())
+
+    def test_heal_loop_uses_store_after_migration(self) -> None:
+        candidates = [self._node("store-node-g", "192.0.2.41")]
+        existing = self._node(
+            "legacy-node-h", "192.0.2.42",
+            config_text="client\nremote 192.0.2.42 1194 udp\n",
+        )
+        manager.write_json(manager.NODES_FILE, [existing])
+
+        self._run_maintain(candidates)
+
+        merged = {n["id"]: n for n in manager.read_nodes()}
+        self.assertIn("legacy-node-h", merged)
+        self.assertNotIn("config_text", merged["legacy-node-h"])
+        materialized = Path(merged["legacy-node-h"]["config_file"])
+        self.assertEqual(
+            "client\nremote 192.0.2.42 1194 udp\n",
+            materialized.read_text(encoding="utf-8"),
+        )
+
+    # -- lifecycle ------------------------------------------------------
+
+    def test_maintain_merge_grace_expiry_archives_and_keeps_config(self) -> None:
+        now = manager.time.time()
+        old = self._node(
+            "store-node-old", "192.0.2.51",
+            retention_status="observing",
+            last_seen_at=now - manager.RETAINED_OBSERVING_GRACE_SECONDS - 10,
+            source_present=0,
+        )
+        manager.write_json(manager.NODES_FILE, [old])
+        manager.write_config_store(
+            {"store-node-old": "client\nremote 192.0.2.51 1194 udp\n"}
+        )
+        candidates = [self._node("store-node-new", "192.0.2.52")]
+        manager.store_node_config(
+            "store-node-new", "client\nremote 192.0.2.52 1194 udp\n"
+        )
+
+        self._run_maintain(candidates)
+
+        # Archiving is NOT config deletion: the archived node keeps
+        # its config in the store (restorable / liveness-probed by
+        # id); only the archive record itself drops the embedded copy.
+        self.assertEqual(
+            "client\nremote 192.0.2.51 1194 udp\n",
+            manager.get_node_config("store-node-old"),
+        )
+        archive = manager.read_json(manager.RETAINED_ARCHIVE_FILE, [])
+        self.assertEqual(["store-node-old"], [r["id"] for r in archive])
+        self.assertNotIn("config_text", archive[0])
+        remaining = {n["id"] for n in manager.read_nodes()}
+        self.assertNotIn("store-node-old", remaining)
+
+    def test_disable_pool_purge_drops_config_but_favorite_keeps_it(self) -> None:
+        fav = self._node(
+            "store-node-fav", "192.0.2.61", retention_status="observing",
+        )
+        plain = self._node(
+            "store-node-plain", "192.0.2.62", retention_status="observing",
+        )
+        manager.write_json(manager.NODES_FILE, [fav, plain])
+        manager.write_config_store({
+            "store-node-fav": "client\nremote 192.0.2.61 1194 udp\n",
+            "store-node-plain": "client\nremote 192.0.2.62 1194 udp\n",
+        })
+        manager.write_json(
+            self.root / "ui_auth.json",
+            {"favorite_node_ids": ["store-node-fav"], "retained_pool_enabled": True},
+        )
+
+        result = manager.disable_retained_pool()
+
+        self.assertEqual({"archived": 1, "kept_favorites": 1}, result)
+        # The purged node was archived, so its config is retained in
+        # the store under its id (it leaves only when the archive
+        # record itself is evicted); the favorite never left the
+        # table, so its config trivially survives too.
+        self.assertEqual(
+            "client\nremote 192.0.2.62 1194 udp\n",
+            manager.get_node_config("store-node-plain"),
+        )
+        archive = manager.read_json(manager.RETAINED_ARCHIVE_FILE, [])
+        self.assertEqual(["store-node-plain"], [r["id"] for r in archive])
+        self.assertNotIn("config_text", archive[0])
+        self.assertEqual(
+            "client\nremote 192.0.2.61 1194 udp\n",
+            manager.get_node_config("store-node-fav"),
+        )
+        remaining = {n["id"]: n for n in manager.read_nodes()}
+        self.assertEqual("normal", remaining["store-node-fav"]["retention_status"])
+
+    def test_sweep_archives_dead_node_and_config_follows_archive(self) -> None:
+        now = manager.time.time()
+        dead = self._node(
+            "store-node-dead", "192.0.2.71",
+            retention_status="observing",
+            consecutive_failures=9,
+            last_seen_at=now - 100 * 3600,
+            fetched_at=now - 100 * 3600,
+            source_present=0,
+        )
+        alive = self._node(
+            "store-node-alive", "192.0.2.72", retention_status="observing",
+        )
+        manager.write_json(manager.NODES_FILE, [dead, alive])
+        manager.write_config_store({
+            "store-node-dead": "client\nremote 192.0.2.71 1194 udp\n",
+            "store-node-alive": "client\nremote 192.0.2.72 1194 udp\n",
+        })
+
+        archived = manager.sweep_retained_nodes(now=now)
+
+        self.assertEqual(1, archived)
+        self.assertEqual(
+            ["store-node-alive"], [n["id"] for n in manager.read_nodes()]
+        )
+        # The dead node is archived, not erased: its config follows
+        # the archive record...
+        self.assertEqual(
+            "client\nremote 192.0.2.71 1194 udp\n",
+            manager.get_node_config("store-node-dead"),
+        )
+        # ...and is pruned only once the record is pushed out of the
+        # archive by the 1000-record cap.
+        fillers = [
+            ({"id": f"filler-{index}"}, "filler") for index in range(1000)
+        ]
+        manager.archive_retained_nodes(fillers)
+        self.assertEqual("", manager.get_node_config("store-node-dead"))
+        self.assertEqual(
+            "client\nremote 192.0.2.72 1194 udp\n",
+            manager.get_node_config("store-node-alive"),
+        )
+
+    def test_archive_cap_eviction_prunes_config(self) -> None:
+        initial = [
+            {"id": f"existing-{index}", "archived_at": 1, "reason": "existing"}
+            for index in range(999)
+        ]
+        manager.write_json(manager.RETAINED_ARCHIVE_FILE, initial)
+        store = {f"existing-{index}": f"cfg-{index}" for index in range(999)}
+        store["orphan-1"] = "orphan-config"
+        manager.write_config_store(store)
+        entries = [
+            (
+                self._node(
+                    f"new-{index}", f"192.0.2.{80 + index}",
+                    config_text=f"new-config-{index}",
+                ),
+                f"reason-{index}",
+            )
+            for index in range(3)
+        ]
+
+        archived = manager.archive_retained_nodes(entries)
+
+        self.assertEqual(3, archived)
+        records = manager.read_json(manager.RETAINED_ARCHIVE_FILE, [])
+        self.assertEqual(1000, len(records))
+        self.assertEqual("existing-2", records[0]["id"])
+        for record in records:
+            self.assertNotIn("config_text", record)
+        # Records pushed out by the cap lose their store entries;
+        # survivors and the new arrivals keep theirs.
+        self.assertEqual("", manager.get_node_config("existing-0"))
+        self.assertEqual("", manager.get_node_config("existing-1"))
+        self.assertEqual("cfg-2", manager.get_node_config("existing-2"))
+        self.assertEqual("new-config-0", manager.get_node_config("new-0"))
+        # Unrelated orphans are not this function's business.
+        self.assertEqual("orphan-config", manager.get_node_config("orphan-1"))
+        self.assertEqual(1, manager.sync_config_store_lifecycle())
+        self.assertEqual("", manager.get_node_config("orphan-1"))
+
+    def test_table_drop_leaves_orphan_until_lifecycle_sweep(self) -> None:
+        node = self._node("store-node-x", "192.0.2.91")
+        manager.write_json(manager.NODES_FILE, [node])
+        manager.write_config_store(
+            {"store-node-x": "client\nremote 192.0.2.91 1194 udp\n"}
+        )
+        # A wholesale table replacement (import/restore) drops the node
+        # without any lifecycle event; the config survives until the
+        # explicit lifecycle sweep prunes it.
+        manager.write_json(manager.NODES_FILE, [])
+        self.assertEqual(
+            "client\nremote 192.0.2.91 1194 udp\n",
+            manager.get_node_config("store-node-x"),
+        )
+        self.assertEqual(1, manager.sync_config_store_lifecycle())
+        self.assertEqual("", manager.get_node_config("store-node-x"))
+
+
+class Plus126Stage3PanelTests(unittest.TestCase):
+    """1.2.6 stage 3: panel IP display (plan §三) and connection
+    state display fixes (plan §五).
+
+    Covers the probe retest (a single failed probe is retested once
+    and only a double failure counts as one failure event), the
+    backend tri-state display signal (degraded below the switch
+    threshold), the /api/state lightweight endpoint, and source-level
+    panel markers for the IP cell / copy handler / busy-period
+    polling split. All network access is faked.
+    """
+
+    class _StopChecker(Exception):
+        """Sentinel raised by the fake sleep to end the checker loop."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.root = root
+        self.path_patches = [
+            mock.patch.object(manager, "DATA_DIR", root),
+            mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
+            mock.patch.object(manager, "CONFIG_STORE_FILE", root / "node_configs.json"),
+            mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "STATE_FILE", root / "state.json"),
+            mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
+            mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
+            mock.patch.object(manager, "API_CACHE_FILE", root / "api_snapshot.csv"),
+            mock.patch.object(manager, "API_CACHE_META_FILE", root / "api_snapshot.meta.json"),
+            mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
+            mock.patch.object(manager, "RETAINED_ARCHIVE_FILE", root / "retained_archive.json"),
+            mock.patch.object(manager.vpn_utils, "DATA_DIR", root),
+            mock.patch.object(manager.vpn_utils, "IP_CACHE_FILE", root / "ip_cache.json"),
+        ]
+        for patcher in self.path_patches:
+            patcher.start()
+        manager.ensure_dirs()
+        manager._config_store_cache["key"] = None
+        manager._config_store_cache["data"] = {}
+        manager.active_openvpn_process = None
+        manager.pending_openvpn_process = None
+        manager.active_openvpn_node_id = ""
+        manager.active_connection_cancel_event = None
+        manager.is_connecting = False
+        manager.consecutive_proxy_failures = 0
+        manager.last_proxy_failure_node_id = ""
+        manager.background_refill_thread = None
+        manager.background_refill_cancel_event.clear()
+        manager.active_sessions.clear()
+        manager.full_sweep_running = False
+        manager.full_sweep_cancel_requested = False
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+
+    def tearDown(self) -> None:
+        if manager.connection_attempt_lock.locked():
+            manager.connection_attempt_lock.release()
+        manager.background_refill_cancel_event.set()
+        manager.background_refill_thread = None
+        manager.active_openvpn_process = None
+        manager.active_openvpn_node_id = ""
+        manager.is_connecting = False
+        manager.consecutive_proxy_failures = 0
+        manager.last_proxy_failure_node_id = ""
+        manager._config_store_cache["key"] = None
+        manager._config_store_cache["data"] = {}
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+        manager.active_sessions.clear()
+        for patcher in reversed(self.path_patches):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    # -- helpers ------------------------------------------------------
+
+    def _activate_node(self, node_id: str = "probe-node") -> FakeProcess:
+        node = {
+            "id": node_id,
+            "country": "日本",
+            "country_short": "JP",
+            "ip": "192.0.2.50",
+            "remote_host": "192.0.2.50",
+            "remote_port": 1194,
+            "ping": 10,
+            "score": 100,
+            "config_file": str(manager.CONFIG_DIR / f"{node_id}.ovpn"),
+            "probe_status": "available",
+            "probed_at": 0,
+            "retention_status": "normal",
+            "consecutive_failures": 0,
+            "active": False,
+        }
+        manager.write_json(manager.NODES_FILE, [node])
+        process = FakeProcess()
+        manager.active_openvpn_process = process
+        manager.active_openvpn_node_id = node_id
+        return process
+
+    def _run_checker_rounds(self, results: list, rounds: int):
+        """Drive background_proxy_checker through exactly `rounds`
+        iterations against a scripted check_proxy_health sequence.
+        The fake sleep lets the initial sleep plus one end-of-round
+        sleep per finished round pass and raises the sentinel on the
+        sleep that ends the last requested round."""
+        calls = {"health": 0, "sleep": 0}
+
+        def fake_health():
+            calls["health"] += 1
+            return results.pop(0)
+
+        def fake_sleep(_seconds):
+            calls["sleep"] += 1
+            if calls["sleep"] > rounds:
+                raise Plus126Stage3PanelTests._StopChecker()
+
+        with (
+            mock.patch.object(manager, "check_proxy_health", side_effect=fake_health),
+            mock.patch.object(manager.time, "sleep", side_effect=fake_sleep),
+            mock.patch.object(manager, "log_to_json"),
+            mock.patch.object(manager, "auto_switch_node") as switch_mock,
+            mock.patch.object(manager, "mark_blacklisted"),
+        ):
+            with self.assertRaises(Plus126Stage3PanelTests._StopChecker):
+                manager.background_proxy_checker()
+        return calls, switch_mock
+
+    def _serve(self) -> str:
+        manager.active_sessions["stage3-token"] = manager.time.time() + 60
+        server = manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, timeout=5)
+        return f"http://127.0.0.1:{server.server_address[1]}/EJsW2EeBo9lY"
+
+    def _get_json(self, base_url: str, path: str) -> dict:
+        req = urllib.request.Request(
+            base_url + path, headers={"Cookie": "session=stage3-token"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            self.assertEqual(200, response.status)
+            return json.loads(response.read().decode("utf-8"))
+
+    # -- plan §五.2: probe retest -------------------------------------
+
+    def test_probe_single_failure_retest_success_keeps_proxy_ok_and_counter(self) -> None:
+        self._activate_node()
+        manager.set_state(proxy_ok=True, proxy_ip="203.0.113.9")
+        results = [
+            {"ok": False, "error": "transient blip"},
+            {"ok": True, "ip": "203.0.113.9", "latency_ms": 12},
+        ]
+        calls, switch_mock = self._run_checker_rounds(results, rounds=1)
+
+        # One failure event consumed exactly two probes (probe+retest).
+        self.assertEqual(2, calls["health"])
+        state = manager.get_state()
+        self.assertTrue(state["proxy_ok"])
+        self.assertEqual("203.0.113.9", state["proxy_ip"])
+        self.assertEqual(0, manager.consecutive_proxy_failures)
+        switch_mock.assert_not_called()
+
+    def test_probe_retest_failure_counts_exactly_one_failure_event(self) -> None:
+        self._activate_node()
+        results = [
+            {"ok": False, "error": "down-1"},
+            {"ok": False, "error": "down-2"},
+            {"ok": False, "error": "down-3"},
+            {"ok": False, "error": "down-4"},
+        ]
+        calls, switch_mock = self._run_checker_rounds(results, rounds=2)
+
+        # Two failure events, four probes: the retest is not a second
+        # count, so after two rounds the counter is 2 -- not 4.
+        self.assertEqual(4, calls["health"])
+        self.assertEqual(2, manager.consecutive_proxy_failures)
+        state = manager.get_state()
+        self.assertFalse(state["proxy_ok"])
+        self.assertIn("连续失败 2/3", state["proxy_error"])
+        switch_mock.assert_not_called()
+
+    def test_probe_threshold_counts_failure_events_not_probes(self) -> None:
+        self._activate_node()
+        results = [{"ok": False, "error": f"down-{i}"} for i in range(6)]
+        calls, switch_mock = self._run_checker_rounds(results, rounds=3)
+
+        # Recovery fires on the third failure *event* (sixth probe).
+        # Had every probe counted, the threshold would have been hit
+        # in round 2 and the counter would not be back at 0 here.
+        self.assertEqual(6, calls["health"])
+        switch_mock.assert_called_once_with()
+        self.assertEqual(0, manager.consecutive_proxy_failures)
+
+    # -- plan §五.1: tri-state display signal ---------------------------
+
+    def test_display_status_degraded_window(self) -> None:
+        process = self._activate_node()
+        manager.set_state(tunnel_ready=True, proxy_ready=True, proxy_ok=True)
+
+        self.assertEqual("connected", manager.connection_display_status())
+
+        manager.set_state(proxy_ok=False)
+        for count in (1, manager.PROXY_FAILURE_THRESHOLD - 1):
+            manager.consecutive_proxy_failures = count
+            self.assertEqual("degraded", manager.connection_display_status())
+            state = manager.get_state()
+            self.assertEqual("degraded", state["connection_display_status"])
+            self.assertEqual(count, state["proxy_consecutive_failures"])
+            self.assertEqual(
+                manager.PROXY_FAILURE_THRESHOLD, state["proxy_failure_threshold"]
+            )
+
+        # Threshold reached: no longer the degraded window.
+        manager.consecutive_proxy_failures = manager.PROXY_FAILURE_THRESHOLD
+        self.assertEqual("disconnected", manager.connection_display_status())
+        # No recorded failure event yet: not degraded either.
+        manager.consecutive_proxy_failures = 0
+        self.assertEqual("disconnected", manager.connection_display_status())
+        # Process dead: flips regardless of the count.
+        manager.consecutive_proxy_failures = 1
+        process.running = False
+        self.assertEqual("disconnected", manager.connection_display_status())
+        # Still connecting: the busy card owns the display.
+        process.running = True
+        manager.is_connecting = True
+        self.assertEqual("disconnected", manager.connection_display_status())
+        manager.is_connecting = False
+
+    def test_nodes_and_state_endpoints_expose_tristate_signals(self) -> None:
+        self._activate_node("stage3-node")
+        manager.set_state(tunnel_ready=True, proxy_ready=True, proxy_ok=True)
+        base_url = self._serve()
+
+        payload = self._get_json(base_url, "/api/nodes")
+        rows = {n["id"]: n for n in payload["nodes"]}
+        self.assertTrue(rows["stage3-node"]["active"])
+        self.assertEqual("connected", payload["state"]["connection_display_status"])
+
+        state_payload = self._get_json(base_url, "/api/state")
+        self.assertEqual({"state"}, set(state_payload.keys()))
+        light_state = state_payload["state"]
+        self.assertEqual("connected", light_state["connection_display_status"])
+        self.assertEqual(0, light_state["proxy_consecutive_failures"])
+        self.assertEqual(
+            manager.PROXY_FAILURE_THRESHOLD, light_state["proxy_failure_threshold"]
+        )
+
+        # Degraded window: the legacy /api/nodes active marking keeps
+        # its exact old meaning (ready-only), while the new display
+        # signal reports the tri-state.
+        manager.set_state(proxy_ok=False)
+        manager.consecutive_proxy_failures = 1
+        payload = self._get_json(base_url, "/api/nodes")
+        rows = {n["id"]: n for n in payload["nodes"]}
+        self.assertFalse(rows["stage3-node"]["active"])
+        self.assertEqual("degraded", payload["state"]["connection_display_status"])
+        self.assertEqual(1, payload["state"]["proxy_consecutive_failures"])
+
+        state_payload = self._get_json(base_url, "/api/state")
+        self.assertEqual(
+            "degraded", state_payload["state"]["connection_display_status"]
+        )
+
+    # -- plan §三 / §五.3: panel markers --------------------------------
+
+    def test_panel_ip_display_markers(self) -> None:
+        html = manager.INDEX_HTML
+
+        # The old truncating cell and fixed-width header are gone.
+        self.assertNotIn(
+            '<td class="mono" style="white-space: nowrap; max-width: 220px;', html
+        )
+        self.assertNotIn('<th style="width: 220px;">IP 地址', html)
+        self.assertIn("<th>IP 地址 : 端口</th>", html)
+
+        # Node row: IP complete in .ip-main, port de-emphasised in
+        # .ip-port, whole cell click-to-copy.
+        self.assertIn('class="mono ip-cell"', html)
+        self.assertIn(
+            '<span class="ip-main">${esc(n.ip||n.remote_host)}</span>', html
+        )
+        self.assertIn('<span class="ip-port">:${n.remote_port}</span>', html)
+        self.assertIn(
+            "copyIpText('${esc(n.ip||n.remote_host)}', this, event)", html
+        )
+
+        # Active card: same treatment for its IP value.
+        self.assertIn("active-ip-value", html)
+        self.assertIn(
+            "copyIpText('${esc(cardNode.ip || cardNode.remote_host)}', this, event)",
+            html,
+        )
+        self.assertIn(
+            '<span class="ip-port" style="font-size: 14px;">:${cardNode.remote_port}</span>',
+            html,
+        )
+
+        # The copy handler itself: Clipboard API first, execCommand
+        # fallback, 已复制 tip, and no alert() anywhere inside it.
+        start = html.index("function copyIpText(ip, el, event)")
+        body = html[start:html.index("function copyLogContent()", start)]
+        self.assertIn("navigator.clipboard.writeText(ip)", body)
+        self.assertIn('document.execCommand("copy")', body)
+        self.assertIn("ip-copied-tip", body)
+        self.assertIn("已复制", body)
+        self.assertNotIn("alert(", body)
+
+    def test_panel_tristate_and_busy_polling_markers(self) -> None:
+        html = manager.INDEX_HTML
+
+        # Tri-state card wiring (plan §五.1).
+        self.assertIn('state.connection_display_status === "degraded"', html)
+        self.assertIn("const cardNode = activeNode || degradedNode;", html)
+        self.assertIn('class="badge degraded"', html)
+        self.assertIn("探测异常", html)
+        self.assertIn("state.proxy_consecutive_failures", html)
+
+        # Busy-period polling split (plan §五.3): lightweight state
+        # endpoint, state-first helper, and the 10s tick no longer
+        # pausing wholesale while busy.
+        self.assertIn("async function fetchStateSnapshot()", html)
+        self.assertIn('"./api/state"', html)
+        self.assertIn("function applyStateSnapshot(nextState)", html)
+        self.assertIn("async function refreshStateFirst()", html)
+
+        tick_start = html.index("// 每 10 秒在前台自动更新节点与状态")
+        tick = html[tick_start:html.index("}, 10000);", tick_start)]
+        self.assertIn(
+            "const busy = Boolean(state.is_connecting || state.maintenance_running);",
+            tick,
+        )
+        self.assertIn("await refreshStateFirst();", tick)
+        self.assertNotIn(
+            "!state.is_connecting && !state.maintenance_running &&", tick
+        )
+
+        # The refresh (更新中) polling judges completion on the fresh
+        # state fetched by the same state-first split.
+        refresh_start = html.index("function startRefreshPolling()")
+        refresh = html[
+            refresh_start:html.index("function startConnectionPolling()", refresh_start)
+        ]
+        self.assertIn("await refreshStateFirst();", refresh)
+        self.assertIn("if (!state.maintenance_running) {", refresh)
