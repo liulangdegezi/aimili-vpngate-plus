@@ -843,8 +843,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.2.4", manager.APP_VERSION)
-        self.assertEqual("V1.2.4 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.2.5", manager.APP_VERSION)
+        self.assertEqual("V1.2.5 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -928,7 +928,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.2.4 正式版", result["current_version_label"])
+        self.assertEqual("V1.2.5 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -947,7 +947,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.2.4", result["current_version"])
+        self.assertEqual("1.2.5", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1303,8 +1303,13 @@ class CodeUpdateTests(unittest.TestCase):
         self.assertIn("一键更新", html)
         self.assertIn("/api/update_code", html)
         self.assertIn("/api/update_status", html)
-        self.assertIn('title="暂未启用"', html)
+        # 1.2.5 stage 4 supersedes the 1.2.0 deferred-scoring state:
+        # the 查评分 button is live now, so the "暂未启用" tooltip is
+        # gone and the row wires to the FFraud check endpoint instead.
+        self.assertNotIn('title="暂未启用"', html)
         self.assertNotIn("评分功能为第三阶段，暂未启用", html)
+        self.assertIn("/api/check_score", html)
+        self.assertIn("checkNodeScore", html)
         self.assertIn("最长约 90 秒", html)
         self.assertIn("出口 IP 可能变化", html)
         self.assertIn("请用终端 ml update 重试", html)
@@ -1315,12 +1320,16 @@ class CodeUpdateTests(unittest.TestCase):
         source = (manager.ROOT_DIR / "vpngate_manager.py").read_text(encoding="utf-8")
         self.assertIn("/api/update_code", source)
         self.assertIn("/api/update_status", source)
-        self.assertNotIn("check_score", source)
         self.assertNotIn("iplark_qualified", source)
         self.assertNotIn("fetch_iplark_score", source)
         start = source.index("def run_code_update_worker")
         end = source.index("def spawn_code_updater")
         self.assertNotIn("iplark", source[start:end])
+        # 1.2.5 stage 4 added a manual /api/check_score endpoint, but
+        # the update worker itself must never touch the scoring path.
+        self.assertNotIn("check_score", source[start:end])
+        self.assertNotIn("risk_display", source[start:end])
+        self.assertNotIn("ffraud", source[start:end].lower())
 
     def test_code_update_status_and_busy_reasons(self) -> None:
         status = manager.read_code_update_status()
@@ -1462,20 +1471,20 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_2_4(self) -> None:
-        self.assertEqual("1.2.4", manager.APP_VERSION)
-        self.assertEqual("V1.2.4 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.2.4 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_2_5(self) -> None:
+        self.assertEqual("1.2.5", manager.APP_VERSION)
+        self.assertEqual("V1.2.5 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.2.5 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.2.4"', install_text)
+        self.assertIn('"1.2.5"', install_text)
         self.assertNotIn('"1.2.2"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.2.4", compose_text)
+        self.assertIn(":1.2.5", compose_text)
         self.assertNotIn("1.2.2", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.2.4", version_text)
+        self.assertEqual("1.2.5", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn("## V1.2.4（2026-11-05，已发布正式版 v1.2.4）", changelog)
+        self.assertIn("## V1.2.5（2026-11-05，已发布正式版 v1.2.5）", changelog)
         self.assertIn("## V1.2.2", changelog)
         self.assertIn("## V1.2.1（2026-10-26，已发布正式版 v1.2.1）", changelog)
         self.assertIn("## V1.2.0（2026-10-26，已发布正式版 v1.2.0）", changelog)
@@ -2688,3 +2697,1025 @@ class Plus124ScopedSweepAndPersistenceTests(unittest.TestCase):
         self.assertIsInstance(result, bool)
         # Second call (cached handle / unavailable latch) also safe.
         self.assertIsInstance(manager.malloc_trim(), bool)
+
+
+class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
+    """1.2.5 stages 1+2: retained-pool mechanism switch (persist-first
+    purge, favorite exemption, vanish gate, liveness-sweep skip) and
+    one-click update verification (process baseline/freshness,
+    main-vs-Release consistency, install-output tracing, verified
+    installer restart). Worker tests inject fake runners/checks, so
+    no real git, install, systemctl, or network is touched."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.root = root
+        self.path_patches = [
+            mock.patch.object(manager, "DATA_DIR", root),
+            mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
+            mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "STATE_FILE", root / "state.json"),
+            mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
+            mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
+            mock.patch.object(manager, "API_CACHE_FILE", root / "api_snapshot.csv"),
+            mock.patch.object(manager, "API_CACHE_META_FILE", root / "api_snapshot.meta.json"),
+            mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
+            mock.patch.object(manager, "RETAINED_ARCHIVE_FILE", root / "retained_archive.json"),
+            mock.patch.object(manager, "CODE_UPDATE_STATUS_FILE", root / "code_update_status.json"),
+            mock.patch.object(manager, "CODE_UPDATE_LOG_FILE", root / "code_update.log"),
+            mock.patch.object(manager, "CODE_UPDATE_LAST_ATTEMPT_FILE", root / "code_update_last_attempt.json"),
+        ]
+        for patcher in self.path_patches:
+            patcher.start()
+        manager.ensure_dirs()
+        self._saved_restart_first = manager._first_maintain_after_startup
+        manager.active_openvpn_process = None
+        manager.active_openvpn_node_id = ""
+        manager.is_connecting = False
+        manager.full_sweep_running = False
+        manager.full_sweep_cancel_requested = False
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+        manager.active_sessions.clear()
+
+    def tearDown(self) -> None:
+        manager._first_maintain_after_startup = self._saved_restart_first
+        manager.active_openvpn_node_id = ""
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+        manager.active_sessions.clear()
+        for patcher in reversed(self.path_patches):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    # -- helpers -----------------------------------------------------
+
+    def _pool_node(self, node_id: str, status: str = "normal", active: bool = False) -> dict:
+        return {
+            "id": node_id,
+            "ip": "192.0.2.1",
+            "remote_host": "192.0.2.1",
+            "remote_port": 1194,
+            "country": "Japan",
+            "country_short": "JP",
+            "ping": 10,
+            "latency_ms": 10,
+            "config_text": "client\nremote 192.0.2.1 1194 udp\n",
+            "config_file": str(manager.CONFIG_DIR / f"{node_id}.ovpn"),
+            "probe_status": "not_checked",
+            "probed_at": 0,
+            "consecutive_failures": 0,
+            "retention_status": status,
+            "source_present": 0 if status == "observing" else 1,
+            "active": active,
+            "last_seen_at": manager.time.time(),
+        }
+
+    def _set_favorites(self, ids: list) -> None:
+        cfg = manager.load_ui_config()
+        cfg["favorite_node_ids"] = list(ids)
+        manager.write_json(manager.DATA_DIR / "ui_auth.json", cfg)
+
+    def _run_maintain(self, candidates):
+        manager._first_maintain_after_startup = True
+        retained_sweep = mock.Mock(return_value=0)
+        sweep_mock = mock.Mock(
+            return_value={"skipped": False, "tested": 0, "available": 0, "unavailable": 0}
+        )
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "active_openvpn_running", return_value=True),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+            mock.patch.object(manager, "sweep_retained_nodes", retained_sweep),
+            mock.patch.object(manager, "run_full_sweep", sweep_mock),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            message = manager.maintain_valid_nodes(force=False, trigger="auto")
+        return message, retained_sweep
+
+    def _fake_result(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
+        return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _make_update_install_dir(self, version: str = "1.2.4") -> Path:
+        install_dir = self.root / "install"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        (install_dir / ".git").mkdir(exist_ok=True)
+        (install_dir / "VERSION").write_text(version + "\n", encoding="utf-8")
+        return install_dir
+
+    def _update_fake(self, pid_mode: str, worktree_version: str | None):
+        """Fake updater runner. pid_mode: "change" (install swaps the
+        MainPID), "same" (install leaves the old process running --
+        the 1.2.4 false success), "no-systemd" (systemctl unusable)."""
+        state = {"pid": 111, "ts": "Mon 2026-11-03 10:00:00 UTC", "installs": 0}
+        calls: list = []
+
+        def fake(cmd, cwd, timeout, env=None):
+            calls.append(list(cmd))
+            if cmd[:2] == ["systemctl", "show"]:
+                if pid_mode == "no-systemd":
+                    return self._fake_result(1, "", "System has not been booted with systemd")
+                return self._fake_result(
+                    0, f"MainPID={state['pid']}\nActiveEnterTimestamp={state['ts']}\n"
+                )
+            if cmd[:2] == ["git", "rev-parse"] and cmd[2] == "HEAD":
+                return self._fake_result(0, "aaa111\n")
+            if cmd[:2] == ["git", "rev-parse"]:
+                return self._fake_result(0, "bbb222\n")
+            if cmd[:3] == ["git", "worktree", "add"]:
+                tmp_path = Path(cmd[4])
+                tmp_path.mkdir(parents=True, exist_ok=True)
+                (tmp_path / "vpngate_manager.py").write_text("x = 1\n", encoding="utf-8")
+                (tmp_path / "install.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+                if worktree_version:
+                    (tmp_path / "VERSION").write_text(
+                        worktree_version + "\n", encoding="utf-8"
+                    )
+                return self._fake_result(0)
+            if cmd == ["bash", "install.sh"]:
+                state["installs"] += 1
+                if state["installs"] == 1 and pid_mode == "change":
+                    state["pid"] = 222
+                    state["ts"] = "Mon 2026-11-03 10:05:00 UTC"
+                return self._fake_result(0, "install output line\n", "")
+            return self._fake_result(0)
+
+        return fake, calls, state
+
+    # -- Stage 1: retained-pool mechanism switch ---------------------
+
+    def test_pool_switch_defaults_on_and_persists(self) -> None:
+        # Fresh config: default ON (no behavior change for old users).
+        self.assertTrue(manager.load_ui_config()["retained_pool_enabled"])
+        self.assertTrue(manager.get_state()["retained_pool_enabled"])
+        # Legacy ui_auth.json without the key: loads as ON and the key
+        # is backfilled into the file.
+        auth_path = manager.DATA_DIR / "ui_auth.json"
+        manager.write_json(
+            auth_path,
+            {"username": "legacy-user", "password": "legacy-pass", "secret_path": "EJsW2EeBo9lY"},
+        )
+        self.assertTrue(manager.load_ui_config()["retained_pool_enabled"])
+        self.assertIn(
+            "retained_pool_enabled",
+            json.loads(auth_path.read_text(encoding="utf-8")),
+        )
+        # Persistence round-trip through the persist helper + state.
+        self.assertFalse(manager.persist_retained_pool_enabled(False))
+        self.assertFalse(manager.load_ui_config()["retained_pool_enabled"])
+        self.assertFalse(manager.get_state()["retained_pool_enabled"])
+        self.assertTrue(manager.persist_retained_pool_enabled(True))
+        self.assertTrue(manager.load_ui_config()["retained_pool_enabled"])
+        with self.assertRaises(ValueError):
+            manager.persist_retained_pool_enabled("yes")
+
+    def test_pool_disable_purges_observing_keeps_favorites_and_active(self) -> None:
+        observing_ids = [f"obs-{i}" for i in range(30)]
+        favorite_ids = [f"fav-obs-{i}" for i in range(3)]
+        nodes = [self._pool_node(nid, status="observing") for nid in observing_ids]
+        nodes += [self._pool_node(nid, status="observing") for nid in favorite_ids]
+        nodes.append(self._pool_node("active-1", status="normal", active=True))
+        nodes.append(self._pool_node("normal-1"))
+        nodes.append(self._pool_node("normal-2"))
+        manager.write_json(manager.NODES_FILE, nodes)
+        self._set_favorites(favorite_ids)
+
+        outcome = manager.disable_retained_pool()
+
+        self.assertEqual({"archived": 30, "kept_favorites": 3}, outcome)
+        # The flag is persisted OFF as part of the same action.
+        self.assertFalse(manager.load_ui_config()["retained_pool_enabled"])
+        stored = {n["id"]: n for n in manager.read_nodes()}
+        for nid in observing_ids:
+            self.assertNotIn(nid, stored)
+        for nid in favorite_ids:
+            self.assertIn(nid, stored)
+            self.assertEqual("normal", stored[nid]["retention_status"])
+        self.assertIn("active-1", stored)
+        self.assertIn("normal-1", stored)
+        self.assertIn("normal-2", stored)
+        archive = manager.read_json(manager.RETAINED_ARCHIVE_FILE, [])
+        self.assertEqual(30, len(archive))
+        self.assertEqual(set(observing_ids), {r["id"] for r in archive})
+        self.assertTrue(all(r["reason"] == "retained-pool-disabled" for r in archive))
+        self.assertEqual(30, manager.retained_archive_count())
+
+    def test_pool_off_vanish_archives_immediately_and_skips_liveness_sweep(self) -> None:
+        table = [
+            self._pool_node("keep-1"),
+            self._pool_node("gone-1"),
+            self._pool_node("fav-1", status="observing"),
+        ]
+        manager.write_json(manager.NODES_FILE, table)
+        self._set_favorites(["fav-1"])
+        manager.persist_retained_pool_enabled(False)
+
+        _, retained_sweep = self._run_maintain([self._pool_node("keep-1")])
+
+        stored = {n["id"]: n for n in manager.read_nodes()}
+        self.assertIn("keep-1", stored)
+        self.assertNotIn("gone-1", stored)
+        # Favorite exemption is identical with the pool OFF.
+        self.assertIn("fav-1", stored)
+        self.assertEqual("normal", stored["fav-1"]["retention_status"])
+        archive = manager.read_json(manager.RETAINED_ARCHIVE_FILE, [])
+        self.assertEqual(1, len(archive))
+        self.assertEqual("gone-1", archive[0]["id"])
+        self.assertEqual("retained-pool-disabled-vanish", archive[0]["reason"])
+        # The 12h liveness sweep does not run at all while OFF.
+        retained_sweep.assert_not_called()
+
+    def test_pool_on_vanish_still_observes_and_sweeps(self) -> None:
+        table = [
+            self._pool_node("keep-1"),
+            self._pool_node("gone-1"),
+            self._pool_node("fav-1", status="observing"),
+        ]
+        manager.write_json(manager.NODES_FILE, table)
+        self._set_favorites(["fav-1"])
+        self.assertTrue(manager.load_ui_config()["retained_pool_enabled"])
+
+        _, retained_sweep = self._run_maintain([self._pool_node("keep-1")])
+
+        stored = {n["id"]: n for n in manager.read_nodes()}
+        self.assertEqual("observing", stored["gone-1"]["retention_status"])
+        self.assertEqual([], manager.read_json(manager.RETAINED_ARCHIVE_FILE, []))
+        retained_sweep.assert_called()
+
+    def test_pool_reopen_does_not_restore_archived(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._pool_node("keep-1"), self._pool_node("gone-2")],
+        )
+        manager.persist_retained_pool_enabled(False)
+        self._run_maintain([self._pool_node("keep-1")])
+        self.assertEqual(
+            ["gone-2"],
+            [r["id"] for r in manager.read_json(manager.RETAINED_ARCHIVE_FILE, [])],
+        )
+        # Reopen: flag only; the archived node stays archived, and a
+        # node disappearing afterwards observes under the normal rules.
+        manager.persist_retained_pool_enabled(True)
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._pool_node("keep-1"), self._pool_node("gone-3")],
+        )
+        self._run_maintain([self._pool_node("keep-1")])
+        stored = {n["id"]: n for n in manager.read_nodes()}
+        self.assertNotIn("gone-2", stored)
+        self.assertEqual("observing", stored["gone-3"]["retention_status"])
+        self.assertEqual(
+            ["gone-2"],
+            [r["id"] for r in manager.read_json(manager.RETAINED_ARCHIVE_FILE, [])],
+        )
+
+    def test_pool_switch_http_endpoint(self) -> None:
+        favorite_ids = ["fav-obs-0"]
+        nodes = [
+            self._pool_node("obs-a", status="observing"),
+            self._pool_node("obs-b", status="observing"),
+            self._pool_node("fav-obs-0", status="observing"),
+            self._pool_node("normal-1"),
+        ]
+        manager.write_json(manager.NODES_FILE, nodes)
+        self._set_favorites(favorite_ids)
+
+        manager.active_sessions["plus125-test-token"] = manager.time.time() + 60
+        server = manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}/EJsW2EeBo9lY"
+
+        def request(path: str, payload: dict | None = None) -> tuple[int, dict]:
+            data = None
+            headers = {"Cookie": "session=plus125-test-token"}
+            if payload is not None:
+                data = json.dumps(payload).encode("utf-8")
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(
+                base_url + path,
+                data=data,
+                headers=headers,
+                method="POST" if payload is not None else "GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+
+        try:
+            status, off_payload = request(
+                "/api/update_retained_pool", {"retained_pool_enabled": False}
+            )
+            self.assertEqual(200, status)
+            self.assertTrue(off_payload["ok"])
+            self.assertFalse(off_payload["retained_pool_enabled"])
+            self.assertEqual(2, off_payload["archived"])
+            self.assertEqual(1, off_payload["kept_favorites"])
+            self.assertIn("已归档移除 2 个", off_payload["message"])
+
+            status, nodes_payload = request("/api/nodes")
+            self.assertEqual(200, status)
+            self.assertFalse(nodes_payload["retained_pool_enabled"])
+            self.assertFalse(nodes_payload["state"]["retained_pool_enabled"])
+
+            status, bad_payload = request(
+                "/api/update_retained_pool", {"retained_pool_enabled": "yes"}
+            )
+            self.assertEqual(400, status)
+            self.assertFalse(bad_payload["ok"])
+
+            status, on_payload = request(
+                "/api/update_retained_pool", {"retained_pool_enabled": True}
+            )
+            self.assertEqual(200, status)
+            self.assertTrue(on_payload["retained_pool_enabled"])
+            self.assertTrue(manager.load_ui_config()["retained_pool_enabled"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_panel_pool_switch_and_update_ui_markers(self) -> None:
+        html = manager.INDEX_HTML
+        self.assertIn('id="retained_pool_enabled"', html)
+        self.assertIn("toggleRetainedPoolEnabled", html)
+        self.assertIn("updateRetainedPoolEnabledUI", html)
+        self.assertIn("保留池已关闭", html)
+        self.assertIn("立即归档并移除当前", html)
+        # Stage 2 UI: side-by-side update actions + Father's wording.
+        self.assertIn('class="update-action-row"', html)
+        self.assertIn(".update-action-row", html)
+        self.assertIn("检测到新版本", html)
+        self.assertIn("请点击一键更新，或者登录后台用 ml 命令更新", html)
+
+    # -- Stage 2: updater verification -------------------------------
+
+    def test_worker_stale_process_fails_and_needs_terminal(self) -> None:
+        install_dir = self._make_update_install_dir("1.2.4")
+        fake, calls, state = self._update_fake("same", "1.2.5")
+        result = manager.run_code_update_worker(
+            install_dir=install_dir,
+            runner=fake,
+            panel_healthy=lambda h, p, t: True,
+            release_check=lambda: {
+                "ok": True, "latest_version": "1.2.5", "no_release": False,
+            },
+        )
+        self.assertFalse(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("failed", status["result"])
+        self.assertEqual("health", status["stage"])
+        self.assertTrue(status["needs_terminal"])
+        self.assertIn("已回滚", status["error"])
+        self.assertIn("服务重启未生效", status["error"])
+        self.assertIn("systemctl restart aimilivpn", status["error"])
+        # Forward install + rollback reinstall both ran.
+        self.assertEqual(2, state["installs"])
+        # The install output was traced even though the update failed.
+        log_text = manager.CODE_UPDATE_LOG_FILE.read_text(encoding="utf-8")
+        self.assertIn("安装脚本输出尾部", log_text)
+        self.assertIn("install output line", log_text)
+
+    def test_worker_fresh_process_succeeds_and_traces_install_output(self) -> None:
+        install_dir = self._make_update_install_dir("1.2.4")
+        fake, calls, state = self._update_fake("change", "1.2.5")
+        result = manager.run_code_update_worker(
+            install_dir=install_dir,
+            runner=fake,
+            panel_healthy=lambda h, p, t: True,
+            release_check=lambda: {
+                "ok": True, "latest_version": "1.2.5", "no_release": False,
+            },
+        )
+        self.assertTrue(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("success", status["result"])
+        self.assertIn("更新完成，当前版本", status["message"])
+        self.assertNotIn("降级核验", status["message"])
+        # Baseline + freshness both consulted systemd via the runner.
+        systemctl_calls = [c for c in calls if c[:2] == ["systemctl", "show"]]
+        self.assertGreaterEqual(len(systemctl_calls), 2)
+        log_text = manager.CODE_UPDATE_LOG_FILE.read_text(encoding="utf-8")
+        self.assertIn("更新前服务基线", log_text)
+        self.assertIn("安装脚本输出尾部", log_text)
+        self.assertIn("install output line", log_text)
+        # ... and an excerpt rides in the status log tail.
+        self.assertIn("安装输出尾部节选：", status["log_tail"])
+        self.assertIn("install output line", status["log_tail"])
+
+    def test_worker_degraded_verification_when_systemd_unreadable(self) -> None:
+        install_dir = self._make_update_install_dir("1.2.4")
+        fake, calls, state = self._update_fake("no-systemd", "1.2.5")
+        result = manager.run_code_update_worker(
+            install_dir=install_dir,
+            runner=fake,
+            panel_healthy=lambda h, p, t: True,
+            release_check=lambda: {
+                "ok": True, "latest_version": "1.2.5", "no_release": False,
+            },
+            panel_http_check=lambda h, p, t: True,
+        )
+        self.assertTrue(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("success", status["result"])
+        self.assertIn("降级核验", status["message"])
+
+    def test_worker_main_release_mismatch_aborts_before_checkout(self) -> None:
+        install_dir = self._make_update_install_dir("1.2.4")
+        fake, calls, state = self._update_fake("change", "9.9.9")
+        result = manager.run_code_update_worker(
+            install_dir=install_dir,
+            runner=fake,
+            panel_healthy=lambda h, p, t: True,
+            release_check=lambda: {
+                "ok": True, "latest_version": "1.2.5", "no_release": False,
+            },
+        )
+        self.assertFalse(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("failed", status["result"])
+        self.assertEqual("check", status["stage"])
+        self.assertIn("不一致", status["error"])
+        self.assertIn("未发布代码", status["error"])
+        # Zero changes to the live tree: no checkout, no install.
+        self.assertNotIn(["git", "checkout", "-B", "main", "origin/main"], calls)
+        self.assertNotIn(["bash", "install.sh"], calls)
+
+    def test_worker_release_check_unreachable_aborts(self) -> None:
+        install_dir = self._make_update_install_dir("1.2.4")
+        fake, calls, state = self._update_fake("change", "1.2.5")
+
+        def broken_release_check():
+            raise RuntimeError("network down (test)")
+
+        result = manager.run_code_update_worker(
+            install_dir=install_dir,
+            runner=fake,
+            panel_healthy=lambda h, p, t: True,
+            release_check=broken_release_check,
+        )
+        self.assertFalse(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("failed", status["result"])
+        self.assertEqual("check", status["stage"])
+        self.assertIn("已中止更新", status["error"])
+        self.assertNotIn(["git", "checkout", "-B", "main", "origin/main"], calls)
+        self.assertNotIn(["bash", "install.sh"], calls)
+
+    def test_installer_restart_is_verified_not_swallowed(self) -> None:
+        install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("OLD_SERVICE_PID", install_text)
+        self.assertIn("INSTALL_START_EPOCH", install_text)
+        self.assertIn("restart_service_verified", install_text)
+        self.assertIn("安装中止", install_text)
+        self.assertNotIn("systemctl restart aimilivpn.service || true", install_text)
+        self.assertNotIn("rc-service aimilivpn restart || true", install_text)
+        result = subprocess.run(
+            ["bash", "-n", str(manager.ROOT_DIR / "install.sh")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+
+class Plus125Stage4RiskScoreTests(unittest.TestCase):
+    """1.2.5 stage 4: manual FFraud risk-score lookup (display-only).
+
+    Scores land in risk_display_* fields; the iplark_score hook stays
+    None and composite ordering must be byte-identical before/after a
+    check. All network access is faked (opener injection), so no test
+    in this class ever leaves the machine.
+    """
+
+    SAMPLES_DIR = (
+        Path(manager.ROOT_DIR).resolve().parent.parent
+        / "hidden_files" / "ffraud_samples"
+    )
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.root = root
+        self.path_patches = [
+            mock.patch.object(manager, "DATA_DIR", root),
+            mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
+            mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "STATE_FILE", root / "state.json"),
+            mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
+            mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
+            mock.patch.object(manager, "API_CACHE_FILE", root / "api_snapshot.csv"),
+            mock.patch.object(manager, "API_CACHE_META_FILE", root / "api_snapshot.meta.json"),
+            mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
+            mock.patch.object(manager, "RETAINED_ARCHIVE_FILE", root / "retained_archive.json"),
+            mock.patch.object(manager, "CODE_UPDATE_STATUS_FILE", root / "code_update_status.json"),
+            mock.patch.object(manager, "CODE_UPDATE_LOG_FILE", root / "code_update.log"),
+            mock.patch.object(manager, "CODE_UPDATE_LAST_ATTEMPT_FILE", root / "code_update_last_attempt.json"),
+        ]
+        for patcher in self.path_patches:
+            patcher.start()
+        manager.ensure_dirs()
+        manager.active_openvpn_process = None
+        manager.active_openvpn_node_id = ""
+        manager.is_connecting = False
+        manager.full_sweep_running = False
+        manager.full_sweep_cancel_requested = False
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+        manager.active_sessions.clear()
+        manager._risk_check_inflight.clear()
+
+    def tearDown(self) -> None:
+        manager._risk_check_inflight.clear()
+        manager.active_openvpn_node_id = ""
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+        manager.active_sessions.clear()
+        for patcher in reversed(self.path_patches):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    # -- helpers -----------------------------------------------------
+
+    def _sample(self, name: str) -> dict:
+        return json.loads(
+            (self.SAMPLES_DIR / f"sample_{name}.json").read_text(encoding="utf-8")
+        )
+
+    def _score_node(self, node_id: str, ip: str, **overrides) -> dict:
+        node = {
+            "id": node_id,
+            "ip": ip,
+            "remote_host": ip,
+            "remote_port": 1194,
+            "country": "Japan",
+            "country_short": "JP",
+            "ping": 10,
+            "latency_ms": 10,
+            "score": 100,
+            "config_text": "client\nremote 192.0.2.1 1194 udp\n",
+            "config_file": str(manager.CONFIG_DIR / f"{node_id}.ovpn"),
+            "probe_status": "available",
+            "probed_at": 0,
+            "consecutive_failures": 0,
+            "retention_status": "normal",
+            "source_present": 1,
+            "active": False,
+            "last_seen_at": manager.time.time(),
+            "iplark_score": None,
+            **manager.RISK_DISPLAY_DEFAULTS,
+            "risk_display_flags": [],
+        }
+        node.update(overrides)
+        return node
+
+    class _FakeResponse:
+        def __init__(self, body: bytes, status: int = 200) -> None:
+            self._body = body
+            self.status = status
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _fake_opener(self, responder):
+        """Patch the manager's fetch opener with a recording fake.
+
+        fetch_ffraud_score builds its opener via the manager-level
+        _ffraud_build_opener() seam, so ONLY the FFraud fetch is faked;
+        the shared urllib.request module (used by this class's own HTTP
+        test client) is never touched. responder(url) -> _FakeResponse,
+        or raises. Returns the list of requested URLs so tests can
+        assert on (non-)network activity.
+        """
+        calls: list = []
+
+        class _Opener:
+            def open(self, request, timeout=None):
+                url = getattr(request, "full_url", str(request))
+                calls.append(url)
+                return responder(url)
+
+        patcher = mock.patch.object(
+            manager, "_ffraud_build_opener", return_value=_Opener()
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def _run_maintain(self, candidates):
+        manager._first_maintain_after_startup = True
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "active_openvpn_running", return_value=True),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+            mock.patch.object(manager, "sweep_retained_nodes", return_value=0),
+            mock.patch.object(
+                manager, "run_full_sweep",
+                return_value={"skipped": True, "tested": 0, "available": 0, "unavailable": 0},
+            ),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            return manager.maintain_valid_nodes(force=False, trigger="auto")
+
+    # -- parsing of the archived real samples -------------------------
+
+    def test_parse_clean_sample(self) -> None:
+        parsed = manager.parse_ffraud_response(
+            self._sample("clean_8.8.8.8"), "8.8.8.8"
+        )
+        self.assertEqual(5, parsed["risk_display_score"])
+        self.assertEqual("none", parsed["risk_display_level"])
+        self.assertEqual("Data Center", parsed["risk_display_connection_type"])
+        self.assertEqual(["机房托管"], parsed["risk_display_flags"])
+        self.assertTrue(
+            parsed["risk_display_reason"].startswith("Datacenter/hosting IP")
+        )
+
+    def test_parse_vpn_sample(self) -> None:
+        parsed = manager.parse_ffraud_response(
+            self._sample("vpn_1.1.1.1"), "1.1.1.1"
+        )
+        self.assertEqual(5, parsed["risk_display_score"])
+        self.assertEqual("none", parsed["risk_display_level"])
+        self.assertEqual("Data Center", parsed["risk_display_connection_type"])
+        self.assertEqual(["VPN", "机房托管"], parsed["risk_display_flags"])
+
+    def test_parse_tor_sample(self) -> None:
+        parsed = manager.parse_ffraud_response(
+            self._sample("tor_185.220.101.34"), "185.220.101.34"
+        )
+        self.assertEqual(100, parsed["risk_display_score"])
+        self.assertEqual("critical", parsed["risk_display_level"])
+        self.assertEqual(
+            ["代理", "VPN", "Tor", "机房托管", "滥用记录", "近期滥用"],
+            parsed["risk_display_flags"],
+        )
+
+    # -- response guards ------------------------------------------------
+
+    def test_parse_guards_reject_bad_payloads(self) -> None:
+        base = self._sample("clean_8.8.8.8")
+        cases = {
+            "not a dict": ["not", "a", "dict"],
+            "success missing": {k: v for k, v in base.items() if k != "success"},
+            "success false": {**base, "success": False},
+            "score missing": {k: v for k, v in base.items() if k != "fraud_score"},
+            "score too high": {**base, "fraud_score": 101},
+            "score negative": {**base, "fraud_score": -1},
+            "score is bool": {**base, "fraud_score": True},
+            "score is string": {**base, "fraud_score": "5"},
+            "ip mismatch": {**base, "ip": "1.1.1.1"},
+            "ip missing": {k: v for k, v in base.items() if k != "ip"},
+        }
+        for label, payload in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(manager.RiskScoreFetchError) as ctx:
+                    manager.parse_ffraud_response(payload, "8.8.8.8")
+                self.assertEqual(
+                    manager.RISK_ERROR_BAD_RESPONSE, ctx.exception.category
+                )
+
+    # -- fetch: validation first, then guarded transport ----------------
+
+    def test_fetch_rejects_invalid_targets_without_network(self) -> None:
+        calls = self._fake_opener(
+            lambda url: self._FakeResponse(b"{}")  # must never be reached
+        )
+        for target in (
+            "notanip", "example.com", "", "999.1.1.1",
+            "10.0.0.1", "192.168.1.1", "127.0.0.1", "169.254.1.1",
+            "172.16.0.5", "::1", "fe80::1", "0.0.0.0",
+        ):
+            with self.subTest(target=target):
+                with self.assertRaises(manager.RiskScoreFetchError) as ctx:
+                    manager.fetch_ffraud_score(target)
+                self.assertEqual(
+                    manager.RISK_ERROR_TARGET_INVALID, ctx.exception.category
+                )
+        self.assertEqual([], calls)
+
+    def test_fetch_success_uses_direct_api_url(self) -> None:
+        body = json.dumps(self._sample("clean_8.8.8.8")).encode("utf-8")
+        calls = self._fake_opener(lambda url: self._FakeResponse(body))
+        parsed = manager.fetch_ffraud_score("8.8.8.8")
+        self.assertEqual(5, parsed["risk_display_score"])
+        self.assertEqual(
+            ["https://api.ffraud.com/public/ip/8.8.8.8"], calls
+        )
+
+    def test_fetch_http_error_is_rejected_category(self) -> None:
+        def responder(url):
+            raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+
+        self._fake_opener(responder)
+        with self.assertRaises(manager.RiskScoreFetchError) as ctx:
+            manager.fetch_ffraud_score("8.8.8.8")
+        self.assertEqual(manager.RISK_ERROR_REJECTED, ctx.exception.category)
+
+    def test_fetch_network_error_category(self) -> None:
+        def responder(url):
+            raise urllib.error.URLError("connection refused")
+
+        self._fake_opener(responder)
+        with self.assertRaises(manager.RiskScoreFetchError) as ctx:
+            manager.fetch_ffraud_score("8.8.8.8")
+        self.assertEqual(manager.RISK_ERROR_NETWORK, ctx.exception.category)
+
+    def test_fetch_malformed_json_is_bad_response(self) -> None:
+        self._fake_opener(lambda url: self._FakeResponse(b"<html>nope</html>"))
+        with self.assertRaises(manager.RiskScoreFetchError) as ctx:
+            manager.fetch_ffraud_score("8.8.8.8")
+        self.assertEqual(manager.RISK_ERROR_BAD_RESPONSE, ctx.exception.category)
+
+    # -- endpoint orchestration (function level) -------------------------
+
+    def test_check_success_writes_display_fields_only(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._score_node("score-1", "8.8.8.8"),
+             self._score_node("other-1", "203.0.113.7")],
+        )
+        fake_fields = manager.parse_ffraud_response(
+            self._sample("clean_8.8.8.8"), "8.8.8.8"
+        )
+        with mock.patch.object(
+            manager, "fetch_ffraud_score", return_value=fake_fields
+        ) as fetch_mock:
+            outcome = manager.check_node_risk_score("score-1")
+        self.assertTrue(outcome["ok"])
+        fetch_mock.assert_called_once_with("8.8.8.8")
+        stored = {n["id"]: n for n in manager.read_nodes()}
+        row = stored["score-1"]
+        self.assertEqual(5, row["risk_display_score"])
+        self.assertEqual("none", row["risk_display_level"])
+        self.assertGreater(row["risk_display_checked_at"], 0)
+        self.assertEqual("", row["risk_display_error"])
+        # The hook field is never written and the other node is untouched.
+        self.assertIsNone(row["iplark_score"])
+        self.assertIsNone(stored["other-1"]["risk_display_score"])
+        self.assertEqual(0, stored["other-1"]["risk_display_checked_at"])
+
+    def test_check_failure_keeps_previous_score(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._score_node(
+                "score-1", "8.8.8.8",
+                risk_display_score=42, risk_display_level="medium",
+                risk_display_checked_at=111.0,
+            )],
+        )
+
+        def failing_fetch(ip):
+            raise manager.RiskScoreFetchError(
+                manager.RISK_ERROR_REJECTED, "FFraud HTTP 403"
+            )
+
+        with mock.patch.object(manager, "fetch_ffraud_score", failing_fetch):
+            outcome = manager.check_node_risk_score("score-1")
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(manager.RISK_ERROR_REJECTED, outcome["error"])
+        row = manager.read_nodes()[0]
+        self.assertEqual(42, row["risk_display_score"])
+        self.assertEqual("medium", row["risk_display_level"])
+        self.assertEqual(manager.RISK_ERROR_REJECTED, row["risk_display_error"])
+        self.assertGreater(row["risk_display_checked_at"], 111.0)
+        self.assertIsNone(row["iplark_score"])
+
+    def test_check_unknown_node_raises(self) -> None:
+        manager.write_json(manager.NODES_FILE, [])
+        with self.assertRaises(ValueError):
+            manager.check_node_risk_score("missing")
+
+    def test_inflight_guard_blocks_second_begin(self) -> None:
+        self.assertTrue(manager._risk_check_begin("n1"))
+        self.assertFalse(manager._risk_check_begin("n1"))
+        self.assertTrue(manager._risk_check_begin("n2"))
+        manager._risk_check_end("n1")
+        self.assertTrue(manager._risk_check_begin("n1"))
+        manager._risk_check_end("n1")
+        manager._risk_check_end("n2")
+
+    # -- ordering hard-acceptance: display fields never move selection ---
+
+    def test_risk_display_fields_do_not_change_composite_ordering(self) -> None:
+        pool = [
+            self._score_node("a", "8.8.8.8", latency_ms=50,
+                             probe_status="available"),
+            self._score_node("b", "1.1.1.1", latency_ms=120,
+                             probe_status="available", consecutive_failures=1),
+            self._score_node("c", "185.220.101.34", latency_ms=200,
+                             probe_status="not_checked"),
+            self._score_node("d", "203.0.113.9", latency_ms=0,
+                             probe_status="unavailable"),
+        ]
+        ui_cfg = {"routing_mode": "auto", "force_country": "",
+                  "routing_ip_type": "all", "favorite_node_ids": []}
+
+        def order():
+            ranked = manager.rank_selection_candidates(
+                [dict(n) for n in pool], ui_cfg
+            )
+            return [n["id"] for n in ranked]
+
+        def composites():
+            return {
+                n["id"]: manager.composite_node_score(n, pool) for n in pool
+            }
+
+        before_order, before_scores = order(), composites()
+        # Simulate completed lookups writing ONLY display fields, with
+        # wildly different scores (including the Tor 100).
+        pool[0].update(risk_display_score=5, risk_display_level="none",
+                       risk_display_checked_at=999.0)
+        pool[1].update(risk_display_score=88, risk_display_level="high",
+                       risk_display_checked_at=999.0)
+        pool[2].update(risk_display_score=100, risk_display_level="critical",
+                       risk_display_checked_at=999.0)
+        self.assertEqual(before_order, order())
+        self.assertEqual(before_scores, composites())
+        for n in pool:
+            self.assertIsNone(n["iplark_score"])
+
+    # -- merge backfill keeps the display fields --------------------------
+
+    def test_merge_preserves_risk_display_fields(self) -> None:
+        checked = self._score_node(
+            "score-1", "8.8.8.8",
+            risk_display_score=5, risk_display_level="none",
+            risk_display_checked_at=1234567.0,
+            risk_display_connection_type="Data Center",
+            risk_display_flags=["机房托管"],
+            risk_display_reason="Datacenter/hosting IP operated by Google Cloud.",
+        )
+        manager.write_json(manager.NODES_FILE, [checked])
+        candidate = self._score_node("score-1", "8.8.8.8")  # fresh, defaults
+        self._run_maintain([candidate])
+        stored = {n["id"]: n for n in manager.read_nodes()}
+        row = stored["score-1"]
+        self.assertEqual(5, row["risk_display_score"])
+        self.assertEqual("none", row["risk_display_level"])
+        self.assertEqual(1234567.0, row["risk_display_checked_at"])
+        self.assertEqual("Data Center", row["risk_display_connection_type"])
+        self.assertEqual(["机房托管"], row["risk_display_flags"])
+        self.assertTrue(row["risk_display_reason"].startswith("Datacenter"))
+        self.assertIsNone(row["iplark_score"])
+
+    # -- HTTP endpoint, full path -----------------------------------------
+
+    def test_check_score_http_endpoint(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._score_node("score-1", "8.8.8.8"),
+             self._score_node("bad-1", "notanip")],
+        )
+        manager.active_sessions["plus125-stage4-token"] = manager.time.time() + 60
+        server = manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}/EJsW2EeBo9lY"
+
+        def request(path: str, payload: dict | None = None) -> tuple[int, dict]:
+            data = None
+            headers = {"Cookie": "session=plus125-stage4-token"}
+            if payload is not None:
+                data = json.dumps(payload).encode("utf-8")
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(
+                base_url + path,
+                data=data,
+                headers=headers,
+                method="POST" if payload is not None else "GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+
+        sample_body = json.dumps(self._sample("clean_8.8.8.8")).encode("utf-8")
+        try:
+            # Success: real fetch runs against the faked opener.
+            calls = self._fake_opener(
+                lambda url: self._FakeResponse(sample_body)
+            )
+            status, payload = request("/api/check_score", {"id": "score-1"})
+            self.assertEqual(200, status)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(5, payload["node"]["risk_display_score"])
+            self.assertNotIn("config_text", payload["node"])
+            self.assertEqual(
+                ["https://api.ffraud.com/public/ip/8.8.8.8"], calls
+            )
+            status, nodes_payload = request("/api/nodes")
+            self.assertEqual(200, status)
+            rows = {n["id"]: n for n in nodes_payload["nodes"]}
+            self.assertEqual(5, rows["score-1"]["risk_display_score"])
+            self.assertEqual("none", rows["score-1"]["risk_display_level"])
+            self.assertIsNone(rows["score-1"]["iplark_score"])
+
+            # Invalid target: rejected before any network use.
+            calls.clear()
+            status, payload = request("/api/check_score", {"id": "bad-1"})
+            self.assertEqual(200, status)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(manager.RISK_ERROR_TARGET_INVALID, payload["error"])
+            self.assertEqual([], calls)
+            rows = {n["id"]: n for n in manager.read_nodes()}
+            self.assertEqual(
+                manager.RISK_ERROR_TARGET_INVALID,
+                rows["bad-1"]["risk_display_error"],
+            )
+            self.assertIsNone(rows["bad-1"]["risk_display_score"])
+
+            # Unknown node / empty id: 400.
+            status, payload = request("/api/check_score", {"id": "missing"})
+            self.assertEqual(400, status)
+            self.assertFalse(payload["ok"])
+            status, payload = request("/api/check_score", {"id": ""})
+            self.assertEqual(400, status)
+
+            # Duplicate in-flight: pre-held guard -> 409 正在查询.
+            self.assertTrue(manager._risk_check_begin("score-1"))
+            try:
+                status, payload = request("/api/check_score", {"id": "score-1"})
+                self.assertEqual(409, status)
+                self.assertFalse(payload["ok"])
+                self.assertEqual("正在查询", payload["error"])
+            finally:
+                manager._risk_check_end("score-1")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_check_score_http_failure_writes_error_only(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE, [self._score_node("score-1", "8.8.8.8")]
+        )
+        manager.active_sessions["plus125-stage4-token"] = manager.time.time() + 60
+        server = manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}/EJsW2EeBo9lY"
+
+        def responder(url):
+            raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+
+        try:
+            self._fake_opener(responder)
+            req = urllib.request.Request(
+                base_url + "/api/check_score",
+                data=json.dumps({"id": "score-1"}).encode("utf-8"),
+                headers={
+                    "Cookie": "session=plus125-stage4-token",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                status = response.status
+            self.assertEqual(200, status)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(manager.RISK_ERROR_REJECTED, payload["error"])
+            row = manager.read_nodes()[0]
+            self.assertEqual(manager.RISK_ERROR_REJECTED, row["risk_display_error"])
+            self.assertGreater(row["risk_display_checked_at"], 0)
+            self.assertIsNone(row["risk_display_score"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    # -- panel markers ------------------------------------------------------
+
+    def test_panel_risk_score_ui_markers(self) -> None:
+        html = manager.INDEX_HTML
+        self.assertIn('<th style="width: 90px;">风险分</th>', html)
+        self.assertNotIn("iplark 评分</th>", html)
+        self.assertNotIn("暂未启用", html)
+        self.assertIn("checkNodeScore", html)
+        self.assertIn("riskScoreTitle", html)
+        self.assertIn("scoreRequestIds", html)
+        self.assertIn("查询中…", html)
+        self.assertIn("越高越危险", html)
+        self.assertIn("此分数只作为参考", html)
+        self.assertIn("risk_display_score", html)
+        # New node records carry the display-field defaults.
+        fresh = manager.row_to_node(
+            {"IP": "8.8.8.8", "CountryShort": "US", "HostName": "x",
+             "Score": "1", "Ping": "1", "Speed": "1", "NumVpnSessions": "1",
+             "CountryLong": "United States"},
+            "client\nremote 8.8.8.8 1194 udp\n",
+        )
+        for key, default in manager.RISK_DISPLAY_DEFAULTS.items():
+            self.assertEqual(default, fresh[key])
+        self.assertIsNone(fresh["iplark_score"])
