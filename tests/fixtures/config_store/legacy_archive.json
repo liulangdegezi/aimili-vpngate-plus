@@ -1,0 +1,34 @@
+[
+  {
+    "id": "JP_198.51.100.10_1194_udp",
+    "country": "日本",
+    "country_short": "JP",
+    "ip": "198.51.100.10",
+    "remote_host": "198.51.100.10",
+    "remote_port": 1194,
+    "proto": "udp",
+    "ip_type": "",
+    "config_text": "client\nremote 198.51.100.10 1194 udp\n",
+    "config_file": "CONFIGS_DIR/JP_198.51.100.10_1194_udp.ovpn",
+    "last_seen_at": 1700000100.0,
+    "last_success_at": 1700000100.0,
+    "archived_at": 1700000200.0,
+    "reason": "observing-grace-expired"
+  },
+  {
+    "id": "US_203.0.113.7_1194_udp",
+    "country": "美国",
+    "country_short": "US",
+    "ip": "203.0.113.7",
+    "remote_host": "203.0.113.7",
+    "remote_port": 1194,
+    "proto": "udp",
+    "ip_type": "",
+    "config_text": "client\nremote 203.0.113.7 1194 udp\n",
+    "config_file": "CONFIGS_DIR/US_203.0.113.7_1194_udp.ovpn",
+    "last_seen_at": 1699800000.0,
+    "last_success_at": 1699850000.0,
+    "archived_at": 1700000300.0,
+    "reason": "liveness-threshold"
+  }
+]
