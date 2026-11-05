@@ -843,8 +843,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.2.3", manager.APP_VERSION)
-        self.assertEqual("V1.2.3 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.2.4", manager.APP_VERSION)
+        self.assertEqual("V1.2.4 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -919,8 +919,8 @@ class ManagerLogicTests(unittest.TestCase):
 
     def test_latest_release_check_reports_current_formal_version(self) -> None:
         release = {
-            "tag_name": "v1.2.3",
-            "name": "AimiliVPN V1.2.3 正式版",
+            "tag_name": "v1.2.4",
+            "name": "AimiliVPN V1.2.4 正式版",
             "draft": False,
             "prerelease": False,
         }
@@ -928,7 +928,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.2.3 正式版", result["current_version_label"])
+        self.assertEqual("V1.2.4 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -947,7 +947,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.2.3", result["current_version"])
+        self.assertEqual("1.2.4", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1462,20 +1462,20 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_2_3(self) -> None:
-        self.assertEqual("1.2.3", manager.APP_VERSION)
-        self.assertEqual("V1.2.3 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.2.3 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_2_4(self) -> None:
+        self.assertEqual("1.2.4", manager.APP_VERSION)
+        self.assertEqual("V1.2.4 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.2.4 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.2.3"', install_text)
+        self.assertIn('"1.2.4"', install_text)
         self.assertNotIn('"1.2.2"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.2.3", compose_text)
+        self.assertIn(":1.2.4", compose_text)
         self.assertNotIn("1.2.2", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.2.3", version_text)
+        self.assertEqual("1.2.4", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn("## V1.2.3（2026-11-04，已发布正式版 v1.2.3）", changelog)
+        self.assertIn("## V1.2.4（2026-11-05，已发布正式版 v1.2.4）", changelog)
         self.assertIn("## V1.2.2", changelog)
         self.assertIn("## V1.2.1（2026-10-26，已发布正式版 v1.2.1）", changelog)
         self.assertIn("## V1.2.0（2026-10-26，已发布正式版 v1.2.0）", changelog)
@@ -2109,7 +2109,7 @@ class CodeUpdateWriteFailureTests(unittest.TestCase):
 
 
 class SlimmingAndRetainedVisibilityTests(unittest.TestCase):
-    """Regression tests for the 1.2.3 memory slimming + display switch."""
+    """Regression tests for the 1.2.4 memory slimming + display switch."""
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -2349,3 +2349,342 @@ class SlimmingAndRetainedVisibilityTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+class Plus124ScopedSweepAndPersistenceTests(unittest.TestCase):
+    """1.2.4: connection-country-scoped full sweep + post-switch
+    re-sweep, batched probe persistence, allocator trim helper, and
+    the /api/retained archive-count cache."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.path_patches = [
+            mock.patch.object(manager, "DATA_DIR", root),
+            mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
+            mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "STATE_FILE", root / "state.json"),
+            mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
+            mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
+            mock.patch.object(manager, "API_CACHE_FILE", root / "api_snapshot.csv"),
+            mock.patch.object(manager, "API_CACHE_META_FILE", root / "api_snapshot.meta.json"),
+            mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
+            mock.patch.object(manager, "RETAINED_ARCHIVE_FILE", root / "retained_archive.json"),
+        ]
+        for patcher in self.path_patches:
+            patcher.start()
+        manager.ensure_dirs()
+        self._saved_restart_first = manager._first_maintain_after_startup
+        manager.active_openvpn_process = None
+        manager.active_openvpn_node_id = ""
+        manager.is_connecting = False
+        manager.full_sweep_running = False
+        manager.full_sweep_cancel_requested = False
+        manager._switch_watch_last_id = ""
+        manager.clear_switch_sweep_pending()
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+
+    def tearDown(self) -> None:
+        manager._first_maintain_after_startup = self._saved_restart_first
+        manager.active_openvpn_node_id = ""
+        manager._switch_watch_last_id = ""
+        manager.clear_switch_sweep_pending()
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+        for patcher in reversed(self.path_patches):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    def _node(self, node_id: str, country_short: str, **extra) -> dict:
+        node = {
+            "id": node_id,
+            "ip": "192.0.2.1",
+            "remote_host": "192.0.2.1",
+            "remote_port": 1194,
+            "country": country_short,
+            "country_short": country_short,
+            "ping": 10,
+            "latency_ms": 10,
+            "config_text": "client\nremote 192.0.2.1 1194 udp\n",
+            "config_file": str(manager.CONFIG_DIR / f"{node_id}.ovpn"),
+            "probe_status": "not_checked",
+            "probed_at": 0,
+            "consecutive_failures": 0,
+            "active": False,
+        }
+        node.update(extra)
+        return node
+
+    # -- Scope 1: sweep scoping -------------------------------------
+
+    def test_sweep_only_tests_connection_country(self) -> None:
+        nodes = [
+            self._node("jp-active", "JP", active=True),
+            self._node("jp-1", "JP"),
+            self._node("jp-2", "JP"),
+            self._node("us-1", "US"),
+            self._node("kr-1", "KR"),
+        ]
+        manager.write_json(manager.NODES_FILE, nodes)
+        manager.active_openvpn_node_id = "jp-active"
+        captured = {}
+
+        def fake_test_multiple(ids, target_available=None, stop_requested=None):
+            captured["ids"] = list(ids)
+            return [
+                {"id": "jp-1", "probe_status": "available"},
+                {"id": "jp-2", "probe_status": "unavailable"},
+            ]
+
+        with (
+            mock.patch.object(manager, "load_ui_config", return_value={"routing_mode": "auto"}),
+            mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test_multiple),
+        ):
+            result = manager.run_full_sweep()
+        self.assertEqual({"jp-1", "jp-2"}, set(captured["ids"]))
+        self.assertEqual(2, result["tested"])
+        self.assertEqual(1, result["available"])
+        self.assertEqual(1, result["unavailable"])
+        self.assertIn("全量检测完成（JP）", manager.get_state().get("last_check_message", ""))
+
+    def test_sweep_skips_without_connection(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._node("jp-1", "JP"), self._node("us-1", "US")],
+        )
+        with mock.patch.object(manager, "test_multiple_nodes") as test_mock:
+            result = manager.run_full_sweep()
+        test_mock.assert_not_called()
+        self.assertTrue(result["skipped"])
+        self.assertEqual("no_connection", result["skip_reason"])
+        self.assertEqual(
+            "无当前连接，跳过全量检测",
+            manager.get_state().get("last_check_message", ""),
+        )
+
+    def test_sweep_scoped_country_with_only_active_node(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._node("jp-active", "JP", active=True), self._node("us-1", "US")],
+        )
+        manager.active_openvpn_node_id = "jp-active"
+        with mock.patch.object(manager, "test_multiple_nodes") as test_mock:
+            result = manager.run_full_sweep()
+        test_mock.assert_not_called()
+        self.assertFalse(result["skipped"])
+        self.assertEqual(0, result["tested"])
+
+    # -- Scope 1: switch observation / gating ------------------------
+
+    def test_switch_pending_lifecycle_and_gating(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [
+                self._node("jp-a", "JP", active=True),
+                self._node("jp-b", "JP"),
+                self._node("us-a", "US"),
+            ],
+        )
+        manager.active_openvpn_node_id = "jp-a"
+        self.assertEqual("JP", manager.pending_switch_sweep_country())
+        # Same-country switch coalesces to one pending entry (new id).
+        manager.active_openvpn_node_id = "jp-b"
+        self.assertEqual("JP", manager.pending_switch_sweep_country())
+        self.assertEqual(("jp-b", "JP"), manager._switch_sweep_pending)
+        # A later switch replaces the pending country.
+        manager.active_openvpn_node_id = "us-a"
+        self.assertEqual("US", manager.pending_switch_sweep_country())
+        # Gating: the switch reason fires for auto, refill vetoes it.
+        self.assertEqual(
+            (True, "连接切换后补检（US）"),
+            manager.should_run_full_sweep("auto", False, False, switch_country="US"),
+        )
+        self.assertFalse(
+            manager.should_run_full_sweep("refill", True, True, switch_country="US")[0]
+        )
+        # Late re-evaluation upgrades an auto skip, never a refill.
+        self.assertEqual(
+            (True, "连接切换后补检（US）"),
+            manager._late_switch_sweep("auto", False, "节点列表未变化"),
+        )
+        self.assertEqual(
+            (False, "节点列表未变化"),
+            manager._late_switch_sweep("refill", False, "节点列表未变化"),
+        )
+        # Consumption clears the marker; no new switch -> nothing pending.
+        manager.clear_switch_sweep_pending()
+        self.assertEqual("", manager.pending_switch_sweep_country())
+
+    def test_scoped_hash_ignores_other_country_list_changes(self) -> None:
+        def cand(node_id: str, country_short: str) -> dict:
+            return self._node(node_id, country_short)
+
+        active = self._node("gb-active", "GB", active=True)
+        manager.write_json(
+            manager.NODES_FILE,
+            [active, cand("gb-a", "GB"), cand("gb-b", "GB"), cand("us-x", "US")],
+        )
+        manager.active_openvpn_node_id = "gb-active"
+
+        def run_maintain(candidates, restart_first):
+            manager._first_maintain_after_startup = restart_first
+            sweep_mock = mock.Mock(
+                return_value={"skipped": False, "tested": 2, "available": 1, "unavailable": 1}
+            )
+            with (
+                mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+                mock.patch.object(manager, "active_openvpn_running", return_value=True),
+                mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+                mock.patch.object(manager, "sweep_retained_nodes", return_value=0),
+                mock.patch.object(manager, "run_full_sweep", sweep_mock),
+                mock.patch.object(manager, "log_to_json"),
+            ):
+                message = manager.maintain_valid_nodes(force=False, trigger="auto")
+            return message, sweep_mock
+
+        # Round 1 (restart-first): sweeps and stores the GB-scoped hash.
+        _, sweep_mock = run_maintain(
+            [cand("gb-a", "GB"), cand("gb-b", "GB"), cand("us-x", "US")], True
+        )
+        self.assertEqual(1, sweep_mock.call_count)
+        # Round 2: only the US part of the list changed -> no sweep.
+        message, sweep_mock = run_maintain(
+            [cand("gb-a", "GB"), cand("gb-b", "GB"), cand("us-y", "US")], False
+        )
+        sweep_mock.assert_not_called()
+        self.assertIn("已跳过", message)
+        # Round 3: the GB part changed -> sweep again.
+        _, sweep_mock = run_maintain(
+            [cand("gb-a", "GB"), cand("gb-c", "GB"), cand("us-y", "US")], False
+        )
+        self.assertEqual(1, sweep_mock.call_count)
+
+    # -- Scope 4: archive-count cache --------------------------------
+
+    def test_retained_archive_count_cache_hit_and_invalidation(self) -> None:
+        archive_path = manager.RETAINED_ARCHIVE_FILE
+        manager.write_json(archive_path, [{"id": "a"}, {"id": "b"}, {"id": "c"}])
+        self.assertEqual(3, manager.retained_archive_count())
+        # Cache hit: a second call must not re-read the file at all.
+        with mock.patch.object(
+            manager, "read_json", side_effect=AssertionError("cache miss re-read")
+        ):
+            self.assertEqual(3, manager.retained_archive_count())
+        # File changed (append one record) -> key changes -> recount.
+        manager.write_json(archive_path, [{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": "d"}])
+        self.assertEqual(4, manager.retained_archive_count())
+        # Missing file -> 0, matching the previous read_json default.
+        archive_path.unlink()
+        self.assertEqual(0, manager.retained_archive_count())
+
+    # -- Scope 3: batched probe persistence --------------------------
+
+    def _write_probe_nodes(self, count: int, failures: int = 0) -> list[dict]:
+        nodes = []
+        for index in range(count):
+            nodes.append(
+                self._node(
+                    f"node-{index}",
+                    "JP",
+                    consecutive_failures=failures,
+                    note=f"orig-{index}",
+                )
+            )
+        manager.write_json(manager.NODES_FILE, nodes)
+        return nodes
+
+    def test_probe_batch_flush_merges_concurrent_changes(self) -> None:
+        nodes = self._write_probe_nodes(6, failures=4)
+        calls = {"n": 0}
+
+        def fake_openvpn(config_file, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                # A concurrent writer (e.g. the panel) edits non-probe
+                # fields of two rows directly on disk mid-batch.
+                raw = json.loads(manager.NODES_FILE.read_text(encoding="utf-8"))
+                for row in raw:
+                    if row["id"] == "node-0":
+                        row["note"] = "changed-during-batch"
+                    if row["id"] == "node-1":
+                        row["owner"] = "concurrent-writer"
+                manager.NODES_FILE.write_text(
+                    json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            return True, "ready", None
+
+        write_calls = {"nodes": 0}
+        real_write_json = manager.write_json
+
+        def counting_write_json(path, data):
+            if Path(path) == manager.NODES_FILE:
+                write_calls["nodes"] += 1
+            return real_write_json(path, data)
+
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+            mock.patch.object(manager, "write_json", side_effect=counting_write_json),
+            mock.patch.object(manager, "NODE_PROBE_WORKERS", 5),
+        ):
+            results = manager.test_multiple_nodes([n["id"] for n in nodes])
+        self.assertEqual(6, len(results))
+        stored = {n["id"]: n for n in manager.read_nodes()}
+        for index in range(6):
+            self.assertEqual("available", stored[f"node-{index}"]["probe_status"])
+            # Success zeroes the failure counter exactly once.
+            self.assertEqual(0, stored[f"node-{index}"]["consecutive_failures"])
+            self.assertGreater(stored[f"node-{index}"].get("last_success_at", 0), 0)
+        # Concurrent non-probe edits survived every flush.
+        self.assertEqual("changed-during-batch", stored["node-0"]["note"])
+        self.assertEqual("concurrent-writer", stored["node-1"]["owner"])
+        self.assertEqual("orig-2", stored["node-2"]["note"])
+        # Batched persistence: a handful of table writes, not one per
+        # marker plus one per result (which would be 2 + 6 + 1 = 9).
+        self.assertLessEqual(write_calls["nodes"], 3)
+
+    def test_probe_batch_interrupt_flushes_and_counts_failures_once(self) -> None:
+        nodes = self._write_probe_nodes(12, failures=2)
+
+        def fake_openvpn(config_file, **kwargs):
+            return False, "Connection reset by peer", None
+
+        state = {"n": 0}
+
+        def stop_requested():
+            state["n"] += 1
+            return state["n"] >= 2
+
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+            mock.patch.object(manager, "NODE_PROBE_WORKERS", 5),
+        ):
+            results = manager.test_multiple_nodes(
+                [n["id"] for n in nodes],
+                target_available=None,
+                stop_requested=stop_requested,
+            )
+        # Only the first batch ran; its results were still flushed on
+        # the interrupt exit path.
+        self.assertEqual(5, len(results))
+        stored = {n["id"]: n for n in manager.read_nodes()}
+        tested = [n for n in stored.values() if n["probe_status"] == "unavailable"]
+        untested = [n for n in stored.values() if n["probe_status"] == "not_checked"]
+        self.assertEqual(5, len(tested))
+        self.assertEqual(7, len(untested))
+        for node in tested:
+            # 2 + exactly one increment -- the exit flush and the final
+            # merge flush must not double-count.
+            self.assertEqual(3, node["consecutive_failures"])
+
+    # -- Scope 2: allocator helper -----------------------------------
+
+    def test_malloc_trim_helper_callable(self) -> None:
+        result = manager.malloc_trim()
+        self.assertIsInstance(result, bool)
+        # Second call (cached handle / unavailable latch) also safe.
+        self.assertIsInstance(manager.malloc_trim(), bool)
