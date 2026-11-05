@@ -13,6 +13,23 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 
+# 1.2.5: record the pre-install service process so the restart at the
+# end of this script can be VERIFIED. A restart that silently leaves
+# the old process running must fail loudly (non-zero exit) instead of
+# looking like success -- that false success is what let a one-click
+# update report "done" while the panel kept running the old version.
+INSTALL_START_EPOCH=$(date +%s)
+OLD_SERVICE_PID=""
+if command -v systemctl >/dev/null 2>&1; then
+    OLD_SERVICE_PID=$(systemctl show aimilivpn.service --property=MainPID --value 2>/dev/null || true)
+    case "${OLD_SERVICE_PID}" in
+        ''|*[!0-9]*) OLD_SERVICE_PID="" ;;
+    esac
+    if [ "${OLD_SERVICE_PID}" = "0" ]; then
+        OLD_SERVICE_PID=""
+    fi
+fi
+
 # 2. Check OS distribution and set package manager
 OS_TYPE=""
 PKG_MGR=""
@@ -205,9 +222,9 @@ def get_app_version():
     try:
         with open(os.path.join(INSTALL_DIR, "VERSION"), "r", encoding="utf-8") as f:
             version = f.read().strip().lstrip("vV")
-        return version or "1.2.4"
+        return version or "1.2.5"
     except Exception:
-        return "1.2.4"
+        return "1.2.5"
 
 def load_ui_cfg():
     import json
@@ -1139,10 +1156,66 @@ state["last_check_message"] = "服务正在重启并重新建立加密通道..."
 state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
 fi
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl restart aimilivpn.service || true
-elif command -v rc-service >/dev/null 2>&1; then
-    rc-service aimilivpn restart || true
+# 1.2.5: verified restart (replaces the old `restart ... || true`,
+# whose swallowed failure produced the 1.2.4 false-success update).
+# systemd: the restart counts only when the service is active AND --
+# for an upgrade, where OLD_SERVICE_PID was recorded at script start --
+# the MainPID actually changed. A first install (no old PID) only
+# requires the service to end up active with a live MainPID.
+# OpenRC has no MainPID, so its restart is verified by status polling.
+restart_service_verified() {
+    if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl restart aimilivpn.service; then
+            echo -e "${RED}错误: systemctl restart aimilivpn.service 执行失败。${PLAIN}"
+            return 1
+        fi
+        local attempt=0
+        local current_pid=""
+        while [ "$attempt" -lt 30 ]; do
+            if [ "$(systemctl is-active aimilivpn.service 2>/dev/null || true)" = "active" ]; then
+                current_pid=$(systemctl show aimilivpn.service --property=MainPID --value 2>/dev/null || true)
+                case "${current_pid}" in
+                    ''|*[!0-9]*) current_pid="" ;;
+                esac
+                if [ -z "${OLD_SERVICE_PID}" ]; then
+                    if [ -n "${current_pid}" ] && [ "${current_pid}" != "0" ]; then
+                        echo -e "  -> ${GREEN}服务已启动并核验通过（MainPID: ${current_pid}）。${PLAIN}"
+                        return 0
+                    fi
+                elif [ -n "${current_pid}" ] && [ "${current_pid}" != "0" ] && [ "${current_pid}" != "${OLD_SERVICE_PID}" ]; then
+                    echo -e "  -> ${GREEN}服务重启已核验通过（MainPID: ${OLD_SERVICE_PID} -> ${current_pid}）。${PLAIN}"
+                    return 0
+                fi
+            fi
+            attempt=$((attempt + 1))
+            sleep 1
+        done
+        echo -e "${RED}错误: 服务重启后 30 秒内未能确认新进程生效（脚本开始时刻 epoch: ${INSTALL_START_EPOCH}，重启前 MainPID: ${OLD_SERVICE_PID:-无}，当前 MainPID: ${current_pid:-未知}）。旧进程可能仍在运行旧版本，请用 systemctl restart aimilivpn.service 手动重启并核对版本。${PLAIN}"
+        return 1
+    elif command -v rc-service >/dev/null 2>&1; then
+        if ! rc-service aimilivpn restart; then
+            echo -e "${RED}错误: rc-service aimilivpn restart 执行失败。${PLAIN}"
+            return 1
+        fi
+        local attempt=0
+        while [ "$attempt" -lt 30 ]; do
+            if rc-service aimilivpn status >/dev/null 2>&1; then
+                echo -e "  -> ${GREEN}服务重启已核验通过（OpenRC 状态为已启动）。${PLAIN}"
+                return 0
+            fi
+            attempt=$((attempt + 1))
+            sleep 1
+        done
+        echo -e "${RED}错误: 服务重启后 30 秒内未能确认处于运行状态（OpenRC）。请用 rc-service aimilivpn restart 手动重启并核对版本。${PLAIN}"
+        return 1
+    fi
+    echo -e "${YELLOW}警告: 未检测到 systemd 或 OpenRC，跳过服务重启核验。${PLAIN}"
+    return 0
+}
+
+if ! restart_service_verified; then
+    echo -e "${RED}安装中止: 服务重启未生效，本次安装不能视为成功。请按上面的提示手动重启服务并核对版本后，再重新运行安装。${PLAIN}"
+    exit 1
 fi
 
 # Wait and poll for node loading and active connection

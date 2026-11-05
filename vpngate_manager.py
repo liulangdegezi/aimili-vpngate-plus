@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+import ipaddress
 import json
 import os
 import py_compile
@@ -165,6 +166,35 @@ RETAINED_POOL_MAX_NODES = env_int("RETAINED_POOL_MAX_NODES", 500, 1)
 SCORE_WEIGHT_LATENCY = 0.3
 SCORE_WEIGHT_AVAILABILITY = 0.3
 SCORE_WEIGHT_IPLARK = 0.4
+# 1.2.5 stage 4: manual per-node risk-score lookup (FFraud, plan §三).
+# Display-only: results land in the node's risk_display_* fields, which
+# composite_node_score() never reads, so a fetched score can never move
+# selection ordering. One fetch per button click -- no worker, no queue,
+# no automatic recheck.
+FFRAUD_API_URL_TEMPLATE = "https://api.ffraud.com/public/ip/{ip}"
+FFRAUD_FETCH_TIMEOUT_SECONDS = 15
+# Human-readable FFraud flag fields, in display order: JSON field name ->
+# short label used in the panel tooltip / flags list.
+FFRAUD_FLAG_LABELS = (
+    ("proxy", "代理"),
+    ("vpn", "VPN"),
+    ("tor", "Tor"),
+    ("relay", "中继"),
+    ("hosting", "机房托管"),
+    ("is_abuser", "滥用记录"),
+    ("recent_abuse", "近期滥用"),
+    ("is_residential_proxy", "住宅代理"),
+)
+# Default risk_display_* values for a node that was never checked.
+RISK_DISPLAY_DEFAULTS: dict[str, Any] = {
+    "risk_display_score": None,
+    "risk_display_level": "",
+    "risk_display_checked_at": 0,
+    "risk_display_connection_type": "",
+    "risk_display_flags": [],
+    "risk_display_reason": "",
+    "risk_display_error": "",
+}
 DEPLOYMENT_MODE = os.environ.get("DEPLOYMENT_MODE", "source").strip().lower()
 if DEPLOYMENT_MODE not in {"source", "docker"}:
     DEPLOYMENT_MODE = "source"
@@ -176,7 +206,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.2.4"
+DEFAULT_APP_VERSION = "1.2.5"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -440,6 +470,7 @@ def load_ui_config() -> dict[str, Any]:
             "fav_fail_fallback": False,
             "discovery_countries": [],
             "show_retained_pool_ips": True,
+            "retained_pool_enabled": True,
         }
         updated = False
         if auth_file.exists():
@@ -451,7 +482,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries", "show_retained_pool_ips"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries", "show_retained_pool_ips", "retained_pool_enabled"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -489,6 +520,10 @@ def load_ui_config() -> dict[str, Any]:
             config["show_retained_pool_ips"] = True
             updated = True
 
+        if not isinstance(config.get("retained_pool_enabled"), bool):
+            config["retained_pool_enabled"] = True
+            updated = True
+
         if not auth_file.exists() or updated:
             try:
                 DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -520,6 +555,56 @@ def persist_show_retained_pool_ips(value: Any) -> bool:
         DATA_DIR.mkdir(exist_ok=True, parents=True)
         write_json(auth_file, ui_cfg)
     return value
+
+def persist_retained_pool_enabled(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("保留池开关必须是布尔值")
+    ui_cfg = load_ui_config()
+    ui_cfg["retained_pool_enabled"] = value
+    auth_file = DATA_DIR / "ui_auth.json"
+    with lock:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        write_json(auth_file, ui_cfg)
+    return value
+
+def disable_retained_pool() -> dict[str, int]:
+    """Turn the retained-pool mechanism OFF and purge the observing pool.
+
+    The order is load-bearing (1.2.5 plan §2.2): the disabled flag is
+    persisted FIRST, so any refresh merge already in flight or starting
+    afterwards treats disappeared nodes under the pool-off rule and can
+    never write a just-purged node back as observing. The purge itself
+    runs under the same node-table write lock (``lock``) as the refresh
+    merge, archives every non-favorite observing node in ONE batch via
+    archive_retained_nodes(), and rewrites the table once. Favorite
+    observing nodes are exempt: they stay in the table and, matching
+    the merge's favorite branch, their status becomes "normal". The
+    active node is never observing, so a live connection is untouched.
+    Returns {"archived": N, "kept_favorites": M}.
+    """
+    persist_retained_pool_enabled(False)
+    fav_ids = set(load_ui_config().get("favorite_node_ids", []))
+    archived = 0
+    kept_favorites = 0
+    with lock:
+        nodes = read_nodes()
+        purge_entries: list[tuple[dict[str, Any], str]] = []
+        remaining: list[dict[str, Any]] = []
+        for node in nodes:
+            if node.get("retention_status") == "observing" and not node.get("active"):
+                if str(node.get("id")) in fav_ids:
+                    node["retention_status"] = "normal"
+                    kept_favorites += 1
+                    remaining.append(node)
+                else:
+                    purge_entries.append((node, "retained-pool-disabled"))
+            else:
+                remaining.append(node)
+        if purge_entries:
+            archived = archive_retained_nodes(purge_entries)
+        if purge_entries or kept_favorites:
+            write_json(NODES_FILE, remaining)
+    return {"archived": archived, "kept_favorites": kept_favorites}
 
 def filter_main_list_nodes(
     nodes: list[dict[str, Any]], show_retained_pool_ips: bool
@@ -665,6 +750,7 @@ def get_state() -> dict[str, Any]:
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["discovery_countries"] = normalize_discovery_countries(ui_cfg.get("discovery_countries"))
     state["show_retained_pool_ips"] = bool(ui_cfg.get("show_retained_pool_ips", True))
+    state["retained_pool_enabled"] = bool(ui_cfg.get("retained_pool_enabled", True))
     state["fav_fail_fallback"] = False
     
     return state
@@ -1077,6 +1163,15 @@ CODE_UPDATE_LOG_FILE = DATA_DIR / "code_update.log"
 CODE_UPDATE_BRANCH = "main"
 CODE_UPDATE_STALE_SECONDS = 1800
 CODE_UPDATE_PANEL_HEALTH_TIMEOUT_SECONDS = 150
+# 1.2.5: the success verdict also requires proof that the running
+# process was replaced (service baseline + freshness), and the install
+# output is always traced. The service identity is fixed, like every
+# other updater command.
+CODE_UPDATE_SERVICE_NAME = "aimilivpn.service"
+CODE_UPDATE_INSTALL_TAIL_LINES = 200
+CODE_UPDATE_INSTALL_TAIL_CHARS = 16000
+CODE_UPDATE_ERROR_TAIL_CHARS = 2000
+CODE_UPDATE_DEGRADED_HTTP_TIMEOUT_SECONDS = 30
 CODE_UPDATE_CHECK_FILES = (
     "vpngate_manager.py",
     "proxy_server.py",
@@ -1116,6 +1211,7 @@ def write_code_update_status(
     target_version: str,
     error: str = "",
     needs_terminal: bool = False,
+    extra_log_lines: list[str] | None = None,
 ) -> dict[str, Any]:
     """Write the one-click update status file + code-update log line.
 
@@ -1137,6 +1233,11 @@ def write_code_update_status(
         log_tail = list(previous.get("log_tail", [])) if isinstance(previous, dict) else []
         entry_line = message if not error else f"{message}：{error}"
         log_tail.append(entry_line)
+        # 1.2.5: optional extra lines (e.g. the install-output excerpt)
+        # ride along in the SAME status write, so the number and order
+        # of status writes in the update flow are unchanged.
+        if extra_log_lines:
+            log_tail.extend(str(line) for line in extra_log_lines)
         log_tail = log_tail[-50:]
         entry = {
             "result": result,
@@ -1406,7 +1507,126 @@ def _code_update_ui_host_port() -> tuple[str, int]:
     return host, port
 
 
-def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) -> bool:
+def _code_update_parse_systemd_show(text: str) -> dict[str, Any]:
+    pid = 0
+    enter_timestamp = ""
+    for line in str(text or "").splitlines():
+        if line.startswith("MainPID="):
+            try:
+                pid = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pid = 0
+        elif line.startswith("ActiveEnterTimestamp="):
+            enter_timestamp = line.split("=", 1)[1].strip()
+    return {"pid": pid, "enter_timestamp": enter_timestamp}
+
+
+def _code_update_read_service_state(run, cwd) -> dict[str, Any] | None:
+    """Read the service's MainPID + start timestamp via systemctl show.
+
+    Goes through the worker's injected runner like every other updater
+    command (tests fake it; no shell, fixed arguments). Returns None
+    whenever the information cannot be obtained (no systemd, unit
+    missing, unparsable output) so callers fall back to the degraded
+    verification path instead of guessing.
+    """
+    try:
+        result = run(
+            [
+                "systemctl", "show", CODE_UPDATE_SERVICE_NAME,
+                "--property=MainPID", "--property=ActiveEnterTimestamp",
+            ],
+            cwd, 30,
+        )
+    except Exception:
+        return None
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    parsed = _code_update_parse_systemd_show(getattr(result, "stdout", "") or "")
+    if parsed["pid"] <= 0 and not parsed["enter_timestamp"]:
+        return None
+    return parsed
+
+
+def _code_update_service_baseline(run, cwd) -> dict[str, Any]:
+    """Record the pre-update service process baseline (1.2.5 plan §1.2).
+
+    With systemd data the baseline is the MainPID + start timestamp of
+    the process running the OLD code; without it the baseline degrades
+    to the recording time and the final verdict is annotated as a
+    degraded verification rather than silently treated as full proof.
+    """
+    state = _code_update_read_service_state(run, cwd)
+    if state is not None:
+        return {
+            "source": "systemd",
+            "pid": state["pid"],
+            "enter_timestamp": state["enter_timestamp"],
+            "recorded_at": time.time(),
+        }
+    return {"source": "fallback", "pid": 0, "enter_timestamp": "", "recorded_at": time.time()}
+
+
+def _code_update_service_freshness(run, cwd, baseline: dict[str, Any]) -> tuple[str, str]:
+    """Compare the current service process against the baseline.
+
+    Returns (verdict, detail): "fresh" when the process demonstrably
+    changed (different MainPID, or a different start timestamp),
+    "stale" when systemd answers and nothing changed (the 1.2.4
+    false-success shape), and "unknown" when the comparison cannot be
+    made, which routes the verdict through the degraded path.
+    """
+    if not baseline or baseline.get("source") != "systemd":
+        return "unknown", "更新前未能读取服务进程信息"
+    current = _code_update_read_service_state(run, cwd)
+    if current is None:
+        return "unknown", "更新后未能读取服务进程信息"
+    if current["pid"] > 0 and current["pid"] != baseline.get("pid"):
+        return "fresh", f"服务进程已更换（MainPID {baseline.get('pid')} -> {current['pid']}）"
+    base_ts = baseline.get("enter_timestamp") or ""
+    if base_ts and current["enter_timestamp"] and current["enter_timestamp"] != base_ts:
+        return "fresh", "服务启动时间已更新"
+    return "stale", f"服务进程未更换（MainPID 仍为 {current['pid']}，启动时间未变）"
+
+
+def _code_update_install_output_tail(result) -> str:
+    """Tail of an install run's combined output (1.2.5 plan §1.2.5):
+    last ~200 lines, capped at ~16K characters, for the update log."""
+    text = (
+        (getattr(result, "stdout", "") or "")
+        + "\n"
+        + (getattr(result, "stderr", "") or "")
+    ).strip()
+    if not text:
+        return ""
+    tail = "\n".join(text.splitlines()[-CODE_UPDATE_INSTALL_TAIL_LINES:])
+    return tail[-CODE_UPDATE_INSTALL_TAIL_CHARS:]
+
+
+def _code_update_panel_http_responds(host: str, port: int, timeout: int) -> bool:
+    """Degraded-verification probe: True once the panel's HTTP stack
+    returns ANY response (any status line counts; the panel requires
+    auth, so no specific code is expected)."""
+    import http.client
+
+    deadline = time.time() + timeout
+    hosts = ["127.0.0.1", "::1"] if host in ("::", "0.0.0.0", "") else [host]
+    while time.time() < deadline:
+        for candidate in hosts:
+            try:
+                conn = http.client.HTTPConnection(candidate, port, timeout=3)
+                conn.request("GET", "/")
+                response = conn.getresponse()
+                response.read(64)
+                conn.close()
+                return True
+            except Exception:
+                continue
+        time.sleep(2)
+    return False
+
+
+def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, release_check=None, panel_http_check=None) -> bool:
     """Detached one-click code updater (source + docker branches).
 
     Never called from the panel process itself; the panel spawns it via
@@ -1415,6 +1635,16 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
     with returncode/stdout/stderr (tests inject fakes so no real git or
     install step ever runs under test). `panel_healthy` is a
     callable(host, port, timeout) -> bool (tests inject it).
+    `release_check` defaults to check_latest_release() and
+    `panel_http_check` to _code_update_panel_http_responds (tests
+    inject both, so no network is touched under test).
+    1.2.5: the source-branch success verdict is three-layered -- panel
+    port reachable, on-disk VERSION equals the target, AND the service
+    process demonstrably replaced (baseline vs freshness via systemd);
+    when process information is unavailable the verdict degrades to a
+    panel-HTTP-response check and is annotated as degraded, never
+    silently treated as full proof. Before checkout, the temp
+    worktree's VERSION must equal the latest formal Release version.
     Stage status writes are gated on their `status_ok` flag: a failed
     running-status write aborts before any overwrite (fetch/check/
     checkout/docker pull/restart) and rolls back after an overwrite
@@ -1454,7 +1684,7 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
 
     def cmd_tail(result) -> str:
         text = (((getattr(result, "stderr", "") or "") + "\n" + (getattr(result, "stdout", "") or "")).strip())
-        return text[-500:] if text else ""
+        return text[-CODE_UPDATE_ERROR_TAIL_CHARS:] if text else ""
 
     if DEPLOYMENT_MODE == "docker":
         if not write_code_update_status(
@@ -1497,6 +1727,19 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
 
     if not write_code_update_status("running", "fetch", "正在拉取 main 分支…", current_version, "").get("status_ok", False):
         return fail_on_status_write("fetch", "拉取 main 分支失败")
+    # 1.2.5: record the service-process baseline BEFORE any overwrite,
+    # so the health stage can prove the running process was replaced.
+    # Recorded to the update log only -- never an extra status write.
+    service_baseline = _code_update_service_baseline(run, install_dir)
+    if service_baseline["source"] == "systemd":
+        _code_update_append_log(
+            f"[fetch] 更新前服务基线：MainPID={service_baseline['pid']}，"
+            f"启动时间 {service_baseline['enter_timestamp'] or '未知'}"
+        )
+    else:
+        _code_update_append_log(
+            "[fetch] 更新前服务基线：无法读取 systemd 服务信息，本次将采用降级核验"
+        )
     if not (install_dir / ".git").exists():
         return fail("fetch", "当前安装目录不是 Git 仓库", "缺少 .git，无法通过 Git 更新", needs_terminal=True)
     try:
@@ -1556,6 +1799,53 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
                     return fail("check", "临时工作区检查失败", cmd_tail(checked) or "install.sh 语法检查失败")
         except Exception as exc:
             return fail("check", "临时工作区检查失败", f"语法检查失败：{exc}")
+        # 1.2.5: main-vs-Release consistency (cross-version audit risk
+        # B). check_update compares against the latest Release tag,
+        # but this updater installs main HEAD; if main has moved past
+        # the latest formal release, installing would silently ship
+        # unpublished code. Mismatch (or an unverifiable latest
+        # release, including GitHub being unreachable) aborts BEFORE
+        # checkout: nothing has been overwritten, so no rollback.
+        main_version_file = tmp_dir / "VERSION"
+        if main_version_file.exists():
+            main_version_text = main_version_file.read_text(encoding="utf-8").strip()
+            try:
+                main_version = ".".join(
+                    str(part) for part in parse_release_version(main_version_text)
+                )
+            except ValueError:
+                return fail(
+                    "check", "临时工作区检查失败",
+                    f"main 分支 VERSION 无法解析：{main_version_text}",
+                )
+            release_info = None
+            release_error = ""
+            try:
+                release_info = (release_check or check_latest_release)()
+            except Exception as exc:
+                release_error = str(exc)
+            if not isinstance(release_info, dict) or not release_info.get("ok"):
+                detail = f"（{release_error}）" if release_error else ""
+                return fail(
+                    "check", "临时工作区检查失败",
+                    f"无法核对最新正式版{detail}，已中止更新，请稍后重试",
+                )
+            if release_info.get("no_release"):
+                return fail(
+                    "check", "临时工作区检查失败",
+                    "仓库尚未发布正式版，已中止更新",
+                )
+            latest_version = str(release_info.get("latest_version") or "")
+            if main_version != latest_version:
+                return fail(
+                    "check", "临时工作区检查失败",
+                    f"main 版本 {main_version} 与最新正式版 {latest_version} 不一致，"
+                    "可能含未发布代码，已中止更新，请等正式版发布",
+                )
+        else:
+            _code_update_append_log(
+                "[check] 临时工作区缺少 VERSION 文件，main 与正式版一致性校验跳过"
+            )
     finally:
         if tmp_dir is not None:
             try:
@@ -1564,19 +1854,46 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
                 pass
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    rollback_install_results: list = []
+
     def rollback(old_sha: str) -> bool:
         try:
             run(["git", "checkout", "-B", CODE_UPDATE_BRANCH, old_sha], install_dir, 120)
             run(["git", "reset", "--hard", old_sha], install_dir, 120)
             env = dict(os.environ)
             env["AIMILIVPN_NONINTERACTIVE"] = "1"
-            run(["bash", "install.sh"], install_dir, 600, env)
+            rollback_install_results.append(
+                run(["bash", "install.sh"], install_dir, 600, env)
+            )
             return True
         except Exception:
             return False
 
-    def fail_after_checkout(stage, message, error, target_version):
+    def fail_after_checkout(stage, message, error, target_version, terminal_hint=""):
         rolled_back = rollback(local_sha)
+        # 1.2.5: the rollback reinstall's output is traced like the
+        # forward install's, so a failed recovery stays diagnosable.
+        for rollback_result in rollback_install_results:
+            rollback_tail = _code_update_install_output_tail(rollback_result)
+            if rollback_tail:
+                _code_update_append_log(f"[rollback] 回滚安装输出尾部：\n{rollback_tail}")
+        if rolled_back and terminal_hint:
+            # The caller knows a plain reinstall cannot prove recovery
+            # (e.g. the service process was never replaced): if the
+            # process is STILL the pre-update one after the rollback,
+            # only a terminal restart can move forward -- say so
+            # instead of reporting a clean rollback.
+            verdict, _verdict_detail = _code_update_service_freshness(
+                run, install_dir, service_baseline
+            )
+            if verdict == "stale":
+                note = f"{error}；已回滚到更新前提交并重装，但{terminal_hint}"
+                write_code_update_status(
+                    "failed", stage, message, current_version, target_version,
+                    error=note, needs_terminal=True,
+                )
+                log_to_json("ERROR", "CodeUpdate", f"面板更新失败[{stage}] {message}：{note}")
+                return False
         if rolled_back:
             note = f"{error}；已回滚到更新前提交并重装重启"
             write_code_update_status(
@@ -1630,12 +1947,23 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
         installed = run(["bash", "install.sh"], install_dir, 600, env)
     except Exception as exc:
         return fail_after_checkout("install", "重新安装失败", str(exc), target_version)
+    # 1.2.5: the install output is ALWAYS traced (success or failure)
+    # to the update log, and excerpted into the status log tail below;
+    # the 1.2.4 false success was undiagnosable precisely because a
+    # successful install left no trace of why its restart did nothing.
+    install_tail = _code_update_install_output_tail(installed)
+    if install_tail:
+        _code_update_append_log(f"[install] 安装脚本输出尾部：\n{install_tail}")
     if installed.returncode != 0:
         return fail_after_checkout(
             "install", "重新安装失败", cmd_tail(installed) or "install.sh 执行失败", target_version
         )
+    health_extra_lines = None
+    if install_tail:
+        health_extra_lines = ["安装输出尾部节选："] + install_tail.splitlines()[-5:]
     if not write_code_update_status(
-        "running", "health", "正在等待新面板响应…", current_version, target_version
+        "running", "health", "正在等待新面板响应…", current_version, target_version,
+        extra_log_lines=health_extra_lines,
     ).get("status_ok", False):
         # Install already ran and the service restarted: roll back
         # rather than proceed unverified.
@@ -1649,8 +1977,41 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None) ->
             "health", "新面板版本与目标不一致",
             f"VERSION 文件为 {live_version}，目标为 {target_version}", target_version,
         )
+    # 1.2.5 health layer (c): the running process must demonstrably be
+    # the post-install one. A reachable panel + matching on-disk
+    # VERSION is exactly what the OLD process also satisfies, so on
+    # their own they proved nothing (the 1.2.4 false success).
+    freshness, freshness_detail = _code_update_service_freshness(
+        run, install_dir, service_baseline
+    )
+    degraded_verification = False
+    if freshness == "stale":
+        return fail_after_checkout(
+            "health", "新服务进程未生效",
+            f"面板已响应且磁盘版本为 {target_version}，但{freshness_detail}，判定更新未真正生效",
+            target_version,
+            terminal_hint="服务重启未生效，请用终端 ml restart 或 systemctl restart aimilivpn 后核对版本",
+        )
+    if freshness == "unknown":
+        # Degraded path: no systemd process proof is available, so the
+        # verdict rests on the panel's HTTP stack actually answering
+        # plus the version match above -- and is labelled degraded in
+        # the result instead of masquerading as a full verification.
+        degraded_verification = True
+        http_check = panel_http_check or _code_update_panel_http_responds
+        if not http_check(host, port, CODE_UPDATE_DEGRADED_HTTP_TIMEOUT_SECONDS):
+            return fail_after_checkout(
+                "health", "新面板未在规定时间内响应",
+                "降级核验失败：面板 HTTP 未返回任何响应", target_version,
+            )
+        _code_update_append_log(
+            f"[health] 降级核验：{freshness_detail}；已以面板 HTTP 响应与磁盘版本完成核验"
+        )
+    success_message = f"更新完成，当前版本 {target_version}"
+    if degraded_verification:
+        success_message += "（降级核验：未能读取服务进程信息，已以面板响应与磁盘版本核验）"
     if not write_code_update_status(
-        "success", "done", f"更新完成，当前版本 {target_version}", current_version, target_version
+        "success", "done", success_message, current_version, target_version
     ).get("status_ok", False):
         # Health passed and the version matches: the update is verified
         # good, so rolling it back because its success record failed
@@ -1804,6 +2165,16 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "consecutive_failures": 0,
         "last_success_at": 0,
         "iplark_score": None,
+        # 1.2.5 stage 4 display-only risk score (FFraud); see
+        # RISK_DISPLAY_DEFAULTS. Keys are spelled out here because
+        # node dicts are serialized to nodes.json verbatim.
+        "risk_display_score": None,
+        "risk_display_level": "",
+        "risk_display_checked_at": 0,
+        "risk_display_connection_type": "",
+        "risk_display_flags": [],
+        "risk_display_reason": "",
+        "risk_display_error": "",
     }
 
 def api_network_sources() -> list[tuple[str, str]]:
@@ -2467,6 +2838,243 @@ def connection_ready_for_ui(state: dict[str, Any] | None = None) -> bool:
         and current.get("proxy_ok")
         and not current.get("is_connecting")
     )
+
+# ---------------------------------------------------------------------------
+# 1.2.5 stage 4: manual FFraud risk-score lookup (display-only, plan §三)
+#
+# The score is fetched only when the user clicks a node's 查评分 button
+# (POST /api/check_score): exactly one direct HTTPS request for that one
+# IP, no queue, no worker thread, no automatic recheck. Results are
+# stored in the node's risk_display_* fields; composite_node_score()
+# never reads them (the iplark_score hook stays None), so checking a
+# score cannot change selection ordering.
+# ---------------------------------------------------------------------------
+
+# Failure categories recorded in risk_display_error and shown in the UI.
+RISK_ERROR_TARGET_INVALID = "目标无效"
+RISK_ERROR_NETWORK = "网络失败"
+RISK_ERROR_REJECTED = "对方拒绝"
+RISK_ERROR_BAD_RESPONSE = "响应异常"
+
+
+class RiskScoreFetchError(RuntimeError):
+    """A FFraud lookup failure carrying its display category."""
+
+    def __init__(self, category: str, detail: str = "") -> None:
+        super().__init__(f"{category}：{detail}" if detail else category)
+        self.category = category
+        self.detail = detail
+
+
+def _validate_public_ip_literal(value: Any) -> str:
+    """Return the canonical literal if `value` is a public IP, else raise.
+
+    FFraud answers even garbage input with success + score 0 (verified
+    2026-11-05: "notanip" was called a home internet address), so the
+    panel must refuse to send anything that is not a literal public IP.
+    Non-literals (hostnames) and private / reserved / loopback /
+    link-local / multicast / unspecified addresses are rejected before
+    any request is made.
+    """
+    text = str(value or "").strip()
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        raise RiskScoreFetchError(
+            RISK_ERROR_TARGET_INVALID, f"不是合法 IP 字面量：{text or '(空)'}"
+        ) from None
+    if not addr.is_global:
+        raise RiskScoreFetchError(
+            RISK_ERROR_TARGET_INVALID, f"不是公网 IP：{text}"
+        )
+    return str(addr)
+
+
+def parse_ffraud_response(payload: Any, target_ip: str) -> dict[str, Any]:
+    """Validate a FFraud JSON payload and map it to risk_display_* fields.
+
+    Every guard from the verification record is enforced: the payload
+    must be an object with success == True, fraud_score must be a real
+    number in 0..100 (bool is not a number), and the echoed ip must
+    match the requested one. Any violation raises RiskScoreFetchError
+    with category 响应异常; nothing is ever guessed.
+    """
+    if not isinstance(payload, dict):
+        raise RiskScoreFetchError(RISK_ERROR_BAD_RESPONSE, "响应不是 JSON 对象")
+    if payload.get("success") is not True:
+        raise RiskScoreFetchError(RISK_ERROR_BAD_RESPONSE, "响应 success 不为 true")
+    score = payload.get("fraud_score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        raise RiskScoreFetchError(RISK_ERROR_BAD_RESPONSE, "fraud_score 不是数值")
+    if not 0 <= float(score) <= 100:
+        raise RiskScoreFetchError(RISK_ERROR_BAD_RESPONSE, f"fraud_score 越界：{score}")
+    if str(payload.get("ip") or "") != target_ip:
+        raise RiskScoreFetchError(
+            RISK_ERROR_BAD_RESPONSE,
+            f"响应 IP 与请求不一致：{payload.get('ip')!r} != {target_ip}",
+        )
+    flags = [
+        label for field, label in FFRAUD_FLAG_LABELS if payload.get(field) is True
+    ]
+    return {
+        "risk_display_score": score,
+        "risk_display_level": str(payload.get("risk") or ""),
+        "risk_display_connection_type": str(payload.get("connection_type") or ""),
+        "risk_display_flags": flags,
+        "risk_display_reason": str(payload.get("reason") or ""),
+    }
+
+
+def _ffraud_build_opener() -> urllib.request.OpenerDirector:
+    """Build the direct (proxy-bypassing) opener for FFraud lookups.
+
+    A named seam so tests can inject a fake opener and never touch the
+    network (patching urllib.request.build_opener itself would be
+    process-global and could hijack unrelated HTTP clients).
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def fetch_ffraud_score(
+    target_ip: str, timeout: int = FFRAUD_FETCH_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    """Fetch one IP's risk score from FFraud (direct, single attempt).
+
+    The target is strictly validated as a public IP literal BEFORE any
+    request. The opener bypasses all proxies (ProxyHandler({})), so the
+    lookup leaves from the panel machine's own network and never via
+    the node being checked. Raises RiskScoreFetchError with a display
+    category on every failure path.
+    """
+    validated_ip = _validate_public_ip_literal(target_ip)
+    url = FFRAUD_API_URL_TEMPLATE.format(
+        ip=urllib.parse.quote(validated_ip, safe="")
+    )
+    # Direct opener: ProxyHandler({}) bypasses any proxy env so the check
+    # never goes through the node under test (or the local proxy).
+    opener = _ffraud_build_opener()
+    request = urllib.request.Request(
+        url, headers={"User-Agent": f"Mozilla/5.0 AimiliVPN/{APP_VERSION}"}
+    )
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            status = getattr(response, "status", 200)
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raise RiskScoreFetchError(
+            RISK_ERROR_REJECTED, f"FFraud HTTP {exc.code}"
+        ) from exc
+    except Exception as exc:
+        raise RiskScoreFetchError(
+            RISK_ERROR_NETWORK, f"FFraud 请求失败：{exc}"
+        ) from exc
+    if status != 200:
+        raise RiskScoreFetchError(RISK_ERROR_REJECTED, f"FFraud HTTP {status}")
+    try:
+        payload = json.loads(
+            raw.decode("utf-8", errors="replace")
+            if isinstance(raw, (bytes, bytearray))
+            else str(raw)
+        )
+    except (ValueError, TypeError) as exc:
+        raise RiskScoreFetchError(
+            RISK_ERROR_BAD_RESPONSE, "响应不是合法 JSON"
+        ) from exc
+    return parse_ffraud_response(payload, validated_ip)
+
+
+# In-flight guard for check_score: one lookup per node at a time. The
+# request handler is synchronous, so a set + lock is enough -- entries
+# live only for the duration of one fetch and no thread is spawned.
+_risk_check_inflight: set[str] = set()
+_risk_check_inflight_lock = threading.Lock()
+
+
+def _risk_check_begin(node_id: str) -> bool:
+    with _risk_check_inflight_lock:
+        if node_id in _risk_check_inflight:
+            return False
+        _risk_check_inflight.add(node_id)
+        return True
+
+
+def _risk_check_end(node_id: str) -> None:
+    with _risk_check_inflight_lock:
+        _risk_check_inflight.discard(node_id)
+
+
+def check_node_risk_score(node_id: str) -> dict[str, Any]:
+    """Run one manual risk-score lookup for a node and persist the result.
+
+    Returns {"ok": True, "node": <updated row>} on success, {"ok": False,
+    "error": <category>, "detail": ..., "node": <row or None>} on
+    failure. The target IP is read under the node-table lock; the fetch
+    itself runs WITHOUT the lock (one request thread waits, the rest of
+    the panel does not); the write-back re-locates the row under the
+    lock and is merged only if the row's IP still matches the one that
+    was queried -- otherwise the result is discarded as a failure. On
+    failure only checked_at + the error category are written; any
+    previously fetched score is kept untouched.
+    """
+    with lock:
+        row = next((n for n in read_nodes() if str(n.get("id")) == node_id), None)
+        if row is None:
+            raise ValueError(f"节点不存在：{node_id}")
+        target_ip = str(row.get("ip") or row.get("remote_host") or "")
+
+    fetched: dict[str, Any] | None = None
+    error_category = ""
+    error_detail = ""
+    try:
+        fetched = fetch_ffraud_score(target_ip)
+    except RiskScoreFetchError as exc:
+        error_category = exc.category
+        error_detail = exc.detail
+
+    checked_at = time.time()
+    with lock:
+        nodes = read_nodes()
+        current = next(
+            (n for n in nodes if str(n.get("id")) == node_id), None
+        )
+        if current is None:
+            raise ValueError(f"节点不存在：{node_id}")
+        current_ip = str(current.get("ip") or current.get("remote_host") or "")
+        if fetched is not None and current_ip != target_ip:
+            # The row was re-created for a different IP while the fetch
+            # was in flight; the score belongs to the old address.
+            fetched = None
+            error_category = RISK_ERROR_BAD_RESPONSE
+            error_detail = "查询期间节点 IP 已变化，结果已丢弃"
+        if fetched is not None:
+            current.update(fetched)
+            current["risk_display_checked_at"] = checked_at
+            current["risk_display_error"] = ""
+        else:
+            current["risk_display_checked_at"] = checked_at
+            current["risk_display_error"] = error_category
+        write_json(NODES_FILE, nodes)
+        updated = dict(current)
+
+    if fetched is not None:
+        log_to_json(
+            "INFO",
+            "RiskScore",
+            f"风险分查询成功：{node_id}（{target_ip}）分数 {fetched['risk_display_score']}",
+        )
+        return {"ok": True, "node": updated}
+    log_to_json(
+        "WARNING",
+        "RiskScore",
+        f"风险分查询失败：{node_id}（{target_ip}）{error_category} {error_detail}",
+    )
+    return {
+        "ok": False,
+        "error": error_category,
+        "detail": error_detail,
+        "node": updated,
+    }
+
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     available_nodes = sorted(
@@ -4045,6 +4653,11 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
         # eligible for the observing pool.
         fav_ids = set(load_ui_config().get("favorite_node_ids", []))
         retention_ui_cfg = load_ui_config()
+        # 1.2.5 retained-pool mechanism switch: while OFF, a disappeared
+        # non-favorite node is archived at once instead of entering the
+        # observing pool (favorites are exempt, exactly as when ON), and
+        # the 12h liveness sweep below is skipped entirely.
+        retained_pool_enabled = bool(retention_ui_cfg.get("retained_pool_enabled", True))
 
         with lock:
             current_nodes = read_nodes()
@@ -4088,6 +4701,13 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
                             "consecutive_failures",
                             "last_success_at",
                             "iplark_score",
+                            "risk_display_score",
+                            "risk_display_level",
+                            "risk_display_checked_at",
+                            "risk_display_connection_type",
+                            "risk_display_flags",
+                            "risk_display_reason",
+                            "risk_display_error",
 
                         ]:
                             if previous.get(key) not in (None, ""):
@@ -4121,6 +4741,12 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
                     old["source_present"] = 0
                     merged.append(old)
                     seen_ids.add(oid)
+                    continue
+                if not retained_pool_enabled:
+                    # 1.2.5 pool-off gate: no observing pool at all, so a
+                    # disappeared node goes straight to the archive via
+                    # the same channel as the 1.2.1 retention filter.
+                    archive_entries.append((old, "retained-pool-disabled-vanish"))
                     continue
                 if not retention_eligible(old, retention_ui_cfg):
                     archive_entries.append((old, "retention-filter-non-matching"))
@@ -4166,15 +4792,19 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
             ip_enrichment_wakeup.set()
 
         # Phase 1 retention: liveness sweep, at most once per interval.
-        try:
-            last_sweep = float(get_state().get("last_retained_sweep_at") or 0)
-        except Exception:
-            last_sweep = 0
-        if time.time() - last_sweep >= RETAINED_LIVENESS_SWEEP_SECONDS:
-            swept = sweep_retained_nodes(nodes=current_nodes)
-            set_state(last_retained_sweep_at=time.time())
-            if swept:
-                log_to_json("INFO", "Main", f"保留池存活清理：归档并删除 {swept} 个失效节点")
+        # 1.2.5: with the mechanism OFF the sweep is skipped entirely and
+        # last_retained_sweep_at is left untouched (not rescheduled):
+        # there are no observing nodes to probe.
+        if retained_pool_enabled:
+            try:
+                last_sweep = float(get_state().get("last_retained_sweep_at") or 0)
+            except Exception:
+                last_sweep = 0
+            if time.time() - last_sweep >= RETAINED_LIVENESS_SWEEP_SECONDS:
+                swept = sweep_retained_nodes(nodes=current_nodes)
+                set_state(last_retained_sweep_at=time.time())
+                if swept:
+                    log_to_json("INFO", "Main", f"保留池存活清理：归档并删除 {swept} 个失效节点")
 
         initial_tested_ids: set[str] = set()
         fast_results: list[dict[str, Any]] = []
@@ -5684,6 +6314,20 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 250px;
       padding: 6px;
     }
+    /* 1.2.5 plan §1.5 (option A): the two update actions share one
+       row inside the dropdown; everything else keeps the stacked
+       dropdown layout. */
+    .update-action-row {
+      display: flex;
+      gap: 6px;
+    }
+    .update-action-row button {
+      flex: 1 1 0;
+      width: auto;
+      min-width: 0;
+      justify-content: center;
+      padding: 10px 6px;
+    }
     .version-current {
       padding: 9px 10px 10px;
       margin-bottom: 4px;
@@ -5880,14 +6524,15 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.2.4 正式版</span>
+        <span id="github_version_label">V1.2.5 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.2.4 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.2.5 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
+        <div class="update-action-row">
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
           <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
           检测更新
@@ -5896,6 +6541,7 @@ INDEX_HTML = r"""<!doctype html>
           <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
           一键更新
         </button>
+        </div>
         <a href="https://github.com/liulangdegezi/aimili-vpngate-plus/tree/main" target="_blank" rel="noopener noreferrer">GitHub main 主分支</a>
         <a href="https://github.com/liulangdegezi/aimili-vpngate-plus/blob/main/CHANGELOG.md" target="_blank" rel="noopener noreferrer">版本升级日志</a>
         <div id="update_check_status" class="update-check-status" role="status" aria-live="polite">点击“检测更新”查询 GitHub 最新正式版。</div>
@@ -5991,6 +6637,10 @@ INDEX_HTML = r"""<!doctype html>
       <input id="show_retained_pool_ips" type="checkbox" checked onchange="toggleRetainedPoolVisibility(this)">
       <span>显示保留池IP</span>
     </label>
+    <label class="toolbar-btn" for="retained_pool_enabled" title="保留池机制开关。关闭后：消失的节点直接归档删除、不再保留观察；已在观察期的节点立即归档清表；收藏节点不受影响。与「显示保留池IP」不同，这个开关关闭的是保留机制本身，适合低规格服务器。" style="height: 42px; gap: 6px; display: inline-flex; align-items: center; cursor: pointer;">
+      <input id="retained_pool_enabled" type="checkbox" checked onchange="toggleRetainedPoolEnabled(this)">
+      <span>保留池</span>
+    </label>
   </section>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
@@ -6029,7 +6679,7 @@ INDEX_HTML = r"""<!doctype html>
             <th>物理位置</th>
             <th>运营主体 / ISP</th>
             <th style="width: 110px;">IP 类型</th>
-            <th style="width: 90px;">iplark 评分</th>
+            <th style="width: 90px;">风险分</th>
             <th style="width: 230px;">操作</th>
           </tr>
         </thead>
@@ -6340,6 +6990,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
 const favoriteRequestIds = new Set();
+const scoreRequestIds = new Set();
 let disconnectInFlight = false;
 let currentPage = 1;
 const pageSize = 50;
@@ -6733,7 +7384,8 @@ function stableSortNodes() {
 
 function render(){
   updateRetainedPoolVisibilityUI();
-  const versionLabel = state.app_version_label || "V1.2.4 正式版";
+  updateRetainedPoolEnabledUI();
+  const versionLabel = state.app_version_label || "V1.2.5 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -6931,6 +7583,12 @@ function render(){
         : `<button class="connect-btn" ${(isUnavailable || isTesting || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">${isPending ? '切换中' : '切换'}</button>`;
       
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
+      const riskTitle = riskScoreTitle(n);
+      const scoreBusy = scoreRequestIds.has(n.id);
+      const scoreBtn = scoreBusy
+        ? `<button class="test-btn" disabled style="padding: 0 8px; height: 30px;">查询中…</button>`
+        : `<button class="test-btn" style="padding: 0 8px; height: 30px;" onclick="checkNodeScore('${esc(n.id)}', event)">查评分</button>`;
+
       const isFav = favoriteIds.includes(n.id);
       const favoriteBusy = favoriteRequestIds.has(n.id);
       const favBtn = isFav 
@@ -6944,12 +7602,12 @@ function render(){
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
         <td style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(ipTypeTitle)}">${esc(translateIpType(n.ip_type))}</td>
-        <td style="white-space: nowrap;">${(n.iplark_score === null || n.iplark_score === undefined) ? "—" : esc(n.iplark_score)}</td>
+        <td style="white-space: nowrap;" title="${esc(riskTitle)}">${(n.risk_display_score === null || n.risk_display_score === undefined) ? "—" : esc(n.risk_display_score)}</td>
         <td>
           <div class="table-actions">
             ${testBtn}
             ${favBtn}
-            <button class="test-btn" disabled title="暂未启用" style="padding: 0 8px; height: 30px;">查评分</button>
+            ${scoreBtn}
             ${connectBtn}
           </div>
         </td>
@@ -6985,6 +7643,58 @@ $("btn_last_page").onclick = () => {
   currentPage = totalPages;
   render();
 };
+
+function riskScoreTitle(n) {
+  const checked = n.risk_display_checked_at ? new Date(n.risk_display_checked_at * 1000).toLocaleString() : "";
+  if (n.risk_display_error) {
+    return `查询失败：${n.risk_display_error}${checked ? "（" + checked + "）" : ""}。来源：FFraud。此分数只作为参考`;
+  }
+  if (n.risk_display_score === null || n.risk_display_score === undefined) {
+    return "尚未查询。点击「查评分」从 FFraud 拉取该 IP 的风险分（0–100，越高越危险）。此分数只作为参考。";
+  }
+  const parts = [`风险分 ${n.risk_display_score}（0–100，越高越危险）`];
+  if (n.risk_display_level) parts.push(`档位：${n.risk_display_level}`);
+  if (checked) parts.push(`查询时间：${checked}`);
+  if (n.risk_display_connection_type) parts.push(`连接类型：${n.risk_display_connection_type}`);
+  const flags = Array.isArray(n.risk_display_flags) ? n.risk_display_flags : [];
+  if (flags.length) parts.push(`标记：${flags.join("、")}`);
+  if (n.risk_display_reason) {
+    const reason = String(n.risk_display_reason);
+    parts.push(`说明：${reason.length > 200 ? reason.slice(0, 200) + "…" : reason}`);
+  }
+  parts.push("来源：FFraud");
+  parts.push("此分数只作为参考");
+  return parts.join("；");
+}
+
+async function checkNodeScore(id, event) {
+  if (event) event.stopPropagation();
+  if (scoreRequestIds.has(id)) return;
+  scoreRequestIds.add(id);
+  render();
+  try {
+    const response = await fetchWithTimeout("./api/check_score", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id })
+    }, 25000);
+    const result = await readJsonResponse(response, "风险分查询失败");
+    if (result.node) {
+      const idx = nodes.findIndex(n => n && n.id === id);
+      if (idx !== -1) {
+        nodes[idx] = result.node;
+      }
+    }
+    if (!result.ok) {
+      alert("风险分查询失败：" + (result.error || "未知错误") + (result.detail ? "（" + result.detail + "）" : ""));
+    }
+  } catch (e) {
+    alert("风险分查询失败: " + (e.message || "未知错误"));
+  } finally {
+    scoreRequestIds.delete(id);
+    render();
+  }
+}
 
 async function testNode(btn, id, event){
   if (event) event.stopPropagation();
@@ -7064,6 +7774,7 @@ async function fetchNodesSnapshot() {
       nodes: Array.isArray(retainedData.retained) ? retainedData.retained : [],
       state: mainData.state || {},
       show_retained_pool_ips: mainData.show_retained_pool_ips,
+      retained_pool_enabled: mainData.retained_pool_enabled,
     };
   })();
   nodesRequestPromise = request;
@@ -7352,7 +8063,7 @@ async function checkForUpdate(event) {
       if (result.deployment_mode === "docker") {
         statusBox.textContent = `发现正式版 ${result.latest_tag}。请在 VPS 执行：${result.update_command}`;
       } else {
-        statusBox.textContent = `发现正式版 ${result.latest_tag}。请执行：${result.update_command}`;
+        statusBox.textContent = `检测到新版本 ${result.latest_tag}，请点击一键更新，或者登录后台用 ml 命令更新。`;
       }
     } else {
       statusBox.className = "update-check-status current";
@@ -7619,6 +8330,62 @@ async function toggleRetainedPoolVisibility(input) {
 function updateRetainedPoolVisibilityUI() {
   const input = $("show_retained_pool_ips");
   if (input) input.checked = !state || state.show_retained_pool_ips !== false;
+}
+
+// 1.2.5 retained-pool mechanism switch. Disabling asks first (the
+// confirm carries the current observing count from /api/retained) and
+// the server purges immediately; enabling only persists the flag.
+async function toggleRetainedPoolEnabled(input) {
+  const enabled = !!input.checked;
+  if (!enabled) {
+    let observingCount = 0;
+    try {
+      const retainedResponse = await fetchWithTimeout("./api/retained", { cache: "no-store" }, 20000);
+      const retainedData = await readJsonResponse(retainedResponse, "读取保留池状态失败");
+      observingCount = retainedData.retained_count || 0;
+    } catch (e) {
+      observingCount = nodes.filter(n => n && n.retention_status === "observing").length;
+    }
+    const confirmed = confirm(`关闭保留池将立即归档并移除当前 ${observingCount} 个观察期节点，之后消失的节点直接归档删除、不再保留；收藏节点不受影响。确定关闭？`);
+    if (!confirmed) {
+      input.checked = true;
+      return;
+    }
+  }
+  state.retained_pool_enabled = enabled;
+  try {
+    const response = await fetchWithTimeout("./api/update_retained_pool", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ retained_pool_enabled: enabled })
+    }, 20000);
+    const result = await readJsonResponse(response, "保存保留池开关失败");
+    if (!result.ok) throw new Error(result.error || "保存保留池开关失败");
+    state.retained_pool_enabled = result.retained_pool_enabled === true;
+    if (result.message) alert(result.message);
+    await load();
+  } catch (e) {
+    alert("保存保留池开关失败: " + (e.message || "未知错误"));
+    await load();
+  }
+}
+
+function updateRetainedPoolEnabledUI() {
+  const input = $("retained_pool_enabled");
+  if (input) input.checked = !state || state.retained_pool_enabled !== false;
+  // 1.2.5: while the mechanism is OFF the display toggle has nothing
+  // to filter, so it is greyed out and labelled as such.
+  const poolOff = !!state && state.retained_pool_enabled === false;
+  const displayInput = $("show_retained_pool_ips");
+  if (displayInput) {
+    displayInput.disabled = poolOff;
+    const label = displayInput.closest("label");
+    if (label) {
+      label.title = poolOff ? "保留池已关闭" : "";
+      label.style.opacity = poolOff ? "0.55" : "";
+      label.style.cursor = poolOff ? "not-allowed" : "pointer";
+    }
+  }
 }
 
 function updateRetainedButtonUI() {
@@ -8643,6 +9410,9 @@ class Handler(BaseHTTPRequestHandler):
                 "nodes": stripped_nodes,
                 "state": get_state(),
                 "show_retained_pool_ips": show_retained_pool_ips,
+                "retained_pool_enabled": bool(
+                    connection_state.get("retained_pool_enabled", True)
+                ),
             })
         elif effective_path == "/api/retained":
             # Phase 1 retained-pool overview: observing nodes + archive count.
@@ -8996,6 +9766,44 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
+        elif effective_path == "/api/update_retained_pool":
+            # 1.2.5 retained-pool mechanism switch. Turning it OFF runs
+            # the ordered purge in disable_retained_pool() (persist the
+            # flag first, then batch-archive + clear under the table
+            # lock); turning it ON only persists the flag and never
+            # restores archived nodes.
+            try:
+                payload = self.read_json_body()
+                enabled = payload.get("retained_pool_enabled")
+                if not isinstance(enabled, bool):
+                    raise ValueError("保留池开关必须是布尔值")
+                if enabled:
+                    persist_retained_pool_enabled(True)
+                    self.send_json({
+                        "ok": True,
+                        "retained_pool_enabled": True,
+                        "archived": 0,
+                        "kept_favorites": 0,
+                        "message": "保留池已开启",
+                    })
+                else:
+                    outcome = disable_retained_pool()
+                    self.send_json({
+                        "ok": True,
+                        "retained_pool_enabled": False,
+                        "archived": outcome["archived"],
+                        "kept_favorites": outcome["kept_favorites"],
+                        "message": (
+                            f"保留池已关闭，已归档移除 {outcome['archived']} 个观察期节点，"
+                            f"{outcome['kept_favorites']} 个收藏节点保留"
+                        ),
+                    })
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
         elif effective_path == "/api/update_settings":
             try:
                 payload = self.read_json_body()
@@ -9308,6 +10116,50 @@ class Handler(BaseHTTPRequestHandler):
                     args=(previous_node_id,),
                     daemon=True,
                 ).start()
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/check_score":
+            # 1.2.5 stage 4: manual per-node risk-score lookup (FFraud).
+            # Display-only; one synchronous fetch on this request thread.
+            # Response form follows the /api/test_node convention:
+            # success -> 200 {"ok": True, "node": row}; fetch failure ->
+            # 200 {"ok": False, "error": <category>, "detail": ...,
+            # "node": row} (the failure state was persisted and the UI
+            # re-renders from the row); duplicate in-flight -> 409
+            # {"ok": False, "error": "正在查询", ...}; bad request /
+            # unknown node -> 400.
+            try:
+                payload = self.read_json_body()
+                node_id = str(payload.get("id") or "")
+                if not node_id.strip():
+                    self.send_json({"ok": False, "error": "节点 ID 不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if not _risk_check_begin(node_id):
+                    self.send_json(
+                        {"ok": False, "error": "正在查询", "detail": "该节点的风险分查询正在进行中"},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                try:
+                    outcome = check_node_risk_score(node_id)
+                finally:
+                    _risk_check_end(node_id)
+                if outcome["ok"]:
+                    node_out = dict(outcome["node"])
+                    node_out.pop("config_text", None)
+                    self.send_json({"ok": True, "node": node_out})
+                else:
+                    node_out = dict(outcome["node"]) if outcome.get("node") else None
+                    if node_out is not None:
+                        node_out.pop("config_text", None)
+                    self.send_json({
+                        "ok": False,
+                        "error": outcome["error"],
+                        "detail": outcome.get("detail", ""),
+                        "node": node_out,
+                    })
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_node":
             try:
