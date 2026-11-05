@@ -3190,9 +3190,12 @@ class Plus125Stage4RiskScoreTests(unittest.TestCase):
     in this class ever leaves the machine.
     """
 
+    # Fixtures live inside the repo (tests/fixtures/ffraud_samples) so
+    # the suite is self-contained anywhere it is checked out; the
+    # pre-1.2.5 path pointed outside the repo at the developer's goal
+    # hidden_files and failed in CI with FileNotFoundError.
     SAMPLES_DIR = (
-        Path(manager.ROOT_DIR).resolve().parent.parent
-        / "hidden_files" / "ffraud_samples"
+        Path(__file__).resolve().parent / "fixtures" / "ffraud_samples"
     )
 
     def setUp(self) -> None:
