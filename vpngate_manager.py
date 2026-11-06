@@ -212,7 +212,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.2.6"
+DEFAULT_APP_VERSION = "1.2.7"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -274,6 +274,17 @@ _retained_count_cache: dict[str, Any] = {"key": None, "count": 0}
 connection_attempt_lock = threading.Lock()
 background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
+# 1.2.7 stage 2 (plan §二.1/§二.3): connection-priority signal. Set by
+# begin_connection_attempt() for the whole lifetime of a connection
+# attempt (cleared by finish_connection_attempt(), which connect_node
+# runs from its finally on every exit path) and read by every probe
+# batch: test_multiple_nodes stops between batches while it is set,
+# and maintenance / background refill must not start a new probe batch
+# (fast test, periodic test, full sweep, retained liveness sweep)
+# while it is set. A plain Event: setting/clearing never blocks, so it
+# cannot deadlock with maintenance_lock or the global RLock, and the
+# connection path itself never waits on it.
+connection_priority_event = threading.Event()
 background_refill_thread: threading.Thread | None = None
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
@@ -1827,6 +1838,7 @@ def _code_update_ui_host_port() -> tuple[str, int]:
 def _code_update_parse_systemd_show(text: str) -> dict[str, Any]:
     pid = 0
     enter_timestamp = ""
+    start_monotonic_us = 0
     for line in str(text or "").splitlines():
         if line.startswith("MainPID="):
             try:
@@ -1835,7 +1847,20 @@ def _code_update_parse_systemd_show(text: str) -> dict[str, Any]:
                 pid = 0
         elif line.startswith("ActiveEnterTimestamp="):
             enter_timestamp = line.split("=", 1)[1].strip()
-    return {"pid": pid, "enter_timestamp": enter_timestamp}
+        elif line.startswith("ExecMainStartTimestampMonotonic="):
+            # 1.2.7: numeric microseconds since boot on the monotonic
+            # clock -- the one systemd timestamp that needs no timezone
+            # parsing to compare against file mtimes (see
+            # _code_update_process_disk_consistency).
+            try:
+                start_monotonic_us = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                start_monotonic_us = 0
+    return {
+        "pid": pid,
+        "enter_timestamp": enter_timestamp,
+        "start_monotonic_us": start_monotonic_us,
+    }
 
 
 def _code_update_read_service_state(run, cwd) -> dict[str, Any] | None:
@@ -1852,6 +1877,7 @@ def _code_update_read_service_state(run, cwd) -> dict[str, Any] | None:
             [
                 "systemctl", "show", CODE_UPDATE_SERVICE_NAME,
                 "--property=MainPID", "--property=ActiveEnterTimestamp",
+                "--property=ExecMainStartTimestampMonotonic",
             ],
             cwd, 30,
         )
@@ -1906,6 +1932,86 @@ def _code_update_service_freshness(run, cwd, baseline: dict[str, Any]) -> tuple[
     return "stale", f"服务进程未更换（MainPID 仍为 {current['pid']}，启动时间未变）"
 
 
+def _code_update_process_disk_consistency(run, cwd) -> tuple[str, str]:
+    """Prove (or disprove) that the running service process serves the
+    code currently on disk (1.2.7 plan §三.1, the front-loaded verdict).
+
+    Signal selection: the panel's version strings are not reachable
+    from the worker -- check_update needs a panel session, and the
+    state file's app_version is only as fresh as the panel's last
+    state write -- so the proof uses process physics instead. Python
+    loads its code once at process start; a process started AFTER the
+    on-disk code files were last written therefore runs exactly the
+    on-disk code, and a process started BEFORE a checkout rewrote
+    them demonstrably runs older code. The process start instant is
+    systemd's ExecMainStartTimestampMonotonic (numeric, no timezone
+    parsing), converted onto the wall clock with this process's own
+    monotonic reading; the disk instant is the newest mtime among
+    VERSION, install.sh, and the syntax-checked code files.
+
+    Returns (verdict, detail): "consistent" only when the proof
+    holds; "stale" when the process provably predates the disk code;
+    "unknown" when either side cannot be read. Callers must treat
+    "unknown" as NOT proven (never as consistent): an unprovable
+    "already latest" is exactly the false success this stage removes.
+    """
+    state = _code_update_read_service_state(run, cwd)
+    if state is None:
+        return "unknown", "无法读取服务进程信息"
+    start_us = int(state.get("start_monotonic_us") or 0)
+    if start_us <= 0:
+        return "unknown", "服务进程未提供单调时钟启动时刻"
+    code_mtime = 0.0
+    for name in ("VERSION", "install.sh", *CODE_UPDATE_CHECK_FILES):
+        try:
+            code_mtime = max(code_mtime, (Path(cwd) / name).stat().st_mtime)
+        except OSError:
+            continue
+    if code_mtime <= 0:
+        return "unknown", "无法读取磁盘代码文件时间"
+    process_started_at = time.time() - (time.monotonic() - start_us / 1_000_000)
+    started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(process_started_at))
+    code_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(code_mtime))
+    # Two seconds of slack absorb clock granularity between the
+    # monotonic conversion and the filesystem timestamps; a checkout
+    # that postdates the process start does so by minutes, not by
+    # the slack, in every observed false-success incident.
+    if process_started_at + 2 >= code_mtime:
+        return (
+            "consistent",
+            f"服务进程 MainPID={state['pid']} 启动于 {started_text}，"
+            f"不早于磁盘代码写入时间 {code_text}，运行的即当前磁盘代码",
+        )
+    return (
+        "stale",
+        f"服务进程 MainPID={state['pid']} 启动于 {started_text}，"
+        f"早于磁盘代码写入时间 {code_text}，运行的仍是旧代码",
+    )
+
+
+def _code_update_self_cgroup() -> str:
+    """This process's cgroup path ("" when unreadable).
+
+    The worker logs it at startup so a post-mortem can tell whether
+    the updater lived inside the service cgroup (and could therefore
+    be killed with the service) or in its own transient scope.
+    """
+    try:
+        text = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    fallback = ""
+    for line in text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        if parts[0] == "0":
+            return parts[2].strip()
+        if not fallback:
+            fallback = parts[2].strip()
+    return fallback
+
+
 def _code_update_install_output_tail(result) -> str:
     """Tail of an install run's combined output (1.2.5 plan §1.2.5):
     last ~200 lines, capped at ~16K characters, for the update log."""
@@ -1943,7 +2049,74 @@ def _code_update_panel_http_responds(host: str, port: int, timeout: int) -> bool
     return False
 
 
+def _code_update_try_acquire_worker_lock():
+    """Try to become the single live code-update worker (1.2.7 §三.4).
+
+    Returns (handle, contended): handle is an open file object whose
+    flock this process holds for the worker's whole run (closing it
+    releases the lock), or None when locking itself is unavailable on
+    this system -- a degraded mode the caller proceeds in, because a
+    missing lock must never block a legitimate update. contended is
+    True only when another LIVE worker demonstrably holds the lock:
+    flock is released by the OS when the holder dies, so a dead
+    worker (e.g. one killed with the service cgroup) never blocks
+    its own completion run. The lock file sits next to the update
+    status file so test redirection of the status path moves it too.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return None, False
+    try:
+        lock_path = CODE_UPDATE_STATUS_FILE.parent / "code_update.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+", encoding="utf-8")
+    except OSError:
+        return None, False
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None, True
+    except OSError:
+        handle.close()
+        return None, False
+    return handle, False
+
+
 def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, release_check=None, panel_http_check=None) -> bool:
+    """Public entry for the detached one-click code updater.
+
+    1.2.7: a single-instance guard wraps the worker. The panel-side
+    busy check (code_update_lock + running status) cannot see a
+    worker whose predecessor outlived the 30-minute stale window or
+    a worker started outside the panel; two live workers could then
+    interleave status writes and mistake each other's progress for
+    their own success. The flock guard closes that: a second worker
+    exits immediately, logs the contention, and -- critically --
+    writes NO status, so it can neither fake nor clobber the live
+    worker's record.
+    """
+    handle, contended = _code_update_try_acquire_worker_lock()
+    if contended:
+        _code_update_append_log(
+            "[starting] 已有另一个更新器进程正在运行，本更新器退出（未改动更新状态）"
+        )
+        log_to_json("WARNING", "CodeUpdate", "已有另一个更新器正在运行，本次更新器启动已退出")
+        return False
+    try:
+        return _run_code_update_worker_locked(
+            install_dir, runner, panel_healthy, release_check, panel_http_check
+        )
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+def _run_code_update_worker_locked(install_dir=None, runner=None, panel_healthy=None, release_check=None, panel_http_check=None) -> bool:
     """Detached one-click code updater (source + docker branches).
 
     Never called from the panel process itself; the panel spawns it via
@@ -1970,11 +2143,37 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, re
     explicitly instead of rolling back verified-good code. A log-only
     failure never aborts a stage: the status log_tail already carries
     the stage message, and the failure itself goes to stderr.
+    1.2.7 (plan §三): the "already latest" exit is two-conditioned --
+    sha equality AND the running process provably serving the on-disk
+    code (_code_update_process_disk_consistency). A stale or
+    unprovable process resumes the unfinished update from the install
+    stage (check/checkout skipped; failures are terminal-guided, not
+    rolled back -- there is no older tree on disk to restore). Every
+    install run is preceded by a "开始执行 install.sh" marker in the
+    update log, the worker logs its own PID/cgroup at startup, and
+    the public entry point holds a single-instance flock so two live
+    workers can never interleave verdicts.
     """
     install_dir = Path(install_dir) if install_dir is not None else ROOT_DIR
     run = runner or _code_update_default_runner
     healthy = panel_healthy or _code_update_panel_healthy
     current_version = _code_update_read_version(install_dir)
+
+    # 1.2.7: the worker's first act is a startup marker with its own
+    # PID and cgroup. Three false successes in a row left no trace of
+    # how the updater process lived or died; if this worker vanishes
+    # mid-update, the log now at least proves it started, and whether
+    # it was inside the service cgroup (killable with the service) or
+    # in its own scope when it died.
+    self_cgroup = _code_update_self_cgroup()
+    _code_update_append_log(
+        f"[starting] 更新器已启动：PID={os.getpid()}，cgroup={self_cgroup or '未知'}"
+    )
+    if self_cgroup and CODE_UPDATE_SERVICE_NAME in self_cgroup:
+        _code_update_append_log(
+            f"[starting] 警告：更新器仍在服务 {CODE_UPDATE_SERVICE_NAME} 的进程组内，"
+            "安装重启时可能被连带终止"
+        )
 
     def fail(stage, message, error, needs_terminal=False, target_version=""):
         write_code_update_status(
@@ -2042,6 +2241,11 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, re
             return True
         return fail("done", "新面板未在规定时间内响应", "健康检查超时", needs_terminal=True, target_version=current_version)
 
+    # 1.2.7: set when the sha-equal gate proves the disk tree is the
+    # target but the running process is not (or cannot be proven to
+    # be): the flow then completes the unfinished update from the
+    # install stage instead of reporting "already latest".
+    resume_incomplete_update = False
     if not write_code_update_status("running", "fetch", "正在拉取 main 分支…", current_version, "").get("status_ok", False):
         return fail_on_status_write("fetch", "拉取 main 分支失败")
     # 1.2.5: record the service-process baseline BEFORE any overwrite,
@@ -2075,101 +2279,141 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, re
     if not local_sha or not remote_sha:
         return fail("fetch", "读取提交号失败", "git rev-parse 未返回提交号")
     if local_sha == remote_sha:
+        # 1.2.7 (plan §三.1): "already latest" is a TWO-condition
+        # verdict. Sha equality alone cannot distinguish a genuinely
+        # current install from a previous updater that died between
+        # checkout and install -- the 1.2.6 false success had exactly
+        # this shape (disk at the new commit, process still old, and
+        # the next click short-circuited to success here). The second
+        # condition is the running process provably serving the
+        # on-disk code. Only "consistent" may take this exit; "stale"
+        # or "unknown" fall through to the install stage and complete
+        # the unfinished update (check/checkout are skipped: the tree
+        # already IS the target commit, which is what sha equality
+        # just proved, and its release consistency was verified by
+        # the update that checked it out).
+        consistency, consistency_detail = _code_update_process_disk_consistency(
+            run, install_dir
+        )
+        _code_update_append_log(
+            f"[fetch] 运行进程与磁盘代码一致性核对：{consistency}——{consistency_detail}"
+        )
+        if consistency == "consistent":
+            if not write_code_update_status(
+                "success", "done", "已是最新正式版，无需更新", current_version, current_version
+            ).get("status_ok", False):
+                # Nothing changed (already latest), so there is nothing to
+                # roll back; the lost record is explicit in the panel log
+                # (+ stderr from the write helper), and check_update still
+                # shows the latest version.
+                log_to_json("ERROR", "CodeUpdate", "面板更新成功但成功状态写入失败：已是最新正式版，无需更新")
+            return True
+        resume_incomplete_update = True
         if not write_code_update_status(
-            "success", "done", "已是最新正式版，无需更新", current_version, current_version
+            "running", "resume",
+            "检测到上次更新未完成：磁盘已是最新代码，但运行中的服务仍是旧进程，正在补完安装并重启服务…",
+            current_version, current_version,
         ).get("status_ok", False):
-            # Nothing changed (already latest), so there is nothing to
-            # roll back; the lost record is explicit in the panel log
-            # (+ stderr from the write helper), and check_update still
-            # shows the latest version.
-            log_to_json("ERROR", "CodeUpdate", "面板更新成功但成功状态写入失败：已是最新正式版，无需更新")
-        return True
+            return fail_on_status_write("resume", "补完上次未完成的更新失败")
+        _code_update_append_log(
+            f"[resume] 补完未竟更新：{consistency_detail}；跳过检查与切换，直接执行安装与核验"
+        )
 
-    # Temp-worktree syntax check BEFORE touching the live checkout (Q4).
-    tmp_dir = None
-    try:
-        tmp_dir = Path(tempfile.mkdtemp(prefix="aimili-code-update-"))
-        if not write_code_update_status(
-            "running", "check", "正在临时工作区检查新代码…", current_version, ""
-        ).get("status_ok", False):
-            return fail_on_status_write("check", "临时工作区检查失败")
+    if resume_incomplete_update:
+        # 1.2.7 resume path: the disk tree already IS the target
+        # commit (sha equality proved it above); there is no new
+        # code to syntax-check or release-match, so the whole
+        # temp-worktree stage is skipped and the flow continues
+        # at the install stage below.
+        _code_update_append_log(
+            "[resume] 跳过临时工作区检查：磁盘已是目标提交，无新代码需要检查"
+        )
+    else:
+        # Temp-worktree syntax check BEFORE touching the live checkout (Q4).
+        tmp_dir = None
         try:
-            added = run(
-                ["git", "worktree", "add", "--detach", str(tmp_dir), f"origin/{CODE_UPDATE_BRANCH}"],
-                install_dir, 120,
-            )
-        except Exception as exc:
-            return fail("check", "临时工作区检查失败", str(exc))
-        if added.returncode != 0:
-            return fail("check", "临时工作区检查失败", cmd_tail(added) or "git worktree add 失败")
-        if not (tmp_dir / "vpngate_manager.py").exists():
-            return fail("check", "临时工作区检查失败", "新代码中缺少 vpngate_manager.py")
-        try:
-            for name in CODE_UPDATE_CHECK_FILES:
-                candidate = tmp_dir / name
-                if candidate.exists():
-                    py_compile.compile(str(candidate), doraise=True)
-            install_tmp = tmp_dir / "install.sh"
-            if install_tmp.exists():
-                checked = run(["bash", "-n", str(install_tmp)], install_dir, 30)
-                if checked.returncode != 0:
-                    return fail("check", "临时工作区检查失败", cmd_tail(checked) or "install.sh 语法检查失败")
-        except Exception as exc:
-            return fail("check", "临时工作区检查失败", f"语法检查失败：{exc}")
-        # 1.2.5: main-vs-Release consistency (cross-version audit risk
-        # B). check_update compares against the latest Release tag,
-        # but this updater installs main HEAD; if main has moved past
-        # the latest formal release, installing would silently ship
-        # unpublished code. Mismatch (or an unverifiable latest
-        # release, including GitHub being unreachable) aborts BEFORE
-        # checkout: nothing has been overwritten, so no rollback.
-        main_version_file = tmp_dir / "VERSION"
-        if main_version_file.exists():
-            main_version_text = main_version_file.read_text(encoding="utf-8").strip()
+            tmp_dir = Path(tempfile.mkdtemp(prefix="aimili-code-update-"))
+            if not write_code_update_status(
+                "running", "check", "正在临时工作区检查新代码…", current_version, ""
+            ).get("status_ok", False):
+                return fail_on_status_write("check", "临时工作区检查失败")
             try:
-                main_version = ".".join(
-                    str(part) for part in parse_release_version(main_version_text)
+                added = run(
+                    ["git", "worktree", "add", "--detach", str(tmp_dir), f"origin/{CODE_UPDATE_BRANCH}"],
+                    install_dir, 120,
                 )
-            except ValueError:
-                return fail(
-                    "check", "临时工作区检查失败",
-                    f"main 分支 VERSION 无法解析：{main_version_text}",
-                )
-            release_info = None
-            release_error = ""
-            try:
-                release_info = (release_check or check_latest_release)()
             except Exception as exc:
-                release_error = str(exc)
-            if not isinstance(release_info, dict) or not release_info.get("ok"):
-                detail = f"（{release_error}）" if release_error else ""
-                return fail(
-                    "check", "临时工作区检查失败",
-                    f"无法核对最新正式版{detail}，已中止更新，请稍后重试",
-                )
-            if release_info.get("no_release"):
-                return fail(
-                    "check", "临时工作区检查失败",
-                    "仓库尚未发布正式版，已中止更新",
-                )
-            latest_version = str(release_info.get("latest_version") or "")
-            if main_version != latest_version:
-                return fail(
-                    "check", "临时工作区检查失败",
-                    f"main 版本 {main_version} 与最新正式版 {latest_version} 不一致，"
-                    "可能含未发布代码，已中止更新，请等正式版发布",
-                )
-        else:
-            _code_update_append_log(
-                "[check] 临时工作区缺少 VERSION 文件，main 与正式版一致性校验跳过"
-            )
-    finally:
-        if tmp_dir is not None:
+                return fail("check", "临时工作区检查失败", str(exc))
+            if added.returncode != 0:
+                return fail("check", "临时工作区检查失败", cmd_tail(added) or "git worktree add 失败")
+            if not (tmp_dir / "vpngate_manager.py").exists():
+                return fail("check", "临时工作区检查失败", "新代码中缺少 vpngate_manager.py")
             try:
-                run(["git", "worktree", "remove", "--force", str(tmp_dir)], install_dir, 60)
-            except Exception:
-                pass
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+                for name in CODE_UPDATE_CHECK_FILES:
+                    candidate = tmp_dir / name
+                    if candidate.exists():
+                        py_compile.compile(str(candidate), doraise=True)
+                install_tmp = tmp_dir / "install.sh"
+                if install_tmp.exists():
+                    checked = run(["bash", "-n", str(install_tmp)], install_dir, 30)
+                    if checked.returncode != 0:
+                        return fail("check", "临时工作区检查失败", cmd_tail(checked) or "install.sh 语法检查失败")
+            except Exception as exc:
+                return fail("check", "临时工作区检查失败", f"语法检查失败：{exc}")
+            # 1.2.5: main-vs-Release consistency (cross-version audit risk
+            # B). check_update compares against the latest Release tag,
+            # but this updater installs main HEAD; if main has moved past
+            # the latest formal release, installing would silently ship
+            # unpublished code. Mismatch (or an unverifiable latest
+            # release, including GitHub being unreachable) aborts BEFORE
+            # checkout: nothing has been overwritten, so no rollback.
+            main_version_file = tmp_dir / "VERSION"
+            if main_version_file.exists():
+                main_version_text = main_version_file.read_text(encoding="utf-8").strip()
+                try:
+                    main_version = ".".join(
+                        str(part) for part in parse_release_version(main_version_text)
+                    )
+                except ValueError:
+                    return fail(
+                        "check", "临时工作区检查失败",
+                        f"main 分支 VERSION 无法解析：{main_version_text}",
+                    )
+                release_info = None
+                release_error = ""
+                try:
+                    release_info = (release_check or check_latest_release)()
+                except Exception as exc:
+                    release_error = str(exc)
+                if not isinstance(release_info, dict) or not release_info.get("ok"):
+                    detail = f"（{release_error}）" if release_error else ""
+                    return fail(
+                        "check", "临时工作区检查失败",
+                        f"无法核对最新正式版{detail}，已中止更新，请稍后重试",
+                    )
+                if release_info.get("no_release"):
+                    return fail(
+                        "check", "临时工作区检查失败",
+                        "仓库尚未发布正式版，已中止更新",
+                    )
+                latest_version = str(release_info.get("latest_version") or "")
+                if main_version != latest_version:
+                    return fail(
+                        "check", "临时工作区检查失败",
+                        f"main 版本 {main_version} 与最新正式版 {latest_version} 不一致，"
+                        "可能含未发布代码，已中止更新，请等正式版发布",
+                    )
+            else:
+                _code_update_append_log(
+                    "[check] 临时工作区缺少 VERSION 文件，main 与正式版一致性校验跳过"
+                )
+        finally:
+            if tmp_dir is not None:
+                try:
+                    run(["git", "worktree", "remove", "--force", str(tmp_dir)], install_dir, 60)
+                except Exception:
+                    pass
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     rollback_install_results: list = []
 
@@ -2179,6 +2423,10 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, re
             run(["git", "reset", "--hard", old_sha], install_dir, 120)
             env = dict(os.environ)
             env["AIMILIVPN_NONINTERACTIVE"] = "1"
+            # 1.2.7: the pre-marker goes in BEFORE the install runs,
+            # so a rollback install that dies with the worker still
+            # leaves a trace of where it stopped.
+            _code_update_append_log("[rollback] 开始执行 install.sh（回滚重装）")
             rollback_install_results.append(
                 run(["bash", "install.sh"], install_dir, 600, env)
             )
@@ -2187,6 +2435,25 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, re
             return False
 
     def fail_after_checkout(stage, message, error, target_version, terminal_hint=""):
+        if resume_incomplete_update:
+            # 1.2.7 resume path: there is nothing to roll back TO.
+            # The disk tree already is the target commit -- the old
+            # code left the disk when the dead updater checked the
+            # new code out, and its commit was never recorded here --
+            # so a same-sha "rollback" could only reinstall the same
+            # code while claiming a restore that never happened.
+            # Fail explicitly with terminal guidance instead (plan
+            # §三.5: failure must stay visible and recoverable).
+            note = (
+                f"{error}；磁盘已是最新代码但更新未能完成，"
+                "请用终端 ml update 完成安装，或重启服务后核对版本"
+            )
+            write_code_update_status(
+                "failed", stage, message, current_version, target_version,
+                error=note, needs_terminal=True,
+            )
+            log_to_json("ERROR", "CodeUpdate", f"面板更新补完失败[{stage}] {message}：{note}")
+            return False
         rolled_back = rollback(local_sha)
         # 1.2.5: the rollback reinstall's output is traced like the
         # forward install's, so a failed recovery stays diagnosable.
@@ -2226,26 +2493,32 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, re
         log_to_json("ERROR", "CodeUpdate", f"面板更新失败[{stage}] {message}：{note}")
         return False
 
-    if not write_code_update_status("running", "checkout", "正在切换到 main 最新代码…", current_version, "").get("status_ok", False):
-        # Checkout has not run yet: plain fail, no rollback (nothing changed).
-        return fail_on_status_write("checkout", "切换代码失败")
-    try:
-        checkout = run(
-            ["git", "checkout", "-B", CODE_UPDATE_BRANCH, f"origin/{CODE_UPDATE_BRANCH}"],
-            install_dir, 120,
-        )
-        reset = (
-            run(["git", "reset", "--hard", f"origin/{CODE_UPDATE_BRANCH}"], install_dir, 120)
-            if checkout.returncode == 0 else checkout
-        )
-    except Exception as exc:
-        return fail_after_checkout("checkout", "切换代码失败", str(exc), "")
-    if checkout.returncode != 0 or reset.returncode != 0:
-        return fail_after_checkout(
-            "checkout", "切换代码失败",
-            cmd_tail(reset) or cmd_tail(checkout) or "git checkout/reset 失败", "",
-        )
-    target_version = _code_update_read_version(install_dir)
+    if resume_incomplete_update:
+        # 1.2.7 resume path: no checkout -- the live tree already is
+        # the target commit, and the target version is the on-disk
+        # VERSION read at worker start.
+        target_version = current_version
+    else:
+        if not write_code_update_status("running", "checkout", "正在切换到 main 最新代码…", current_version, "").get("status_ok", False):
+            # Checkout has not run yet: plain fail, no rollback (nothing changed).
+            return fail_on_status_write("checkout", "切换代码失败")
+        try:
+            checkout = run(
+                ["git", "checkout", "-B", CODE_UPDATE_BRANCH, f"origin/{CODE_UPDATE_BRANCH}"],
+                install_dir, 120,
+            )
+            reset = (
+                run(["git", "reset", "--hard", f"origin/{CODE_UPDATE_BRANCH}"], install_dir, 120)
+                if checkout.returncode == 0 else checkout
+            )
+        except Exception as exc:
+            return fail_after_checkout("checkout", "切换代码失败", str(exc), "")
+        if checkout.returncode != 0 or reset.returncode != 0:
+            return fail_after_checkout(
+                "checkout", "切换代码失败",
+                cmd_tail(reset) or cmd_tail(checkout) or "git checkout/reset 失败", "",
+            )
+        target_version = _code_update_read_version(install_dir)
     try:
         run(
             ["find", ".", "-type", "d", "-name", "__pycache__", "-exec", "rm", "-rf", "{}", "+"],
@@ -2261,6 +2534,12 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, re
     try:
         env = dict(os.environ)
         env["AIMILIVPN_NONINTERACTIVE"] = "1"
+        # 1.2.7: the pre-marker is appended BEFORE install.sh runs
+        # (plan §三.3). All three false successes died somewhere in
+        # this stage without a trace; now the stage's entry is on
+        # record even if the worker is killed during the install,
+        # and the output tail below marks how far it got.
+        _code_update_append_log(f"[install] 开始执行 install.sh（目标版本 {target_version}）")
         installed = run(["bash", "install.sh"], install_dir, 600, env)
     except Exception as exc:
         return fail_after_checkout("install", "重新安装失败", str(exc), target_version)
@@ -2325,6 +2604,11 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, re
             f"[health] 降级核验：{freshness_detail}；已以面板 HTTP 响应与磁盘版本完成核验"
         )
     success_message = f"更新完成，当前版本 {target_version}"
+    if resume_incomplete_update:
+        # 1.2.7: a completed resume is reported distinctly from a
+        # fresh update, so the panel record (and any later review)
+        # can tell the two apart.
+        success_message = f"已补完上次未完成的更新，当前版本 {target_version}"
     if degraded_verification:
         success_message += "（降级核验：未能读取服务进程信息，已以面板响应与磁盘版本核验）"
     if not write_code_update_status(
@@ -2335,7 +2619,11 @@ def run_code_update_worker(install_dir=None, runner=None, panel_healthy=None, re
         # would turn success into failure. Record the loss explicitly
         # instead; the new version is still confirmable via check_update.
         log_to_json("ERROR", "CodeUpdate", f"面板更新成功但成功状态写入失败：{current_version} -> {target_version}")
-    log_to_json("INFO", "CodeUpdate", f"面板更新成功：{current_version} -> {target_version}")
+    if resume_incomplete_update:
+        _code_update_append_log(f"[resume] 补完未竟更新完成，当前版本 {target_version}")
+        log_to_json("INFO", "CodeUpdate", f"面板更新补完成功：运行进程已切换至磁盘版本 {target_version}")
+    else:
+        log_to_json("INFO", "CodeUpdate", f"面板更新成功：{current_version} -> {target_version}")
     return True
 
 
@@ -2361,10 +2649,25 @@ def spawn_code_updater_detailed() -> tuple[bool, str, str]:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
         )
         if proc.returncode == 0:
+            # 1.2.7: the spawn method and result go to the update log
+            # (plan §三.2). The spawn's own stderr stays DEVNULL'd --
+            # systemd-run's chatter is not a record -- but the FACT
+            # of how the updater was launched now always is.
+            _code_update_append_log(
+                "[starting] 更新器拉起：systemd-run scope 成功（更新器已脱离服务进程组）"
+            )
             return True, "systemd-run", ""
         systemd_detail = f"返回码 {proc.returncode}"
     except Exception as exc:
         systemd_detail = str(exc) or exc.__class__.__name__
+    # 1.2.7: never fall back silently. The fallback is recorded
+    # BEFORE the setsid attempt, with the systemd-run failure reason
+    # and the survival caveat, so even a worker that is then killed
+    # with the service cgroup leaves a reviewable trail.
+    _code_update_append_log(
+        f"[starting] 更新器拉起：systemd-run 失败（{systemd_detail}），"
+        "回退 setsid 子进程（仍在服务进程组内，安装重启时有被连带终止的风险）"
+    )
     try:
         subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -2373,6 +2676,9 @@ def spawn_code_updater_detailed() -> tuple[bool, str, str]:
         return True, "setsid", f"systemd-run 不可用或失败（{systemd_detail}），已回退 setsid"
     except Exception as exc:
         setsid_detail = str(exc) or exc.__class__.__name__
+        _code_update_append_log(
+            f"[starting] 更新器拉起失败：systemd-run：{systemd_detail}；setsid：{setsid_detail}"
+        )
         return False, "none", f"systemd-run：{systemd_detail}；setsid：{setsid_detail}"
 
 
@@ -2854,6 +3160,11 @@ def begin_connection_attempt() -> tuple[int, threading.Event]:
         token = connection_epoch
         active_connection_cancel_event = cancel_event
         is_connecting = True
+        # 1.2.7 stage 2: from this moment the connection attempt owns
+        # the machine -- probe batches yield to it (see
+        # connection_priority_event). Set only once the attempt is
+        # committed, so a rejected begin (busy) never raises the flag.
+        connection_priority_event.set()
     return token, cancel_event
 
 def connection_attempt_is_current(token: int, cancel_event: threading.Event) -> bool:
@@ -2867,6 +3178,12 @@ def finish_connection_attempt(token: int, cancel_event: threading.Event) -> None
             active_connection_cancel_event = None
         if token == connection_epoch:
             is_connecting = False
+            # 1.2.7 stage 2: the attempt is over (success, failure, or
+            # cancellation -- connect_node calls this from its finally),
+            # so probe batches may resume. Cleared under the same epoch
+            # guard as is_connecting: a superseded attempt's finish must
+            # not clear a newer attempt's priority.
+            connection_priority_event.clear()
     connection_attempt_lock.release()
 
 def cancel_pending_connection_attempt() -> None:
@@ -2881,6 +3198,48 @@ def cancel_pending_connection_attempt() -> None:
         pending_openvpn_process = None
         is_connecting = False
     stop_process(pending)
+
+def reset_stale_testing_nodes() -> int:
+    """Reset probe_status="testing" rows left in the node table by a
+    previous process (1.2.7 stage 2, plan §二.4).
+
+    "testing" is written only as a transient in-flight marker by
+    test_multiple_nodes' batched flush; a row still carrying it at
+    process start can only be residue of an interrupted run (the
+    2026-11-05 restart left one such row, JP_138.64.70.36, stuck).
+    Resetting it to "not_checked" restores the row's pre-probe
+    semantics: no verdict was ever recorded for it. probe_message is
+    cleared (the "正在检测节点连通性..." marker text would otherwise
+    contradict the reset status) and probed_at is zeroed, matching a
+    freshly fetched candidate row (probed_at=0 in row_to_node) so no
+    consumer can mistake the residue for a completed probe. No other
+    field is touched. Called once from main() before the collector
+    thread starts, so no probe batch can be in flight; returns the
+    number of rows reset and logs it, so the heal is observable.
+    """
+    with lock:
+        nodes = read_nodes()
+        stale_ids = [
+            str(n.get("id") or "")
+            for n in nodes
+            if n.get("probe_status") == "testing"
+        ]
+        if not stale_ids:
+            return 0
+        for n in nodes:
+            if n.get("probe_status") == "testing":
+                n["probe_status"] = "not_checked"
+                n["probe_message"] = ""
+                n["probed_at"] = 0
+        write_json(NODES_FILE, nodes)
+    msg = (
+        f"启动自愈：{len(stale_ids)} 个节点残留「检测中」状态已复位为未检测"
+        f"（{', '.join(stale_ids[:5])}）"
+    )
+    print(f"[启动自愈] {msg}", flush=True)
+    log_to_json("WARNING", "Main", msg)
+    return len(stale_ids)
+
 
 def kill_existing_openvpn_processes() -> None:
     if not sys.platform.startswith("linux"):
@@ -4211,12 +4570,18 @@ def run_full_sweep(systemic_probe_failure: str = "") -> dict[str, Any]:
             results = test_multiple_nodes(
                 candidate_ids,
                 target_available=None,
-                stop_requested=lambda: full_sweep_cancel_requested,
+                # 1.2.7 stage 2: the sweep also yields to a connection
+                # attempt that began through a non-HTTP path (e.g. the
+                # background proxy checker's auto-switch), which never
+                # sets full_sweep_cancel_requested. test_multiple_nodes
+                # checks the event itself as well; passing it here too
+                # keeps `interrupted` truthful for either source.
+                stop_requested=lambda: full_sweep_cancel_requested or connection_priority_event.is_set(),
             )
             tested = len(results)
             available = sum(1 for r in results if r.get("probe_status") == "available")
             unavailable = sum(1 for r in results if r.get("probe_status") == "unavailable")
-            interrupted = bool(full_sweep_cancel_requested)
+            interrupted = bool(full_sweep_cancel_requested or connection_priority_event.is_set())
             if conn_country:
                 summary = (
                     f"全量检测完成（{conn_country}）：共 {tested} 个，可用 {available} 个，不可用 {unavailable} 个"
@@ -4594,6 +4959,17 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             for batch_start in range(0, len(to_test), max_workers):
+                if connection_priority_event.is_set():
+                    # 1.2.7 stage 2 (plan §二.1): a connection attempt
+                    # outranks every probe batch, not just the full
+                    # sweep -- stop between batches exactly like the
+                    # sweep-cancel path below. Results already gathered
+                    # are safe: the finally below flushes them, so a
+                    # preempted batch leaves no result un-persisted
+                    # and no fresh "testing" residue behind.
+                    print("[节点检测] 连接优先，暂停本轮剩余节点检测", flush=True)
+                    log_to_json("INFO", "Main", "连接优先，暂停本轮剩余节点检测")
+                    break
                 if stop_requested is not None and stop_requested():
                     print("[节点检测] 全量检测收到连接请求，提前停止剩余批次", flush=True)
                     log_to_json("INFO", "Main", "全量检测收到连接请求，提前停止剩余批次")
@@ -4677,6 +5053,12 @@ def schedule_background_refill() -> bool:
                     ui_cfg = load_ui_config()
                     if not ui_cfg.get("connection_enabled", True):
                         return
+                    if connection_priority_event.is_set():
+                        # 1.2.7 stage 2 (plan §二.3): a connection attempt
+                        # is in progress; refill probing must not start
+                        # now. Wait out this delay slot and re-check on
+                        # the next one, exactly like a cancelled wait.
+                        continue
                     try:
                         # 1.2.2: refill never full-sweeps; it only does
                         # prioritized testing (target available count).
@@ -5248,11 +5630,51 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
             current_nodes = merged
             ip_enrichment_wakeup.set()
 
+        # 1.2.7 stage 2 (plan §二.2): connection first. When nothing is
+        # connected, a node the merged table already knows as available
+        # (previous rounds' probe results, carried into the merge above)
+        # is connected NOW, before any probing in this round -- probing
+        # first and connecting last is what left a restarted service
+        # unconnected for ~28 minutes on 2026-11-05. The attempt mirrors
+        # the fast-connect path below (same routing filters, same
+        # is_connecting hand-off around auto_switch_node, whose
+        # connect_node raises while is_connecting is set). When the
+        # attempt leaves the service connected, the fast-connect block
+        # below skips itself (its condition requires no running tunnel)
+        # and the round continues as an ordinary connected maintain:
+        # remaining probes and the terminal sweep decision unchanged.
+        # When no candidate exists, or every candidate fails, the round
+        # falls through to the fast-connect probe path exactly as
+        # before. fixed_ip mode keeps its own reconnect handling above
+        # and never reaches this block.
+        pre_ui_cfg = load_ui_config()
+        if (
+            pre_ui_cfg.get("connection_enabled", True)
+            and pre_ui_cfg.get("routing_mode", "auto") != "fixed_ip"
+            and not active_openvpn_running()
+        ):
+            pre_candidates = [
+                n for n in current_nodes
+                if n.get("probe_status") == "available" and not n.get("active")
+            ]
+            pre_candidates = apply_routing_filters(pre_candidates, pre_ui_cfg)
+            if pre_candidates:
+                print("[维护线程] 表中已有可用节点，先行建立连接，检测随后进行", flush=True)
+                log_to_json("INFO", "Main", "表中已有可用节点，先行建立连接，检测随后进行")
+                is_connecting = False
+                set_state(is_connecting=False, last_check_message="已有可用节点，正在优先建立连接...")
+                auto_switch_node()
+                is_connecting = True
+
         # Phase 1 retention: liveness sweep, at most once per interval.
         # 1.2.5: with the mechanism OFF the sweep is skipped entirely and
         # last_retained_sweep_at is left untouched (not rescheduled):
         # there are no observing nodes to probe.
-        if retained_pool_enabled:
+        # 1.2.7 stage 2: while a connection attempt holds priority, the
+        # liveness sweep is not started either; like the pool-off skip,
+        # last_retained_sweep_at is left untouched so it is retried on a
+        # later round instead of being rescheduled away.
+        if retained_pool_enabled and not connection_priority_event.is_set():
             try:
                 last_sweep = float(get_state().get("last_retained_sweep_at") or 0)
             except Exception:
@@ -7022,12 +7444,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.2.6 正式版</span>
+        <span id="github_version_label">V1.2.7 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.2.6 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.2.7 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <div class="update-action-row">
@@ -7501,7 +7923,7 @@ let lastNodesSnapshotSignature = "";
 let lastStateSnapshotSignature = "";
 
 const $=id=>document.getElementById(id);
-const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
+const esc=s=>String(s===null||s===undefined?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
 function fetchWithTimeout(resource, options = {}, timeoutMs = 20000) {
   if (typeof AbortController === "undefined") return fetch(resource, options);
   const controller = new AbortController();
@@ -7884,7 +8306,7 @@ function stableSortNodes() {
 function render(){
   updateRetainedPoolVisibilityUI();
   updateRetainedPoolEnabledUI();
-  const versionLabel = state.app_version_label || "V1.2.6 正式版";
+  const versionLabel = state.app_version_label || "V1.2.7 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -8110,7 +8532,7 @@ function render(){
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
         <td style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(ipTypeTitle)}">${esc(translateIpType(n.ip_type))}</td>
-        <td style="white-space: nowrap;" title="${esc(riskTitle)}">${(n.risk_display_score === null || n.risk_display_score === undefined) ? "—" : esc(n.risk_display_score)}</td>
+        <td style="white-space: nowrap;" title="${esc(riskTitle)}">${riskScoreCellHtml(n)}</td>
         <td>
           <div class="table-actions">
             ${testBtn}
@@ -8151,6 +8573,22 @@ $("btn_last_page").onclick = () => {
   currentPage = totalPages;
   render();
 };
+
+function riskScoreCellHtml(n) {
+  // 1.2.7 stage 1 (plan §一): the score number is coloured by band --
+  // 0-19 green, 20-29 light green, 30-49 orange, 50-100 red. Only the
+  // number itself is coloured (and bolded); the tooltip text and the
+  // column width are untouched. An unqueried node keeps the plain em
+  // dash, uncoloured; a score kept after a failed re-query is coloured
+  // by that kept value like any other score. The number renders
+  // through esc(), which since 1.2.7 stage 1 preserves the number 0
+  // exactly -- previously esc(0) returned "" and a genuine 0 score
+  // rendered as a blank cell, indistinguishable from "not queried".
+  const score = n.risk_display_score;
+  if (score === null || score === undefined) return "—";
+  const color = score < 20 ? "#34d399" : (score < 30 ? "#a3e635" : (score < 50 ? "#f59e0b" : "#f87171"));
+  return `<span style="color: ${color}; font-weight: 700;">${esc(score)}</span>`;
+}
 
 function riskScoreTitle(n) {
   // 1.2.6 plan §二: the tooltip narrates exactly four items -- risk
@@ -10868,7 +11306,11 @@ class Tee:
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
-    
+    # 1.2.7 stage 2 (plan §二.4): heal any "testing" probe residue the
+    # previous process left in the node table, before the collector
+    # thread (started below) can run its first maintain against it.
+    reset_stale_testing_nodes()
+
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
     sys.stdout = tee

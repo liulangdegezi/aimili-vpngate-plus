@@ -222,9 +222,9 @@ def get_app_version():
     try:
         with open(os.path.join(INSTALL_DIR, "VERSION"), "r", encoding="utf-8") as f:
             version = f.read().strip().lstrip("vV")
-        return version or "1.2.6"
+        return version or "1.2.7"
     except Exception:
-        return "1.2.6"
+        return "1.2.7"
 
 def load_ui_cfg():
     import json
