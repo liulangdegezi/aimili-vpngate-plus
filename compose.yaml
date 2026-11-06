@@ -1,6 +1,6 @@
 services:
   aimilivpn:
-    image: ghcr.io/liulangdegezi/aimili-vpngate-plus:1.2.7
+    image: ghcr.io/liulangdegezi/aimili-vpngate-plus:1.2.8
     build:
       context: .
       args:

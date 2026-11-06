@@ -212,7 +212,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.2.7"
+DEFAULT_APP_VERSION = "1.2.8"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -634,7 +634,20 @@ def filter_main_list_nodes(
     """Apply the display-only retained-pool preference to the main list."""
     if show_retained_pool_ips:
         return list(nodes)
-    return [node for node in nodes if node.get("retention_status") != "observing"]
+    # 1.2.8 (plan §一): the active node is exempt from the filter. The
+    # 1.2.3 design assumed the active node is never "observing", but
+    # the merge can move a vanished node to observing and a later
+    # round can still select it, so a live connection's node CAN be
+    # observing; filtering it out made the panel's active card, the
+    # status line, and the active count all report "not connected"
+    # while the tunnel was healthy. The only caller (/api/nodes) sets
+    # n["active"] on every row before calling this, so the exemption
+    # keys on a field that is always present at the call site.
+    return [
+        node
+        for node in nodes
+        if node.get("retention_status") != "observing" or node.get("active")
+    ]
 
 # 初始化时优先从 ui_auth.json 加载保存的代理出站端口和网页端口配置以覆盖环境变量
 try:
@@ -1628,6 +1641,97 @@ def read_code_update_status() -> dict[str, Any]:
         "update_command": UPDATE_COMMAND,
         "last_attempt": read_code_update_last_attempt(),
     }
+
+
+def finalize_orphaned_update_status(now: float | None = None) -> bool:
+    """Finalize an update status orphaned at "running" (1.2.8, plan §三).
+
+    The 1.2.7 live upgrade reproduced the orphan: the resume-path
+    worker rewrote the disk and the install restarted the service,
+    which killed the worker itself before it could write back its
+    verdict, leaving code_update_status.json at result=running /
+    stage=install forever (cosmetic only, but the panel kept showing
+    an update "in progress" that no longer existed). A status still
+    at "running" whose last write predates this process's start can
+    only belong to a worker that died with the previous process --
+    a live worker writes from THIS process's lifetime and holds the
+    worker flock, so both facts are checked before touching anything:
+
+    - ``updated_at`` must be a valid timestamp older than
+      ``server_start_time - 5`` (the module-level import-time stamp;
+      the 5-second guard absorbs clock granularity around process
+      start). A fresh or timestamp-less "running" is left alone.
+    - the worker flock must be acquirable non-blocking via the same
+      helper the worker itself uses; if another process holds it, a
+      live worker owns the status and nothing is changed. If locking
+      is unavailable on this platform (helper returns no handle
+      without contention), exclusivity cannot be proven and the
+      status is likewise left alone.
+
+    When finalizing, result/stage/message are rewritten to
+    success/done with an explanatory message and every other recorded
+    field (versions, deployment_mode, update_command, log_tail) is
+    preserved; the message is also appended to the status log_tail
+    and to code_update.log, mirroring write_code_update_status.
+    Returns True only when it finalized. Any failure is swallowed
+    (stderr note) and returns False: this runs once at startup and
+    must never crash it.
+    """
+    try:
+        current = time.time() if now is None else float(now)
+        data = read_json(CODE_UPDATE_STATUS_FILE, None)
+        if not isinstance(data, dict):
+            return False
+        if str(data.get("result") or "") != "running":
+            return False
+        try:
+            updated_at = float(data.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            return False
+        if not updated_at or updated_at >= server_start_time - 5:
+            return False
+        handle, contended = _code_update_try_acquire_worker_lock()
+        if contended or handle is None:
+            return False
+        message = "上次更新已完成（更新器退出前未及写回状态，已由新进程启动自检收尾）"
+        try:
+            entry = dict(data)
+            log_tail = list(entry.get("log_tail") or [])
+            log_tail.append(message)
+            entry.update(
+                {
+                    "result": "success",
+                    "stage": "done",
+                    "message": message,
+                    "log_tail": log_tail[-50:],
+                    "error": "",
+                    "needs_terminal": False,
+                    "updated_at": current,
+                }
+            )
+            entry.setdefault("deployment_mode", DEPLOYMENT_MODE)
+            entry.setdefault("update_command", UPDATE_COMMAND)
+            write_json(CODE_UPDATE_STATUS_FILE, entry)
+        finally:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        _code_update_append_log(f"[done] {message}")
+        log_to_json(
+            "WARNING",
+            "CodeUpdate",
+            "启动自检：上次更新状态停在 running 且更新器已退出，已收尾为 success",
+        )
+        print("[启动自检] 上次更新状态已收尾（更新器退出前未及写回）", flush=True)
+        return True
+    except Exception as exc:
+        print(
+            f"[启动自检] 更新状态孤儿检查失败（已忽略）：{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
 
 
 # 1.2.2 last-attempt record (Q2): a separate file, never the running
@@ -7117,6 +7221,33 @@ INDEX_HTML = r"""<!doctype html>
       color: #fb7185;
     }
 
+    .risk-val {
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    .risk-band-low {
+      background: rgba(52, 211, 153, 0.1);
+      color: #34d399;
+    }
+
+    .risk-band-mild {
+      background: rgba(163, 230, 53, 0.1);
+      color: #a3e635;
+    }
+
+    .risk-band-medium {
+      background: rgba(245, 158, 11, 0.1);
+      color: #f59e0b;
+    }
+
+    .risk-band-high {
+      background: rgba(248, 113, 113, 0.1);
+      color: #f87171;
+    }
+
     .latency-estimated {
       background: rgba(148, 163, 184, 0.08);
       color: var(--text-secondary);
@@ -7444,12 +7575,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.2.7 正式版</span>
+        <span id="github_version_label">V1.2.8 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.2.7 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.2.8 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <div class="update-action-row">
@@ -8306,7 +8437,7 @@ function stableSortNodes() {
 function render(){
   updateRetainedPoolVisibilityUI();
   updateRetainedPoolEnabledUI();
-  const versionLabel = state.app_version_label || "V1.2.7 正式版";
+  const versionLabel = state.app_version_label || "V1.2.8 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -8584,10 +8715,15 @@ function riskScoreCellHtml(n) {
   // through esc(), which since 1.2.7 stage 1 preserves the number 0
   // exactly -- previously esc(0) returned "" and a genuine 0 score
   // rendered as a blank cell, indistinguishable from "not queried".
+  // 1.2.8 (plan §二): the number is now a badge in the latency-val
+  // mould -- the band colours moved into .risk-val/.risk-band-*
+  // classes (same text colours as 1.2.7, background = the same colour
+  // at 0.1 alpha, font-weight 700 on the badge). Only the scored
+  // branch changed; the unqueried em dash stays bare.
   const score = n.risk_display_score;
   if (score === null || score === undefined) return "—";
-  const color = score < 20 ? "#34d399" : (score < 30 ? "#a3e635" : (score < 50 ? "#f59e0b" : "#f87171"));
-  return `<span style="color: ${color}; font-weight: 700;">${esc(score)}</span>`;
+  const band = score < 20 ? "risk-band-low" : (score < 30 ? "risk-band-mild" : (score < 50 ? "risk-band-medium" : "risk-band-high"));
+  return `<span class="risk-val ${band}">${esc(score)}</span>`;
 }
 
 function riskScoreTitle(n) {
@@ -11310,6 +11446,11 @@ def main() -> None:
     # previous process left in the node table, before the collector
     # thread (started below) can run its first maintain against it.
     reset_stale_testing_nodes()
+    # 1.2.8 (plan §三): finalize an update status the previous
+    # process's worker left at "running" when the install's service
+    # restart killed it before it could write back its verdict. The
+    # check never raises, so it cannot block startup.
+    finalize_orphaned_update_status()
 
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
