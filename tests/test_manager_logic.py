@@ -843,8 +843,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.2.6", manager.APP_VERSION)
-        self.assertEqual("V1.2.6 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.2.7", manager.APP_VERSION)
+        self.assertEqual("V1.2.7 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -928,7 +928,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.2.6 正式版", result["current_version_label"])
+        self.assertEqual("V1.2.7 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -947,7 +947,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.2.6", result["current_version"])
+        self.assertEqual("1.2.7", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1357,11 +1357,32 @@ class CodeUpdateTests(unittest.TestCase):
             manager.full_sweep_running = False
 
     def test_code_update_worker_already_latest_stops_without_reinstall(self) -> None:
+        # 1.2.7 revision (plan §三.1): "already latest" used to be a
+        # sha-only verdict -- this fake originally answered every
+        # non-git command with an empty success, i.e. NO process
+        # signal at all, and the worker still reported success. That
+        # is precisely the 1.2.6 false-success shape, so the old
+        # assertion set cannot stand: the verdict is now two-
+        # conditioned (sha equal AND the running process provably
+        # serving the on-disk code). This test therefore supplies a
+        # consistent process signal (systemd reports the service
+        # started just now, after the VERSION file was written) and
+        # keeps the original assertions verbatim: success, "已是最新",
+        # no checkout, no install. The stale and unprovable shapes
+        # are covered by Plus127Stage3UpdaterTests.
         install_dir = self._make_install_dir("1.1.0")
         calls: list = []
 
         def fake(cmd, cwd, timeout, env=None):
             calls.append(list(cmd))
+            if cmd[:2] == ["systemctl", "show"]:
+                mono_us = int(manager.time.monotonic() * 1_000_000)
+                return self._fake_result(
+                    0,
+                    "MainPID=4242\n"
+                    "ActiveEnterTimestamp=Mon 2026-11-03 10:00:00 UTC\n"
+                    f"ExecMainStartTimestampMonotonic={mono_us}\n",
+                )
             if cmd[:2] == ["git", "rev-parse"]:
                 return self._fake_result(0, "aaa111\n")
             return self._fake_result(0)
@@ -1471,19 +1492,20 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_2_6(self) -> None:
-        self.assertEqual("1.2.6", manager.APP_VERSION)
-        self.assertEqual("V1.2.6 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.2.6 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_2_7(self) -> None:
+        self.assertEqual("1.2.7", manager.APP_VERSION)
+        self.assertEqual("V1.2.7 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.2.7 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.2.6"', install_text)
+        self.assertIn('"1.2.7"', install_text)
         self.assertNotIn('"1.2.2"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.2.6", compose_text)
+        self.assertIn(":1.2.7", compose_text)
         self.assertNotIn("1.2.2", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.2.6", version_text)
+        self.assertEqual("1.2.7", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## V1.2.7（2026-11-06，已发布正式版 v1.2.7）", changelog)
         self.assertIn("## V1.2.6（2026-11-05，已发布正式版 v1.2.6）", changelog)
         self.assertIn("## V1.2.5（2026-11-05，已发布正式版 v1.2.5）", changelog)
         self.assertIn("## V1.2.2", changelog)
@@ -3064,13 +3086,13 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
 
     def test_worker_stale_process_fails_and_needs_terminal(self) -> None:
         install_dir = self._make_update_install_dir("1.2.4")
-        fake, calls, state = self._update_fake("same", "1.2.6")
+        fake, calls, state = self._update_fake("same", "1.2.7")
         result = manager.run_code_update_worker(
             install_dir=install_dir,
             runner=fake,
             panel_healthy=lambda h, p, t: True,
             release_check=lambda: {
-                "ok": True, "latest_version": "1.2.6", "no_release": False,
+                "ok": True, "latest_version": "1.2.7", "no_release": False,
             },
         )
         self.assertFalse(result)
@@ -3090,13 +3112,13 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
 
     def test_worker_fresh_process_succeeds_and_traces_install_output(self) -> None:
         install_dir = self._make_update_install_dir("1.2.4")
-        fake, calls, state = self._update_fake("change", "1.2.6")
+        fake, calls, state = self._update_fake("change", "1.2.7")
         result = manager.run_code_update_worker(
             install_dir=install_dir,
             runner=fake,
             panel_healthy=lambda h, p, t: True,
             release_check=lambda: {
-                "ok": True, "latest_version": "1.2.6", "no_release": False,
+                "ok": True, "latest_version": "1.2.7", "no_release": False,
             },
         )
         self.assertTrue(result)
@@ -3117,13 +3139,13 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
 
     def test_worker_degraded_verification_when_systemd_unreadable(self) -> None:
         install_dir = self._make_update_install_dir("1.2.4")
-        fake, calls, state = self._update_fake("no-systemd", "1.2.6")
+        fake, calls, state = self._update_fake("no-systemd", "1.2.7")
         result = manager.run_code_update_worker(
             install_dir=install_dir,
             runner=fake,
             panel_healthy=lambda h, p, t: True,
             release_check=lambda: {
-                "ok": True, "latest_version": "1.2.6", "no_release": False,
+                "ok": True, "latest_version": "1.2.7", "no_release": False,
             },
             panel_http_check=lambda h, p, t: True,
         )
@@ -3140,7 +3162,7 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
             runner=fake,
             panel_healthy=lambda h, p, t: True,
             release_check=lambda: {
-                "ok": True, "latest_version": "1.2.6", "no_release": False,
+                "ok": True, "latest_version": "1.2.7", "no_release": False,
             },
         )
         self.assertFalse(result)
@@ -3155,7 +3177,7 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
 
     def test_worker_release_check_unreachable_aborts(self) -> None:
         install_dir = self._make_update_install_dir("1.2.4")
-        fake, calls, state = self._update_fake("change", "1.2.6")
+        fake, calls, state = self._update_fake("change", "1.2.7")
 
         def broken_release_check():
             raise RuntimeError("network down (test)")
@@ -3188,6 +3210,268 @@ class Plus125PoolSwitchAndUpdaterTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(0, result.returncode, result.stderr)
+
+
+class Plus127Stage3UpdaterTests(unittest.TestCase):
+    """1.2.7 stage 3: panel one-click update flow (plan §三).
+
+    The "already latest" verdict is two-conditioned (sha equality
+    AND the running process provably serving the on-disk code); a
+    stale or unprovable process resumes the unfinished update from
+    the install stage. Spawn method and install runs are traced to
+    the update log, and a single-instance flock keeps two live
+    workers from interleaving verdicts. All tests inject fake
+    runners, so no real git, install, systemctl, or network runs.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.root = root
+        self.path_patches = [
+            mock.patch.object(manager, "DATA_DIR", root),
+            mock.patch.object(manager, "CODE_UPDATE_STATUS_FILE", root / "code_update_status.json"),
+            mock.patch.object(manager, "CODE_UPDATE_LOG_FILE", root / "code_update.log"),
+            mock.patch.object(manager, "CODE_UPDATE_LAST_ATTEMPT_FILE", root / "code_update_last_attempt.json"),
+        ]
+        for patcher in self.path_patches:
+            patcher.start()
+
+    def tearDown(self) -> None:
+        for patcher in reversed(self.path_patches):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    def _fake_result(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
+        return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _make_update_install_dir(self, version: str = "1.2.7") -> Path:
+        install_dir = self.root / "install"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        (install_dir / ".git").mkdir(exist_ok=True)
+        (install_dir / "VERSION").write_text(version + "\n", encoding="utf-8")
+        return install_dir
+
+    def _stale_mono_us(self) -> int:
+        """A monotonic timestamp safely in the past: minutes before
+        the just-written install files, without going negative on a
+        freshly booted test machine (monotonic is uptime-based)."""
+        mono = manager.time.monotonic()
+        delta = 120.0 if mono > 240 else mono / 2
+        return int((mono - delta) * 1_000_000)
+
+    def _resume_fake(self, process_mode: str):
+        """Fake runner; git always reports local == remote.
+
+        process_mode: "stale" (the service process started before
+        the disk code was written; the install replaces it),
+        "consistent" (the service started just now, after the disk
+        code), "no-systemd" (systemctl unusable throughout).
+        """
+        state = {"pid": 111, "ts": "Mon 2026-11-03 10:00:00 UTC", "installs": 0}
+        calls: list = []
+
+        def fake(cmd, cwd, timeout, env=None):
+            calls.append(list(cmd))
+            if cmd[:2] == ["systemctl", "show"]:
+                if process_mode == "no-systemd":
+                    return self._fake_result(1, "", "System has not been booted with systemd")
+                if process_mode == "consistent" or state["installs"]:
+                    mono_us = int(manager.time.monotonic() * 1_000_000)
+                else:
+                    mono_us = self._stale_mono_us()
+                return self._fake_result(
+                    0,
+                    f"MainPID={state['pid']}\n"
+                    f"ActiveEnterTimestamp={state['ts']}\n"
+                    f"ExecMainStartTimestampMonotonic={mono_us}\n",
+                )
+            if cmd[:2] == ["git", "rev-parse"]:
+                return self._fake_result(0, "aaa111\n")
+            if cmd == ["bash", "install.sh"]:
+                state["installs"] += 1
+                if process_mode == "stale":
+                    state["pid"] = 222
+                    state["ts"] = "Mon 2026-11-03 11:00:00 UTC"
+                return self._fake_result(0, "resume install output\n", "")
+            return self._fake_result(0)
+
+        return fake, calls, state
+
+    def _log_text(self) -> str:
+        if not manager.CODE_UPDATE_LOG_FILE.exists():
+            return ""
+        return manager.CODE_UPDATE_LOG_FILE.read_text(encoding="utf-8")
+
+    # -- Task ①: sha equal but the process is stale -> resume ------
+
+    def test_resume_completes_unfinished_update_when_process_stale(self) -> None:
+        install_dir = self._make_update_install_dir("1.2.7")
+        fake, calls, state = self._resume_fake("stale")
+        result = manager.run_code_update_worker(
+            install_dir=install_dir,
+            runner=fake,
+            panel_healthy=lambda h, p, t: True,
+        )
+        self.assertTrue(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("success", status["result"])
+        self.assertIn("补完", status["message"])
+        self.assertIn("1.2.7", status["message"])
+        # The install ran exactly once, with verification ...
+        self.assertEqual(1, state["installs"])
+        # ... and neither checkout nor the temp-worktree stage ran:
+        # the disk tree already was the target commit.
+        self.assertNotIn(["git", "checkout", "-B", "main", "origin/main"], calls)
+        self.assertFalse(any(c[:3] == ["git", "worktree", "add"] for c in calls))
+        # Log identifiability: resume markers present, and (task ④)
+        # the install pre-marker precedes the install output tail.
+        log_text = self._log_text()
+        self.assertIn("[resume]", log_text)
+        self.assertIn("补完未竟更新", log_text)
+        self.assertLess(
+            log_text.index("开始执行 install.sh"),
+            log_text.index("安装脚本输出尾部"),
+        )
+
+    # -- Task ②: sha equal and the process is consistent -----------
+
+    def test_already_latest_requires_consistent_process(self) -> None:
+        install_dir = self._make_update_install_dir("1.2.7")
+        fake, calls, state = self._resume_fake("consistent")
+        result = manager.run_code_update_worker(
+            install_dir=install_dir,
+            runner=fake,
+            panel_healthy=lambda h, p, t: True,
+        )
+        self.assertTrue(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("success", status["result"])
+        self.assertIn("已是最新", status["message"])
+        self.assertEqual(0, state["installs"])
+        self.assertNotIn(["bash", "install.sh"], calls)
+        self.assertNotIn(["git", "checkout", "-B", "main", "origin/main"], calls)
+
+    # -- Task ⑤: consistency unprovable -> never "already latest" --
+
+    def test_unprovable_process_resumes_instead_of_reporting_latest(self) -> None:
+        install_dir = self._make_update_install_dir("1.2.7")
+        fake, calls, state = self._resume_fake("no-systemd")
+        result = manager.run_code_update_worker(
+            install_dir=install_dir,
+            runner=fake,
+            panel_healthy=lambda h, p, t: True,
+            panel_http_check=lambda h, p, t: True,
+        )
+        self.assertTrue(result)
+        status = manager.read_code_update_status()
+        self.assertEqual("success", status["result"])
+        self.assertNotIn("已是最新", status["message"])
+        # It resumed (install executed) and the verdict degraded
+        # honestly instead of claiming full process proof.
+        self.assertEqual(1, state["installs"])
+        self.assertIn("补完", status["message"])
+        self.assertIn("降级核验", status["message"])
+
+    # -- Task ③: spawn method is traced to the update log ----------
+
+    def test_spawn_methods_are_traced_to_update_log(self) -> None:
+        with (
+            mock.patch.object(manager.subprocess, "run", return_value=mock.Mock(returncode=0)),
+            mock.patch.object(manager.subprocess, "Popen") as popen_mock,
+        ):
+            ok, method, detail = manager.spawn_code_updater_detailed()
+        self.assertTrue(ok)
+        self.assertEqual("systemd-run", method)
+        popen_mock.assert_not_called()
+        log_text = self._log_text()
+        self.assertIn("systemd-run scope 成功", log_text)
+
+        manager.CODE_UPDATE_LOG_FILE.write_text("", encoding="utf-8")
+        with (
+            mock.patch.object(manager.subprocess, "run", return_value=mock.Mock(returncode=1)),
+            mock.patch.object(manager.subprocess, "Popen") as popen_mock,
+        ):
+            ok, method, detail = manager.spawn_code_updater_detailed()
+        self.assertTrue(ok)
+        self.assertEqual("setsid", method)
+        popen_mock.assert_called_once()
+        log_text = self._log_text()
+        self.assertIn("systemd-run 失败", log_text)
+        self.assertIn("返回码 1", log_text)
+        self.assertIn("回退 setsid", log_text)
+
+    # -- Single-instance guard --------------------------------------
+
+    def test_second_worker_exits_without_touching_status_when_lock_held(self) -> None:
+        handle, contended = manager._code_update_try_acquire_worker_lock()
+        self.assertIsNotNone(handle)
+        self.assertFalse(contended)
+        try:
+            fake, calls, state = self._resume_fake("consistent")
+            result = manager.run_code_update_worker(
+                install_dir=self._make_update_install_dir("1.2.7"),
+                runner=fake,
+                panel_healthy=lambda h, p, t: True,
+            )
+            self.assertFalse(result)
+            self.assertEqual([], calls)
+            # The losing worker writes NO status at all: it can
+            # neither fake a success nor clobber the live record.
+            self.assertFalse(manager.CODE_UPDATE_STATUS_FILE.exists())
+            self.assertIn("已有另一个更新器进程正在运行", self._log_text())
+        finally:
+            handle.close()
+        # The lock is free again once the holder lets go.
+        handle2, contended2 = manager._code_update_try_acquire_worker_lock()
+        self.assertIsNotNone(handle2)
+        self.assertFalse(contended2)
+        handle2.close()
+
+    # -- The consistency signal itself -------------------------------
+
+    def test_process_disk_consistency_verdicts(self) -> None:
+        install_dir = self._make_update_install_dir("1.2.7")
+
+        def systemd_run(mono_delta_seconds: float):
+            def run(cmd, cwd, timeout, env=None):
+                mono_us = int((manager.time.monotonic() + mono_delta_seconds) * 1_000_000)
+                return self._fake_result(
+                    0,
+                    "MainPID=111\n"
+                    "ActiveEnterTimestamp=Mon 2026-11-03 10:00:00 UTC\n"
+                    f"ExecMainStartTimestampMonotonic={mono_us}\n",
+                )
+            return run
+
+        verdict, _ = manager._code_update_process_disk_consistency(
+            systemd_run(0), install_dir
+        )
+        self.assertEqual("consistent", verdict)
+        mono = manager.time.monotonic()
+        stale_delta = -120.0 if mono > 240 else -(mono / 2)
+        verdict, _ = manager._code_update_process_disk_consistency(
+            systemd_run(stale_delta), install_dir
+        )
+        self.assertEqual("stale", verdict)
+
+        def no_systemd(cmd, cwd, timeout, env=None):
+            return self._fake_result(1, "", "not booted with systemd")
+
+        verdict, _ = manager._code_update_process_disk_consistency(
+            no_systemd, install_dir
+        )
+        self.assertEqual("unknown", verdict)
+
+        def no_monotonic(cmd, cwd, timeout, env=None):
+            return self._fake_result(
+                0, "MainPID=111\nActiveEnterTimestamp=Mon 2026-11-03 10:00:00 UTC\n"
+            )
+
+        verdict, _ = manager._code_update_process_disk_consistency(
+            no_monotonic, install_dir
+        )
+        self.assertEqual("unknown", verdict)
 
 
 class Plus126Stage2CoffeeScoreTests(unittest.TestCase):
@@ -4942,3 +5226,503 @@ class Plus126Stage3PanelTests(unittest.TestCase):
         ]
         self.assertIn("await refreshStateFirst();", refresh)
         self.assertIn("if (!state.maintenance_running) {", refresh)
+
+
+class Plus127Stage1RiskScoreDisplayTests(unittest.TestCase):
+    """1.2.7 stage 1: risk-score display fixes (plan §一).
+
+    Two changes, both in the panel script only: esc() no longer
+    swallows the number 0 (null/undefined/"" still collapse to "",
+    string escaping is byte-identical), and the risk-score cell
+    renders through riskScoreCellHtml(), which shows a genuine 0 and
+    colours the number by band (0-19 green, 20-29 light green,
+    30-49 orange, 50-100 red). Behaviour is verified by executing
+    the panel's own esc()/riskScoreCellHtml() source under node,
+    the same extraction style as the dashboard syntax check.
+    """
+
+    def _run_risk_cell_harness(self) -> dict:
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed; JS behaviour checks skipped")
+        html = manager.INDEX_HTML
+        esc_line = next(
+            line for line in html.splitlines() if line.startswith("const esc=")
+        )
+        cell_start = html.index("function riskScoreCellHtml(n) {")
+        cell_end = html.index("function riskScoreTitle(n) {", cell_start)
+        script = "\n".join(
+            [
+                esc_line,
+                html[cell_start:cell_end],
+                "const cellCases = [0, 1, 19, 20, 29, 30, 49, 50, 100, null, undefined];",
+                "const out = {",
+                "  cells: cellCases.map(s => riskScoreCellHtml({risk_display_score: s})),",
+                "  escCases: [esc(null), esc(undefined), esc(''), esc(0), esc(1),"
+                " esc('plain'), esc('a<b>&\"\\''), esc(false), esc('0')],",
+                "};",
+                "console.log(JSON.stringify(out));",
+            ]
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", encoding="utf-8", delete=False
+        ) as handle:
+            handle.write(script)
+            script_path = handle.name
+        try:
+            result = subprocess.run(
+                ["node", script_path],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        finally:
+            Path(script_path).unlink(missing_ok=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        return json.loads(result.stdout.strip())
+
+    def test_panel_risk_score_cell_markers(self) -> None:
+        html = manager.INDEX_HTML
+
+        # The cell delegates to the band helper; the old inline
+        # rendering (whose esc() call swallowed a genuine 0) is gone,
+        # while the tooltip wiring is untouched.
+        self.assertIn('title="${esc(riskTitle)}">${riskScoreCellHtml(n)}</td>', html)
+        self.assertNotIn('? "—" : esc(n.risk_display_score)', html)
+
+        # Band thresholds and colours are pinned verbatim.
+        start = html.index("function riskScoreCellHtml(n) {")
+        body = html[start:html.index("function riskScoreTitle(n) {", start)]
+        self.assertIn('if (score === null || score === undefined) return "—";', body)
+        self.assertIn('score < 20 ? "#34d399"', body)
+        self.assertIn('score < 30 ? "#a3e635"', body)
+        self.assertIn('score < 50 ? "#f59e0b"', body)
+        self.assertIn('"#f87171"', body)
+        self.assertIn("font-weight: 700", body)
+        self.assertIn("${esc(score)}", body)
+
+        # esc() numeric fidelity: the falsy `|| ""` form is gone and
+        # only null/undefined collapse to "".
+        self.assertIn('const esc=s=>String(s===null||s===undefined?"":s)', html)
+        self.assertNotIn("const esc=s=>String(s||", html)
+
+        # The tooltip function keeps its 1.2.6 wording verbatim.
+        title_start = html.index("function riskScoreTitle(n) {")
+        title_body = html[
+            title_start:html.index("async function checkNodeScore", title_start)
+        ]
+        self.assertIn("风险系数 ${n.risk_display_score}（0–100，越高越危险）", title_body)
+
+    def test_risk_cell_zero_and_band_boundaries(self) -> None:
+        out = self._run_risk_cell_harness()
+        green = '<span style="color: #34d399; font-weight: 700;">{}</span>'
+        light = '<span style="color: #a3e635; font-weight: 700;">{}</span>'
+        orange = '<span style="color: #f59e0b; font-weight: 700;">{}</span>'
+        red = '<span style="color: #f87171; font-weight: 700;">{}</span>'
+        self.assertEqual(
+            [
+                green.format(0),  # the fix: a genuine 0 renders, green
+                green.format(1),
+                green.format(19),
+                light.format(20),
+                light.format(29),
+                orange.format(30),
+                orange.format(49),
+                red.format(50),
+                red.format(100),
+                "—",  # null: unqueried, uncoloured
+                "—",  # undefined: same
+            ],
+            out["cells"],
+        )
+
+    def test_esc_regression_lock(self) -> None:
+        out = self._run_risk_cell_harness()
+        self.assertEqual(
+            [
+                "",  # null -> "" (unchanged from baseline)
+                "",  # undefined -> "" (unchanged)
+                "",  # "" -> "" (unchanged)
+                "0",  # 0 -> "0" (THE fix; baseline returned "")
+                "1",  # other numbers stringify (unchanged)
+                "plain",
+                "a&lt;b&gt;&amp;&quot;&#039;",  # escaping verbatim (unchanged)
+                "false",  # boolean false now stringifies (was ""); no
+                # current call site passes a boolean -- locked so a
+                # future one behaves deliberately, see impl notes.
+                "0",  # the string "0" (unchanged)
+            ],
+            out["escCases"],
+        )
+
+
+class Plus127Stage2ConnectionPriorityTests(unittest.TestCase):
+    """1.2.7 stage 2: connection priority over probing (plan §二).
+
+    Covers the connection-priority signal (set by begin_connection_
+    attempt, cleared by finish_connection_attempt), its preemption of
+    probe batches inside test_multiple_nodes, the maintenance re-order
+    (connect from already-known available nodes BEFORE any probing),
+    the suspension of new probe work while the signal is set, the
+    startup reset of leftover "testing" rows, and connected-maintenance
+    equivalence with the pre-change flow.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.root = root
+        self.path_patches = [
+            mock.patch.object(manager, "DATA_DIR", root),
+            mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
+            mock.patch.object(manager, "CONFIG_STORE_FILE", root / "node_configs.json"),
+            mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "STATE_FILE", root / "state.json"),
+            mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
+            mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
+            mock.patch.object(manager, "API_CACHE_FILE", root / "api_snapshot.csv"),
+            mock.patch.object(manager, "API_CACHE_META_FILE", root / "api_snapshot.meta.json"),
+            mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
+            mock.patch.object(manager, "RETAINED_ARCHIVE_FILE", root / "retained_archive.json"),
+            mock.patch.object(manager.vpn_utils, "DATA_DIR", root),
+            mock.patch.object(manager.vpn_utils, "IP_CACHE_FILE", root / "ip_cache.json"),
+        ]
+        for patcher in self.path_patches:
+            patcher.start()
+        manager.ensure_dirs()
+        manager._config_store_cache["key"] = None
+        manager._config_store_cache["data"] = {}
+        self._saved_restart_first = manager._first_maintain_after_startup
+        manager._first_maintain_after_startup = True
+        manager.active_openvpn_process = None
+        manager.pending_openvpn_process = None
+        manager.active_openvpn_node_id = ""
+        manager.active_connection_cancel_event = None
+        manager.is_connecting = False
+        manager.consecutive_proxy_failures = 0
+        manager.last_proxy_failure_node_id = ""
+        manager.background_refill_thread = None
+        manager.background_refill_cancel_event.clear()
+        manager.active_sessions.clear()
+        manager.full_sweep_running = False
+        manager.full_sweep_cancel_requested = False
+        manager.connection_priority_event.clear()
+        manager._switch_watch_last_id = ""
+        manager.clear_switch_sweep_pending()
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+
+    def tearDown(self) -> None:
+        if manager.connection_attempt_lock.locked():
+            manager.connection_attempt_lock.release()
+        manager.connection_priority_event.clear()
+        manager.background_refill_cancel_event.set()
+        manager.background_refill_thread = None
+        manager._first_maintain_after_startup = self._saved_restart_first
+        manager.active_openvpn_node_id = ""
+        manager._switch_watch_last_id = ""
+        manager.clear_switch_sweep_pending()
+        manager._config_store_cache["key"] = None
+        manager._config_store_cache["data"] = {}
+        manager._retained_count_cache["key"] = None
+        manager._retained_count_cache["count"] = 0
+        for patcher in reversed(self.path_patches):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    # -- helpers ------------------------------------------------------
+
+    def _node(self, node_id: str, ip: str, country_short: str = "JP", **extra) -> dict:
+        node = {
+            "id": node_id,
+            "country": "日本" if country_short == "JP" else "韩国",
+            "country_short": country_short,
+            "ip": ip,
+            "remote_host": ip,
+            "remote_port": 1194,
+            "proto": "udp",
+            "ping": 10,
+            "score": 100,
+            "speed": 1000,
+            "sessions": 1,
+            "latency_ms": 0,
+            "config_file": str(manager.CONFIG_DIR / f"{node_id}.ovpn"),
+            "probe_status": "not_checked",
+            "probe_message": "",
+            "probed_at": 0,
+            "retention_status": "normal",
+            "last_seen_at": manager.time.time(),
+            "source_present": 1,
+            "consecutive_failures": 0,
+            "last_success_at": 0,
+            "active": False,
+        }
+        node.update(extra)
+        return node
+
+    def _jp_ui_cfg(self) -> dict:
+        return {
+            "connection_enabled": True,
+            "routing_mode": "fixed_region",
+            "force_country": "JP",
+            "routing_ip_type": "all",
+            "favorite_node_ids": [],
+            "retained_pool_enabled": True,
+            "discovery_countries": [],
+        }
+
+    # -- ① maintenance connects before probing -------------------------
+
+    def test_maintain_connects_known_available_before_any_probing(self) -> None:
+        jp_prev = self._node(
+            "jp-a", "198.51.100.21", probe_status="available", probed_at=111.0
+        )
+        kr_prev = self._node(
+            "kr-b", "198.51.100.22", country_short="KR",
+            probe_status="available", probed_at=111.0,
+        )
+        manager.write_json(manager.NODES_FILE, [jp_prev, kr_prev])
+        candidates = [self._node("jp-a", "198.51.100.21"), self._node("kr-b", "198.51.100.22", country_short="KR")]
+
+        calls: list[str] = []
+        running = {"value": False}
+
+        def fake_switch() -> None:
+            calls.append("auto_switch")
+            running["value"] = True
+
+        def fake_test(ids, target_available=None, **kwargs):
+            calls.append("test_multiple_nodes")
+            return [
+                {
+                    "id": ids[0],
+                    "latency_ms": 5,
+                    "probe_status": "available",
+                    "probe_message": "ok",
+                    "probed_at": 222.0,
+                }
+            ]
+
+        def fake_sweep(systemic_probe_failure=""):
+            calls.append("run_full_sweep")
+            return {"skipped": True, "tested": 0, "available": 0, "unavailable": 0}
+
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "load_ui_config", return_value=self._jp_ui_cfg()),
+            mock.patch.object(
+                manager, "active_openvpn_running", side_effect=lambda: running["value"]
+            ),
+            mock.patch.object(manager, "auto_switch_node", side_effect=fake_switch),
+            mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test),
+            mock.patch.object(manager, "sweep_retained_nodes", return_value=0),
+            mock.patch.object(manager, "run_full_sweep", side_effect=fake_sweep),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            message = manager.maintain_valid_nodes(force=False, trigger="auto")
+
+        # The pre-connect switch is the FIRST action of the round: it
+        # precedes every probe batch in the round.
+        self.assertEqual("auto_switch", calls[0])
+        self.assertLess(calls.index("auto_switch"), calls.index("test_multiple_nodes"))
+        self.assertTrue(running["value"])
+        # Once connected, the fast-connect block skips itself (its
+        # condition requires no running tunnel) and the round completes
+        # as an ordinary connected maintain: one periodic test batch,
+        # then the gated terminal sweep, baseline message shape.
+        self.assertEqual(1, calls.count("auto_switch"))
+        self.assertTrue(
+            message.startswith(
+                "Fetched 2 nodes. Tested 1 prioritized non-active nodes."
+            )
+        )
+
+    # -- ② signal preempts probe batches, results persist --------------
+
+    def test_probe_batch_yields_to_connection_priority_and_persists(self) -> None:
+        ids = [f"n{i}" for i in range(1, 13)]
+        nodes = []
+        store = {}
+        for i, nid in enumerate(ids, start=1):
+            nodes.append(self._node(nid, f"198.51.100.{30 + i}"))
+            store[nid] = f"client\nremote 198.51.100.{30 + i} 1194 udp\n# cfg-{nid}\n"
+        manager.write_json(manager.NODES_FILE, nodes)
+        manager.write_config_store(store)
+
+        def fake_openvpn(config_path, **kwargs):
+            text = Path(config_path).read_text(encoding="utf-8")
+            if "# cfg-n5" in text:
+                # A connection attempt begins while batch 1 is in
+                # flight; the batch loop must stop before batch 2.
+                manager.connection_priority_event.set()
+            return True, "ok", None
+
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=5),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info", return_value=None),
+            mock.patch.object(
+                manager, "run_openvpn_until_ready", side_effect=fake_openvpn
+            ),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            results = manager.test_multiple_nodes(ids)
+
+        # Batch 1 (5 workers) completed and returned; batches 2-3
+        # never started.
+        self.assertEqual(5, len(results))
+        self.assertEqual({f"n{i}" for i in range(1, 6)}, {r["id"] for r in results})
+        on_disk = {n["id"]: n for n in manager.read_nodes()}
+        for i in range(1, 6):
+            self.assertEqual("available", on_disk[f"n{i}"]["probe_status"])
+            self.assertGreater(on_disk[f"n{i}"]["probed_at"], 0)
+        for i in range(6, 13):
+            self.assertEqual("not_checked", on_disk[f"n{i}"]["probe_status"])
+        # No fresh "testing" residue anywhere after the preemption.
+        self.assertFalse(
+            any(n.get("probe_status") == "testing" for n in on_disk.values())
+        )
+
+    def test_maintain_starts_no_probes_while_connection_priority_set(self) -> None:
+        nodes = [self._node(f"m{i}", f"198.51.100.{40 + i}") for i in range(1, 4)]
+        store = {
+            n["id"]: f"client\nremote {n['ip']} 1194 udp\n# cfg-{n['id']}\n"
+            for n in nodes
+        }
+        manager.write_json(manager.NODES_FILE, nodes)
+        manager.write_config_store(store)
+        candidates = [self._node(f"m{i}", f"198.51.100.{40 + i}") for i in range(1, 4)]
+        manager.connection_priority_event.set()
+        sweep_mock = mock.Mock(return_value=0)
+        switch_mock = mock.Mock()
+
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "load_ui_config", return_value=self._jp_ui_cfg()),
+            mock.patch.object(manager, "active_openvpn_running", return_value=False),
+            mock.patch.object(manager, "auto_switch_node", switch_mock),
+            mock.patch.object(manager, "sweep_retained_nodes", sweep_mock),
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=5),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info", return_value=None),
+            mock.patch.object(
+                manager,
+                "run_openvpn_until_ready",
+                side_effect=AssertionError("probe must not run under connection priority"),
+            ),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            message = manager.maintain_valid_nodes(force=False, trigger="auto")
+
+        # Both probe stages self-stopped at their first batch check:
+        # nothing was tested, nothing connected, the liveness sweep
+        # was not started.
+        self.assertIn("Tested 0 prioritized non-active nodes.", message)
+        switch_mock.assert_not_called()
+        sweep_mock.assert_not_called()
+        on_disk = manager.read_nodes()
+        self.assertTrue(
+            all(n.get("probe_status") == "not_checked" for n in on_disk)
+        )
+
+    # -- ③ startup reset of "testing" residue --------------------------
+
+    def test_reset_stale_testing_nodes(self) -> None:
+        stale = self._node(
+            "stale-1", "198.51.100.51",
+            probe_status="testing",
+            probe_message="正在检测节点连通性...",
+            probed_at=12345.0,
+            latency_ms=7,
+            consecutive_failures=2,
+        )
+        healthy = self._node(
+            "ok-1", "198.51.100.52", probe_status="available", probed_at=999.0
+        )
+        fresh = self._node("new-1", "198.51.100.53")
+        manager.write_json(manager.NODES_FILE, [stale, healthy, fresh])
+
+        with mock.patch.object(manager, "log_to_json"):
+            reset_count = manager.reset_stale_testing_nodes()
+            second_count = manager.reset_stale_testing_nodes()
+
+        self.assertEqual(1, reset_count)
+        self.assertEqual(0, second_count)  # idempotent
+        on_disk = {n["id"]: n for n in manager.read_nodes()}
+        reset_row = on_disk["stale-1"]
+        self.assertEqual("not_checked", reset_row["probe_status"])
+        self.assertEqual("", reset_row["probe_message"])
+        self.assertEqual(0, reset_row["probed_at"])
+        # Nothing else on the reset row changes.
+        self.assertEqual(7, reset_row["latency_ms"])
+        self.assertEqual(2, reset_row["consecutive_failures"])
+        # Other rows are byte-for-byte the records that were written.
+        self.assertEqual(healthy, on_disk["ok-1"])
+        self.assertEqual(fresh, on_disk["new-1"])
+
+    # -- ④ signal lifecycle + connected-maintenance equivalence --------
+
+    def test_connection_priority_signal_lifecycle(self) -> None:
+        self.assertFalse(manager.connection_priority_event.is_set())
+        token, cancel_event = manager.begin_connection_attempt()
+        try:
+            self.assertTrue(manager.connection_priority_event.is_set())
+            self.assertTrue(manager.is_connecting)
+            # A rejected (busy) begin must not disturb the live flag.
+            with self.assertRaises(RuntimeError):
+                manager.begin_connection_attempt()
+            self.assertTrue(manager.connection_priority_event.is_set())
+        finally:
+            manager.finish_connection_attempt(token, cancel_event)
+        self.assertFalse(manager.connection_priority_event.is_set())
+        self.assertFalse(manager.is_connecting)
+        # The attempt lock is free again for the next attempt.
+        token2, cancel_event2 = manager.begin_connection_attempt()
+        manager.finish_connection_attempt(token2, cancel_event2)
+        self.assertFalse(manager.connection_priority_event.is_set())
+
+    def test_connected_maintain_matches_baseline_flow(self) -> None:
+        manager._first_maintain_after_startup = False
+        candidate = self._node("c1", "198.51.100.61")
+        calls: list[str] = []
+
+        def fake_test(ids, target_available=None, **kwargs):
+            calls.append("test_multiple_nodes")
+            return [
+                {
+                    "id": ids[0],
+                    "latency_ms": 5,
+                    "probe_status": "available",
+                    "probe_message": "ok",
+                    "probed_at": 222.0,
+                }
+            ]
+
+        def fake_sweep(systemic_probe_failure=""):
+            calls.append("run_full_sweep")
+            return {
+                "skipped": False, "tested": 3, "available": 2,
+                "unavailable": 1, "interrupted": False,
+            }
+
+        switch_mock = mock.Mock(side_effect=lambda: calls.append("auto_switch"))
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=[candidate]),
+            mock.patch.object(manager, "load_ui_config", return_value=self._jp_ui_cfg()),
+            mock.patch.object(manager, "active_openvpn_running", return_value=True),
+            mock.patch.object(manager, "auto_switch_node", switch_mock),
+            mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test),
+            mock.patch.object(manager, "sweep_retained_nodes", return_value=0),
+            mock.patch.object(manager, "run_full_sweep", side_effect=fake_sweep),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            message = manager.maintain_valid_nodes(force=False, trigger="auto")
+
+        # Already connected: no pre-connect attempt, no switch at all;
+        # the round is periodic testing followed by the gated sweep,
+        # with the baseline message shape.
+        switch_mock.assert_not_called()
+        self.assertEqual(["test_multiple_nodes", "run_full_sweep"], calls)
+        self.assertEqual(
+            "Fetched 1 nodes. Tested 1 prioritized non-active nodes. "
+            "全量检测：共 3 个，可用 2 个，不可用 1 个。",
+            message,
+        )
