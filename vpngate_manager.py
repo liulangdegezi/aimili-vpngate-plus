@@ -212,7 +212,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.2.8"
+DEFAULT_APP_VERSION = "1.2.9"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -1023,9 +1023,50 @@ def sync_config_store_lifecycle() -> int:
     maintenance/tests rather than as a per-read tax.
     """
     with lock:
+        def _store_is_nonempty() -> bool:
+            try:
+                return CONFIG_STORE_FILE.stat().st_size > 0
+            except FileNotFoundError:
+                return False
+
+        # 1.2.9 stage 1 guard: read_json() swallows damage and returns
+        # a default, so a damaged node table would read as empty and
+        # the sweep would delete the whole store as orphans. Check
+        # the archive FIRST, from its raw bytes (never via read_json,
+        # never via any function that may write a file).
+        archive_unreadable = False
+        try:
+            archive_size = RETAINED_ARCHIVE_FILE.stat().st_size
+        except FileNotFoundError:
+            archive_size = None
+        except OSError:
+            archive_unreadable = True
+        else:
+            if archive_size > 0:
+                try:
+                    raw_archive = RETAINED_ARCHIVE_FILE.read_bytes().decode("utf-8")
+                    parsed_archive = json.loads(raw_archive)
+                    if not isinstance(parsed_archive, list):
+                        archive_unreadable = True
+                except Exception:
+                    # Scheme v10: ANY exception reading the raw archive
+                    # (not just OSError/UnicodeDecodeError/JSONDecodeError,
+                    # e.g. RecursionError on deeply nested JSON) means
+                    # the archive is unreadable.
+                    archive_unreadable = True
+
+        if archive_unreadable and _store_is_nonempty():
+            print("[启动自检] 配置仓清扫跳过：归档不可读，仓未动", flush=True)
+            return 0
+
+        nodes = read_nodes()
+        if nodes == [] and _store_is_nonempty():
+            print("[启动自检] 配置仓清扫跳过：节点表为空，仓未动", flush=True)
+            return 0
+
         referenced = {
             str(n.get("id"))
-            for n in read_nodes()
+            for n in nodes
             if n.get("id")
         }
         archive = read_json(RETAINED_ARCHIVE_FILE, [])
@@ -3301,6 +3342,10 @@ def cancel_pending_connection_attempt() -> None:
         pending = pending_openvpn_process
         pending_openvpn_process = None
         is_connecting = False
+        # 1.2.9 stage 2 (plan §二): the superseded attempt's finish()
+        # cannot clear the signal (epoch mismatch), so clear it here
+        # in the same lock; the early return above must not touch it.
+        connection_priority_event.clear()
     stop_process(pending)
 
 def reset_stale_testing_nodes() -> int:
@@ -5698,7 +5743,11 @@ def maintain_valid_nodes(force: bool = False, trigger: str = "auto") -> str:
             # beyond the cap (active / favorite / normal nodes untouched).
             observing = [n for n in merged if n.get("retention_status") == "observing" and not n.get("active")]
             if len(observing) > RETAINED_POOL_MAX_NODES:
-                observing.sort(key=lambda n: float(n.get("last_seen_at") or 0))
+                # 1.2.9 stage 4 (plan §四, split-half): primary key is
+                # last_success_at (last usable time); last_seen_at is
+                # only the tie-break, preserving the old order among
+                # never-succeeded nodes. Scores never enter eviction.
+                observing.sort(key=lambda n: (float(n.get("last_success_at") or 0), float(n.get("last_seen_at") or 0)))
                 evicted_ids = {str(n.get("id")) for n in observing[:len(observing) - RETAINED_POOL_MAX_NODES]}
                 for evicted in observing:
                     if str(evicted.get("id")) in evicted_ids:
@@ -7575,12 +7624,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.2.8 正式版</span>
+        <span id="github_version_label">V1.2.9 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.2.8 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.2.9 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <div class="update-action-row">
@@ -8437,7 +8486,7 @@ function stableSortNodes() {
 function render(){
   updateRetainedPoolVisibilityUI();
   updateRetainedPoolEnabledUI();
-  const versionLabel = state.app_version_label || "V1.2.8 正式版";
+  const versionLabel = state.app_version_label || "V1.2.9 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -11445,7 +11494,14 @@ def main() -> None:
     # 1.2.7 stage 2 (plan §二.4): heal any "testing" probe residue the
     # previous process left in the node table, before the collector
     # thread (started below) can run its first maintain against it.
-    reset_stale_testing_nodes()
+    # 1.2.9 appendix: the heal reads the node table, which may be
+    # undecodable; a failure here must not abort startup (same guard
+    # as the sweep wiring below). The line goes to stdout only (Tee
+    # is not installed yet), not vpngate.log.
+    try:
+        reset_stale_testing_nodes()
+    except Exception as exc:
+        print(f"[启动自愈] 节点残留状态复位失败：{exc}，继续启动", flush=True)
     # 1.2.8 (plan §三): finalize an update status the previous
     # process's worker left at "running" when the install's service
     # restart killed it before it could write back its verdict. The
@@ -11479,6 +11535,16 @@ def main() -> None:
             "blacklisted_nodes": 0,
         },
     )
+    # 1.2.9 stage 1 (plan §一): prune orphaned config-store entries
+    # once at startup. Any failure is logged only and never blocks
+    # startup; the sweep itself is atomic (write_json tmp+replace),
+    # so a failed sweep leaves no half-written state.
+    try:
+        pruned = sync_config_store_lifecycle()
+        if pruned > 0:
+            print(f"[启动自检] 配置仓清扫：已清 {pruned} 条孤儿配置", flush=True)
+    except Exception as exc:
+        print(f"[启动自检] 配置仓清扫失败：{exc}", flush=True)
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
     
     # Wait for the gateway to officially start
