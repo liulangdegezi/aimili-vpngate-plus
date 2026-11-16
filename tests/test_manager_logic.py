@@ -567,6 +567,44 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertFalse(manager.is_connecting)
         self.assertEqual(previous_epoch + 1, manager.connection_epoch)
 
+    def test_cancel_pending_connection_clears_priority_signal(self) -> None:
+        # 1.2.9 stage 2 (plan §二): cancelling an in-flight attempt
+        # must clear connection_priority_event in the same lock --
+        # the superseded attempt's finish() cannot clear it itself
+        # (epoch mismatch).
+        process = FakeProcess()
+        event = threading.Event()
+        manager.pending_openvpn_process = process
+        manager.active_connection_cancel_event = event
+        manager.is_connecting = True
+        manager.connection_priority_event.set()
+        try:
+            manager.cancel_pending_connection_attempt()
+            self.assertFalse(manager.connection_priority_event.is_set())
+        finally:
+            manager.connection_priority_event.clear()
+
+        self.assertTrue(event.is_set())
+        self.assertTrue(process.terminated)
+        self.assertIsNone(manager.pending_openvpn_process)
+        self.assertFalse(manager.is_connecting)
+
+    def test_cancel_with_no_attempt_leaves_priority_signal_untouched(self) -> None:
+        # 1.2.9 stage 2 (plan §二): the early return (no attempt in
+        # flight) must not touch the signal or any other state.
+        manager.active_connection_cancel_event = None
+        manager.pending_openvpn_process = None
+        manager.is_connecting = False
+        manager.connection_priority_event.set()
+        try:
+            manager.cancel_pending_connection_attempt()
+            self.assertTrue(manager.connection_priority_event.is_set())
+        finally:
+            manager.connection_priority_event.clear()
+
+        self.assertIsNone(manager.pending_openvpn_process)
+        self.assertFalse(manager.is_connecting)
+
     def test_proxy_failures_reset_when_node_changes(self) -> None:
         self.assertEqual(1, manager.record_proxy_failure("node-a"))
         self.assertEqual(2, manager.record_proxy_failure("node-a"))
@@ -843,8 +881,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.2.8", manager.APP_VERSION)
-        self.assertEqual("V1.2.8 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.2.9", manager.APP_VERSION)
+        self.assertEqual("V1.2.9 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -928,7 +966,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.2.8 正式版", result["current_version_label"])
+        self.assertEqual("V1.2.9 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -947,7 +985,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.2.8", result["current_version"])
+        self.assertEqual("1.2.9", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1492,19 +1530,20 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_2_8(self) -> None:
-        self.assertEqual("1.2.8", manager.APP_VERSION)
-        self.assertEqual("V1.2.8 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.2.8 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_2_9(self) -> None:
+        self.assertEqual("1.2.9", manager.APP_VERSION)
+        self.assertEqual("V1.2.9 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.2.9 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.2.8"', install_text)
+        self.assertIn('"1.2.9"', install_text)
         self.assertNotIn('"1.2.2"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.2.8", compose_text)
+        self.assertIn(":1.2.9", compose_text)
         self.assertNotIn("1.2.2", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.2.8", version_text)
+        self.assertEqual("1.2.9", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## V1.2.9（2026-11-16，已发布正式版 v1.2.9）", changelog)
         self.assertIn("## V1.2.8（2026-11-06，已发布正式版 v1.2.8）", changelog)
         self.assertIn("## V1.2.7（2026-11-06，已发布正式版 v1.2.7）", changelog)
         self.assertIn("## V1.2.6（2026-11-05，已发布正式版 v1.2.6）", changelog)
@@ -4861,6 +4900,14 @@ class Plus126ConfigStoreTests(unittest.TestCase):
         self.assertEqual("new-config-0", manager.get_node_config("new-0"))
         # Unrelated orphans are not this function's business.
         self.assertEqual("orphan-config", manager.get_node_config("orphan-1"))
+        # Populate a non-empty node table so the empty-table guard does not skip the sweep.
+        manager.write_json(
+            manager.NODES_FILE,
+            [
+                self._node(f"new-{index}", f"192.0.2.{80 + index}")
+                for index in range(3)
+            ],
+        )
         self.assertEqual(1, manager.sync_config_store_lifecycle())
         self.assertEqual("", manager.get_node_config("orphan-1"))
 
@@ -4878,8 +4925,193 @@ class Plus126ConfigStoreTests(unittest.TestCase):
             "client\nremote 192.0.2.91 1194 udp\n",
             manager.get_node_config("store-node-x"),
         )
+        # Empty-table guard skips the sweep when NODES_FILE reads empty and store is non-empty.
+        self.assertEqual(0, manager.sync_config_store_lifecycle())
+        self.assertEqual(
+            "client\nremote 192.0.2.91 1194 udp\n",
+            manager.get_node_config("store-node-x"),
+        )
+        # Once the node table is non-empty again, the next sweep prunes the orphan.
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._node("store-node-y", "192.0.2.92")],
+        )
         self.assertEqual(1, manager.sync_config_store_lifecycle())
         self.assertEqual("", manager.get_node_config("store-node-x"))
+
+
+    # 1.2.9 stage 1: startup self-check guard (plan §一). The guard
+    # must never let a damaged/empty table turn the whole store into
+    # orphans, and must check the archive BEFORE read_nodes() can do
+    # its migration write-back.
+
+    def test_lifecycle_keeps_active_node_config(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._node("active-node", "198.51.100.1", active=True)],
+        )
+        manager.write_json(manager.RETAINED_ARCHIVE_FILE, [])
+        manager.write_config_store({"active-node": "cfg-active"})
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 0)
+        self.assertEqual(manager.get_node_config("active-node"), "cfg-active")
+
+    def test_lifecycle_keeps_archive_referenced_config(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._node("live-node", "198.51.100.2")],
+        )
+        manager.write_json(
+            manager.RETAINED_ARCHIVE_FILE,
+            [{"id": "arch-node", "ip": "198.51.100.3"}],
+        )
+        manager.write_config_store(
+            {
+                "arch-node": "cfg-arch",
+                "orphan-node": "cfg-orphan",
+            }
+        )
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 1)
+        self.assertEqual(manager.get_node_config("arch-node"), "cfg-arch")
+        self.assertNotIn("orphan-node", manager.read_config_store())
+
+    def test_lifecycle_damaged_store_does_not_raise(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._node("n1", "198.51.100.10")],
+        )
+        manager.write_json(manager.RETAINED_ARCHIVE_FILE, [])
+        manager.CONFIG_STORE_FILE.write_bytes(b"{damaged store json")
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 0)
+        nodes = manager.read_nodes()
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0]["id"], "n1")
+
+    def test_lifecycle_guard_skips_when_table_empty_and_store_nonempty(self) -> None:
+        manager.write_json(manager.NODES_FILE, [])
+        manager.write_json(manager.RETAINED_ARCHIVE_FILE, [])
+        manager.write_config_store({"n1": "cfg-n1"})
+        before = manager.CONFIG_STORE_FILE.read_bytes()
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 0)
+        self.assertEqual(manager.CONFIG_STORE_FILE.read_bytes(), before)
+
+    def test_lifecycle_guard_skips_when_table_damaged_and_store_nonempty(self) -> None:
+        manager.NODES_FILE.write_bytes(b"{broken json")
+        manager.write_json(manager.RETAINED_ARCHIVE_FILE, [])
+        manager.write_config_store({"n1": "cfg-n1"})
+        before = manager.CONFIG_STORE_FILE.read_bytes()
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 0)
+        self.assertEqual(manager.CONFIG_STORE_FILE.read_bytes(), before)
+
+    def test_lifecycle_guard_skips_when_archive_not_a_list_and_store_nonempty(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._node("n1", "198.51.100.11")],
+        )
+        manager.write_json(manager.RETAINED_ARCHIVE_FILE, {"a": 1})
+        manager.write_config_store({"n1": "cfg-n1", "orphan": "cfg-orphan"})
+        before = manager.CONFIG_STORE_FILE.read_bytes()
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 0)
+        self.assertEqual(manager.CONFIG_STORE_FILE.read_bytes(), before)
+
+    def test_lifecycle_guard_skips_when_archive_damaged_json_and_store_nonempty(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._node("n1", "198.51.100.12")],
+        )
+        manager.RETAINED_ARCHIVE_FILE.write_bytes(b"[broken json")
+        manager.write_config_store({"n1": "cfg-n1", "orphan": "cfg-orphan"})
+        before = manager.CONFIG_STORE_FILE.read_bytes()
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 0)
+        self.assertEqual(manager.CONFIG_STORE_FILE.read_bytes(), before)
+
+    def test_lifecycle_guard_skips_when_archive_deeply_nested_and_store_nonempty(self) -> None:
+        # Scheme v10: ANY exception reading the raw archive means
+        # unreadable, not just OSError/UnicodeDecodeError/JSONDecodeError
+        # (deeply nested JSON raises RecursionError in json.loads).
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._node("n1", "198.51.100.12")],
+        )
+        manager.RETAINED_ARCHIVE_FILE.write_bytes(("[" * 10000 + "]" * 10000).encode("utf-8"))
+        manager.write_config_store({"n1": "cfg-n1", "orphan": "cfg-orphan"})
+        before = manager.CONFIG_STORE_FILE.read_bytes()
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 0)
+        self.assertEqual(manager.CONFIG_STORE_FILE.read_bytes(), before)
+
+    def test_lifecycle_guard_no_writes_before_skip_damaged_table_with_config_text_archive(self) -> None:
+        manager.NODES_FILE.write_bytes(b"{damaged table json")
+        manager.write_json(
+            manager.RETAINED_ARCHIVE_FILE,
+            [
+                {
+                    "id": "arch-1",
+                    "config_text": "client\nremote 192.0.2.10 1194 udp\n",
+                }
+            ],
+        )
+        manager.write_config_store({"kept": "cfg-kept"})
+
+        snapshots = {
+            path: (path.stat().st_mtime_ns, path.read_bytes())
+            for path in (
+                manager.NODES_FILE,
+                manager.RETAINED_ARCHIVE_FILE,
+                manager.CONFIG_STORE_FILE,
+            )
+        }
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 0)
+        for path, (mtime_ns, raw_bytes) in snapshots.items():
+            self.assertEqual(path.stat().st_mtime_ns, mtime_ns)
+            self.assertEqual(path.read_bytes(), raw_bytes)
+        self.assertEqual(manager.get_node_config("kept"), "cfg-kept")
+
+    def test_lifecycle_guard_archive_unreadable_skips_before_table_migration(self) -> None:
+        manager.RETAINED_ARCHIVE_FILE.write_bytes(b"{damaged archive json")
+        manager.write_json(
+            manager.NODES_FILE,
+            [
+                self._node(
+                    "n1",
+                    "192.0.2.99",
+                    config_text="client\nremote 192.0.2.99 1194 udp\n",
+                )
+            ],
+        )
+        manager.write_config_store({"kept": "cfg-kept"})
+
+        snapshots = {
+            path: (path.stat().st_mtime_ns, path.read_bytes())
+            for path in (
+                manager.NODES_FILE,
+                manager.RETAINED_ARCHIVE_FILE,
+                manager.CONFIG_STORE_FILE,
+            )
+        }
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 0)
+        for path, (mtime_ns, raw_bytes) in snapshots.items():
+            self.assertEqual(path.stat().st_mtime_ns, mtime_ns)
+            self.assertEqual(path.read_bytes(), raw_bytes)
+
+    def test_lifecycle_migration_writeback_still_happens_for_nonempty_table(self) -> None:
+        cfg = "client\nremote 192.0.2.55 1194 udp\n"
+        manager.write_json(
+            manager.NODES_FILE,
+            [self._node("n1", "192.0.2.55", config_text=cfg)],
+        )
+        manager.write_json(manager.RETAINED_ARCHIVE_FILE, [])
+
+        self.assertEqual(manager.sync_config_store_lifecycle(), 0)
+        self.assertEqual(manager.get_node_config("n1"), cfg)
 
 
 class Plus126Stage3PanelTests(unittest.TestCase):
@@ -5754,6 +5986,209 @@ class Plus127Stage2ConnectionPriorityTests(unittest.TestCase):
             "全量检测：共 3 个，可用 2 个，不可用 1 个。",
             message,
         )
+
+    # -- ⑤ 1.2.9 stage 4: retained-pool capacity eviction order --------
+
+    def _run_evicting_maintain(self, nodes, candidates, cap, ui_cfg=None):
+        """Drive one maintain round with a patched pool cap; return
+        (capacity-evicted ids, on-disk table). Nodes missing from the
+        fetched snapshot go through the missing-node path into the
+        observing pool, where the capacity check evicts the oldest
+        beyond the cap."""
+        manager.write_json(manager.NODES_FILE, nodes)
+        cfg = dict(ui_cfg) if ui_cfg is not None else self._jp_ui_cfg()
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "load_ui_config", return_value=cfg),
+            mock.patch.object(manager, "RETAINED_POOL_MAX_NODES", cap),
+            mock.patch.object(manager, "active_openvpn_running", return_value=False),
+            mock.patch.object(manager, "auto_switch_node", mock.Mock()),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+            mock.patch.object(manager, "sweep_retained_nodes", return_value=0),
+            mock.patch.object(
+                manager,
+                "run_full_sweep",
+                return_value={"skipped": True, "tested": 0, "available": 0, "unavailable": 0},
+            ),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            manager.maintain_valid_nodes(force=False, trigger="auto")
+        archive = manager.read_json(manager.RETAINED_ARCHIVE_FILE, [])
+        evicted = {
+            str(r["id"])
+            for r in archive
+            if r.get("reason") == "retained-pool-capacity"
+        }
+        on_disk = {n["id"]: n for n in manager.read_nodes()}
+        return evicted, on_disk
+
+    def test_capacity_eviction_uses_last_success_at_first(self) -> None:
+        # 1.2.9 stage 4 (plan §四): the eviction key is
+        # (last_success_at, last_seen_at). The two orders disagree
+        # here on purpose: by last_seen_at the victims would be
+        # keep-d then keep-c; by last_success_at they are evict-a
+        # then evict-b.
+        now = manager.time.time()
+        nodes = [
+            self._node("evict-a", "198.51.100.71", retention_status="observing",
+                       last_success_at=now - 3000, last_seen_at=now - 100),
+            self._node("evict-b", "198.51.100.72", retention_status="observing",
+                       last_success_at=now - 2000, last_seen_at=now - 200),
+            self._node("keep-c", "198.51.100.73", retention_status="observing",
+                       last_success_at=now - 1000, last_seen_at=now - 300),
+            self._node("keep-d", "198.51.100.74", retention_status="observing",
+                       last_success_at=now - 500, last_seen_at=now - 400),
+        ]
+        fresh = self._node("fresh-1", "198.51.100.75")
+        evicted, on_disk = self._run_evicting_maintain(nodes, [fresh], cap=2)
+
+        self.assertEqual({"evict-a", "evict-b"}, evicted)
+        self.assertNotIn("evict-a", on_disk)
+        self.assertNotIn("evict-b", on_disk)
+        self.assertIn("keep-c", on_disk)
+        self.assertIn("keep-d", on_disk)
+        self.assertIn("fresh-1", on_disk)
+
+    def test_capacity_eviction_tie_breaks_never_succeeded_by_last_seen(self) -> None:
+        # 1.2.9 stage 4 (plan §四): last_success_at == 0 (never
+        # succeeded) sorts first, and among those the oldest
+        # last_seen_at is evicted first.
+        now = manager.time.time()
+        nodes = [
+            self._node("zero-old", "198.51.100.81", retention_status="observing",
+                       last_success_at=0, last_seen_at=now - 400),
+            self._node("zero-mid", "198.51.100.82", retention_status="observing",
+                       last_success_at=0, last_seen_at=now - 200),
+            self._node("zero-new", "198.51.100.83", retention_status="observing",
+                       last_success_at=0, last_seen_at=now - 100),
+            self._node("ok-one", "198.51.100.84", retention_status="observing",
+                       last_success_at=now - 500, last_seen_at=now - 1000),
+        ]
+        fresh = self._node("fresh-1", "198.51.100.85")
+        evicted, on_disk = self._run_evicting_maintain(nodes, [fresh], cap=2)
+
+        self.assertEqual({"zero-old", "zero-mid"}, evicted)
+        self.assertIn("zero-new", on_disk)
+        self.assertIn("ok-one", on_disk)
+
+    def test_capacity_eviction_spares_active_favorite_and_normal(self) -> None:
+        # 1.2.9 stage 4 (plan §四): the cap touches only plain
+        # observing nodes; active / favorite / normal nodes are
+        # untouched even when they look older by the sort key.
+        now = manager.time.time()
+        nodes = [
+            self._node("plain-1", "198.51.100.91", retention_status="observing",
+                       last_success_at=now - 3000, last_seen_at=now - 100),
+            self._node("plain-2", "198.51.100.92", retention_status="observing",
+                       last_success_at=now - 1000, last_seen_at=now - 200),
+            self._node("plain-3", "198.51.100.93", retention_status="observing",
+                       last_success_at=now - 500, last_seen_at=now - 300),
+            self._node("active-1", "198.51.100.94", retention_status="observing",
+                       last_success_at=now - 4000, last_seen_at=now - 400,
+                       active=True),
+            self._node("fav-1", "198.51.100.95", retention_status="observing",
+                       last_success_at=now - 4000, last_seen_at=now - 400),
+            self._node("normal-1", "198.51.100.96"),
+        ]
+        fresh = self._node("fresh-1", "198.51.100.97")
+        cfg = self._jp_ui_cfg()
+        cfg["favorite_node_ids"] = ["fav-1"]
+        evicted, on_disk = self._run_evicting_maintain(
+            nodes, [fresh, self._node("normal-1", "198.51.100.96")],
+            cap=2, ui_cfg=cfg,
+        )
+
+        self.assertEqual({"plain-1"}, evicted)
+        for kept in ("plain-2", "plain-3", "active-1", "fav-1", "normal-1", "fresh-1"):
+            self.assertIn(kept, on_disk)
+
+
+class _StopServer(Exception):
+    """Sentinel raised by the mocked HTTP server to end main()."""
+
+
+class _FakeSocket:
+    def settimeout(self, timeout: float) -> None:
+        pass
+
+    def connect(self, address) -> None:
+        return None
+
+    def close(self) -> None:
+        pass
+
+
+class Plus129AppendixStartupHealTests(unittest.TestCase):
+    """1.2.9 appendix: main() must survive a failing startup heal."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.path_patches = [
+            mock.patch.object(manager, "DATA_DIR", root),
+            mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
+            mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "STATE_FILE", root / "state.json"),
+            mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
+            mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
+            mock.patch.object(manager, "RETAINED_ARCHIVE_FILE", root / "retained_archive.json"),
+        ]
+        for patcher in self.path_patches:
+            patcher.start()
+        manager.ensure_dirs()
+
+    def tearDown(self) -> None:
+        for patcher in reversed(self.path_patches):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_main_continues_when_startup_heal_fails(self) -> None:
+        # 1.2.9 appendix (plan 附录验收 4): the reset call in main()
+        # is guarded; a decode failure must print the failure line
+        # and let startup run all the way to the panel server. The
+        # §一 sweep must still run afterwards.
+        import sys
+
+        reset_mock = mock.Mock(
+            side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        )
+        sweep_mock = mock.Mock(return_value=0)
+        server_mock = mock.Mock()
+        server_mock.serve_forever.side_effect = _StopServer()
+        captured = io.StringIO()
+        saved_out, saved_err = sys.stdout, sys.stderr
+        try:
+            with (
+                mock.patch.object(manager, "ensure_dirs"),
+                mock.patch.object(manager, "kill_existing_openvpn_processes"),
+                mock.patch.object(manager, "reset_stale_testing_nodes", reset_mock),
+                mock.patch.object(manager, "finalize_orphaned_update_status"),
+                mock.patch.object(manager, "Tee", return_value=mock.Mock()),
+                mock.patch.object(manager, "write_json"),
+                mock.patch.object(manager, "sync_config_store_lifecycle", sweep_mock),
+                mock.patch.object(manager.threading, "Thread", return_value=mock.Mock()),
+                mock.patch.object(
+                    manager.socket, "socket",
+                    side_effect=lambda *args, **kwargs: _FakeSocket(),
+                ),
+                mock.patch.object(manager.time, "sleep"),
+                mock.patch.object(
+                    manager, "load_ui_config",
+                    return_value={"host": "127.0.0.1", "port": 8787},
+                ),
+                mock.patch.object(manager, "DualStackHTTPServer", return_value=server_mock),
+                contextlib.redirect_stdout(captured),
+            ):
+                with self.assertRaises(_StopServer):
+                    manager.main()
+        finally:
+            sys.stdout, sys.stderr = saved_out, saved_err
+
+        self.assertIn("[启动自愈] 节点残留状态复位失败：", captured.getvalue())
+        self.assertIn("继续启动", captured.getvalue())
+        reset_mock.assert_called_once()
+        sweep_mock.assert_called_once()
+        server_mock.serve_forever.assert_called_once()
 
 
 class Plus128Tests(unittest.TestCase):
