@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -212,7 +213,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.2.9"
+DEFAULT_APP_VERSION = "1.3.0"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -473,6 +474,75 @@ def normalize_discovery_countries(value: Any) -> list[str]:
             break
     return normalized
 
+PEER_NAME_MAX_LEN = 64
+_PEER_FORBIDDEN_CHARS = ("/", "?", "#", "@")
+
+
+def normalize_peer_entry(entry: Any) -> tuple[dict[str, Any] | None, str]:
+    """Validate one peer entry (V1.3.0 section 6).
+
+    Returns ``(normalized, "")`` or ``(None, reason)``. All string fields are
+    stripped first; an empty result is invalid. ``host`` and ``secret_path``
+    must not contain ``/ ? # @`` or whitespace (URL injection guard). ``port``
+    is checked explicitly -- ``bounded_int`` must not be used here because it
+    silently rewrites a bad value to the default port.
+    """
+    if not isinstance(entry, dict):
+        return None, "条目不是对象"
+    normalized: dict[str, Any] = {}
+    for key in ("peer_id", "name", "host", "secret_path"):
+        value = entry.get(key)
+        if not isinstance(value, str):
+            return None, f"{key} 缺失或不是字符串"
+        value = value.strip()
+        if not value:
+            return None, f"{key} 为空"
+        normalized[key] = value
+    for key in ("host", "secret_path"):
+        value = normalized[key]
+        if any(ch in value for ch in _PEER_FORBIDDEN_CHARS) or any(ch.isspace() for ch in value):
+            return None, f"{key} 含非法字符"
+    port = entry.get("port")
+    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+        return None, "port 不合法"
+    normalized["port"] = port
+    return normalized, ""
+
+
+def normalize_peers_config(raw: Any, own_peer_id: str) -> tuple[list[dict[str, Any]], bool]:
+    """Clean the ``peers`` list. Returns ``(peers, changed)``.
+
+    Any entry that fails validation is dropped as a whole and logged with its
+    index and reason. Duplicate ``peer_id`` keeps the first; an entry whose
+    ``peer_id`` equals our own is dropped (no self-pull).
+    """
+    if not isinstance(raw, list):
+        print("[Peer] peers 配置不是列表，已重置为空列表", flush=True)
+        return [], True
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    changed = False
+    for index, entry in enumerate(raw):
+        normalized, reason = normalize_peer_entry(entry)
+        if normalized is None:
+            print(f"[Peer] 已丢弃 peers[{index}]：{reason}", flush=True)
+            changed = True
+            continue
+        if normalized["peer_id"] == own_peer_id:
+            print(f"[Peer] 已丢弃 peers[{index}]：peer_id 等于本机 peer_id（禁止自拉）", flush=True)
+            changed = True
+            continue
+        if normalized["peer_id"] in seen:
+            print(f"[Peer] 已丢弃 peers[{index}]：peer_id 重复", flush=True)
+            changed = True
+            continue
+        seen.add(normalized["peer_id"])
+        if normalized != entry:
+            changed = True
+        result.append(normalized)
+    return result, changed
+
+
 def load_ui_config() -> dict[str, Any]:
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
@@ -493,6 +563,10 @@ def load_ui_config() -> dict[str, Any]:
             "discovery_countries": [],
             "show_retained_pool_ips": True,
             "retained_pool_enabled": True,
+            "peer_id": "",
+            "peer_name": "",
+            "peer_shared_key": "",
+            "peers": [],
         }
         updated = False
         if auth_file.exists():
@@ -504,7 +578,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries", "show_retained_pool_ips", "retained_pool_enabled"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries", "show_retained_pool_ips", "retained_pool_enabled", "peer_id", "peer_name", "peer_shared_key", "peers"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -544,6 +618,39 @@ def load_ui_config() -> dict[str, Any]:
 
         if not isinstance(config.get("retained_pool_enabled"), bool):
             config["retained_pool_enabled"] = True
+            updated = True
+
+        # V1.3.0 section 6: peer hub config.
+        raw_peer_id = config.get("peer_id")
+        peer_id = raw_peer_id.strip() if isinstance(raw_peer_id, str) else ""
+        if not peer_id:
+            peer_id = uuid.uuid4().hex
+        if peer_id != raw_peer_id:
+            config["peer_id"] = peer_id
+            updated = True
+
+        raw_peer_name = config.get("peer_name")
+        peer_name = raw_peer_name.strip() if isinstance(raw_peer_name, str) else ""
+        if not peer_name:
+            try:
+                peer_name = socket.gethostname().strip()
+            except Exception:
+                peer_name = ""
+            if not peer_name:
+                peer_name = "aimilivpn"
+        peer_name = peer_name[:PEER_NAME_MAX_LEN]
+        if peer_name != raw_peer_name:
+            config["peer_name"] = peer_name
+            updated = True
+
+        if not isinstance(config.get("peer_shared_key"), str):
+            config["peer_shared_key"] = ""
+            updated = True
+            print("[Peer] peer_shared_key 不是字符串，已归一化为空串（对端功能停用）", flush=True)
+
+        normalized_peers, peers_changed = normalize_peers_config(config.get("peers"), peer_id)
+        if peers_changed:
+            config["peers"] = normalized_peers
             updated = True
 
         if not auth_file.exists() or updated:
@@ -4512,6 +4619,374 @@ def _connection_scope(nodes: list[dict[str, Any]]) -> tuple[str, str]:
     return "", ""
 
 
+def build_peer_status() -> dict[str, Any]:
+    """This instance's status payload for the peer hub (V1.3.0 section 6).
+
+    Fixed fields ``{peer_id, name, status, node_ip, region, ts}``. Connection
+    state is judged ONLY from the ``active_openvpn_node_id`` global. The node
+    table's ``active`` flag is deliberately not consulted, and this function
+    never calls ``_connection_scope`` (which falls back to that flag when the
+    global is empty): a stale flag left on disk must not report "connected".
+    Read-only; triggers no network or connection probing. ``ts`` is
+    informational only and never used for staleness decisions.
+    """
+    ui_cfg = load_ui_config()
+    node_id = active_openvpn_node_id
+    node_ip = ""
+    region = ""
+    if node_id:
+        node = next(
+            (n for n in read_nodes() if str(n.get("id") or "") == node_id),
+            None,
+        )
+        if node is not None:
+            node_ip = str(node.get("ip") or node.get("remote_host") or "")
+            region = str(node.get("country_short") or "")
+    return {
+        "peer_id": str(ui_cfg.get("peer_id") or ""),
+        "name": str(ui_cfg.get("peer_name") or ""),
+        "status": "connected" if node_id else "disconnected",
+        "node_ip": node_ip,
+        "region": region,
+        "ts": int(time.time()),
+    }
+
+
+PEER_STATUS_PATH = "/api/peer_status"
+PEER_TABLE_MAX_ROWS = 50
+PEER_ROW_RETENTION_SECONDS = 24 * 3600
+PEER_TS_WINDOW_SECONDS = 300
+PEER_RATE_LIMIT_MAX_REQUESTS = 10
+PEER_RATE_LIMIT_WINDOW_SECONDS = 60
+PEER_RATE_LIMIT_MAX_KEYS = 1024
+
+# In-memory only (never written to disk); protected by the global ``lock``.
+# Key: peer_id. Value: {peer_id, name, status, node_ip, region, last_seen}
+# where ``last_seen`` is the RECEIVER's time.time() -- the reporter's own
+# timestamp is never used for staleness.
+peer_status_table: dict[str, dict[str, Any]] = {}
+# ip -> request timestamps inside the last 60 seconds; guarded by its own lock.
+_peer_rate_limit: dict[str, list[float]] = {}
+_peer_rate_limit_lock = threading.Lock()
+
+
+def prune_peer_table(now: float, peer_ids: set[str]) -> None:
+    """Prune ``peer_status_table``. The CALLER MUST HOLD the global ``lock``.
+
+    Drops rows older than 24 hours, rows whose peer_id is not in ``peer_ids``
+    (the configured ids, read by the caller outside the lock -- this function
+    never touches config files), and, beyond 50 rows, the rows with the oldest
+    ``last_seen`` (ties broken by ascending peer_id).
+    """
+    for peer_id in list(peer_status_table):
+        last_seen = peer_status_table[peer_id].get("last_seen")
+        if (
+            peer_id not in peer_ids
+            or not isinstance(last_seen, (int, float))
+            or now - last_seen > PEER_ROW_RETENTION_SECONDS
+        ):
+            del peer_status_table[peer_id]
+    overflow = len(peer_status_table) - PEER_TABLE_MAX_ROWS
+    if overflow > 0:
+        oldest_first = sorted(
+            peer_status_table,
+            key=lambda pid: (peer_status_table[pid]["last_seen"], pid),
+        )
+        for peer_id in oldest_first[:overflow]:
+            del peer_status_table[peer_id]
+
+
+def peer_rate_limit_allow(ip: str, now: float | None = None) -> bool:
+    """Per-IP limit for /api/peer_status: at most 10 requests per 60 seconds.
+
+    Check, append and sweep all happen inside ``_peer_rate_limit_lock``. Every
+    call sweeps the whole dict (expired timestamps dropped, emptied keys
+    removed); the dict is capped at 1024 keys, evicting the key whose most
+    recent request is oldest (ties: smallest IP string). Every request
+    reaching the branch is recorded, including rejected ones, so a sustained
+    flood keeps returning 429 until requests stop for a full 60 seconds
+    (scheme Task 3: the quota counts all requests reaching the branch).
+    """
+    current = time.time() if now is None else now
+    cutoff = current - PEER_RATE_LIMIT_WINDOW_SECONDS
+    with _peer_rate_limit_lock:
+        for key in list(_peer_rate_limit):
+            kept = [t for t in _peer_rate_limit[key] if t > cutoff]
+            if kept:
+                _peer_rate_limit[key] = kept
+            else:
+                del _peer_rate_limit[key]
+        hits = _peer_rate_limit.get(ip)
+        if hits is not None and len(hits) >= PEER_RATE_LIMIT_MAX_REQUESTS:
+            # Rejected requests are recorded too: the block only lifts 60 s
+            # after the last request, not 60 s after the first accepted one.
+            hits.append(current)
+            return False
+        if hits is None:
+            if len(_peer_rate_limit) >= PEER_RATE_LIMIT_MAX_KEYS:
+                evict = min(_peer_rate_limit, key=lambda k: (max(_peer_rate_limit[k]), k))
+                del _peer_rate_limit[evict]
+            hits = _peer_rate_limit[ip] = []
+        hits.append(current)
+        return True
+
+
+def peer_request_signature(key: str, ts: str) -> str:
+    """HMAC-SHA256(key, ts + "\\n" + "/api/peer_status") as hex."""
+    return hmac.new(
+        key.encode(), f"{ts}\n{PEER_STATUS_PATH}".encode(), hashlib.sha256
+    ).hexdigest()
+
+
+def peer_response_signature(key: str, ts: str, body: bytes) -> str:
+    """HMAC-SHA256(key, ts.encode("ascii") + b"\\n" + body_bytes) as hex.
+
+    ``body`` must be the exact byte string that is sent / was received.
+    """
+    return hmac.new(
+        key.encode(), ts.encode("ascii") + b"\n" + body, hashlib.sha256
+    ).hexdigest()
+
+
+def _peer_parse_ts(ts: str | None) -> int | None:
+    """Strict integer-seconds parse: ASCII digits only (no sign, spaces, '_')."""
+    if ts and ts.isascii() and ts.isdigit() and len(ts) <= 15:
+        return int(ts)
+    return None
+
+
+def peer_ts_delta(ts_header: str | None, now_int: int) -> str:
+    """Log value for ``ts_delta``: whole-second ``int(ts) - int(now)``,
+    ``missing`` without a timestamp header, ``unparseable`` for a bad format.
+    Decided by the timestamp itself, independent of why the request failed."""
+    if ts_header is None:
+        return "missing"
+    parsed = _peer_parse_ts(ts_header)
+    return "unparseable" if parsed is None else str(parsed - now_int)
+
+
+def verify_peer_request(
+    key: str, ts_header: str | None, sig_header: str | None, now: float | None = None
+) -> tuple[bool, str]:
+    """Verify a peer request. Returns ``(ok, reason)``.
+
+    Fixed order (earlier failure returns immediately): missing headers ->
+    non-ASCII -> timestamp format / window -> signature. The window is an
+    integer-second difference ``abs(int(now) - int(ts)) <= 300`` (both sides
+    truncated to whole seconds). The signature is compared with
+    ``hmac.compare_digest``. The caller has already handled the empty-key and
+    rate-limit checks that come before these.
+    """
+    if not ts_header or not sig_header:
+        return False, "缺少 X-Peer-Timestamp 或 X-Peer-Signature 头"
+    if not (ts_header.isascii() and sig_header.isascii()):
+        return False, "头部含非 ASCII 字符"
+    ts_value = _peer_parse_ts(ts_header)
+    if ts_value is None:
+        return False, "时间戳不是整数"
+    now_int = int(time.time() if now is None else now)
+    if abs(now_int - ts_value) > PEER_TS_WINDOW_SECONDS:
+        return False, "时间戳超出 ±300 秒窗口"
+    if not hmac.compare_digest(sig_header, peer_request_signature(key, ts_header)):
+        return False, "签名不匹配"
+    return True, ""
+
+
+PEER_STATUS_MAX_BYTES = 65536
+PEER_PULL_INTERVAL_SECONDS = 300
+PEER_PULL_TIMEOUT_SECONDS = 10
+_peer_pull_lock = threading.Lock()
+
+
+def _peer_build_opener() -> urllib.request.OpenerDirector:
+    """Direct (proxy-bypassing) opener for peer pulls; a named seam so tests
+    can inject a fake opener without touching the network (same shape as
+    ``_coffee_build_opener``)."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def pull_one_peer(peer: dict[str, Any], shared_key: str, own_peer_id: str) -> bool:
+    """Pull one peer's status once; True on success (row written), else False.
+
+    ``shared_key`` and ``own_peer_id`` always come from the caller's
+    round-start snapshot -- this function must NEVER call ``load_ui_config()``
+    (a key rotated mid-round must not affect the running round). A row is
+    written only after: HTTP 200, size within 64 KB, a valid response
+    signature over the exact received bytes (response ``X-Peer-Timestamp``
+    must equal the request ts), a JSON object with all fields well-typed, and
+    a ``peer_id`` equal to the one requested. Never raises.
+    """
+    peer_id = str(peer.get("peer_id") or "")
+    label = f"{peer.get('name') or peer_id}({peer.get('host')}:{peer.get('port')})"
+    try:
+        if not shared_key:
+            print("[Peer] 未配置对端共享密钥，跳过拉取", flush=True)
+            return False
+        if peer_id == own_peer_id:
+            print(f"[Peer] 跳过自拉：{label}", flush=True)
+            return False
+        host = str(peer["host"])
+        try:
+            if isinstance(ipaddress.ip_address(host), ipaddress.IPv6Address):
+                host = f"[{host}]"
+        except ValueError:
+            pass
+        url = f"http://{host}:{peer['port']}/{peer['secret_path']}{PEER_STATUS_PATH}"
+        ts = str(int(time.time()))
+        request = urllib.request.Request(
+            url,
+            headers={
+                "X-Peer-Timestamp": ts,
+                "X-Peer-Signature": peer_request_signature(shared_key, ts),
+                "User-Agent": f"Mozilla/5.0 AimiliVPN/{APP_VERSION}",
+            },
+        )
+        opener = _peer_build_opener()
+        try:
+            with opener.open(request, timeout=PEER_PULL_TIMEOUT_SECONDS) as response:
+                status = getattr(response, "status", 200)
+                if status != 200:
+                    print(f"[Peer] 拉取 {label} 失败：HTTP {status}", flush=True)
+                    return False
+                declared = response.headers.get("Content-Length")
+                if declared is not None and str(declared).strip().isdigit() \
+                        and int(str(declared).strip()) > PEER_STATUS_MAX_BYTES:
+                    print(f"[Peer] 拉取 {label} 失败：回包声明长度超过 {PEER_STATUS_MAX_BYTES} 字节", flush=True)
+                    return False
+                raw = response.read(PEER_STATUS_MAX_BYTES + 1)
+                resp_ts = response.headers.get("X-Peer-Timestamp")
+                resp_sig = response.headers.get("X-Peer-Response-Signature")
+        except urllib.error.HTTPError as exc:
+            hint = "，请核对 peer_shared_key 与双方时钟（NTP）" if exc.code == 401 else ""
+            print(f"[Peer] 拉取 {label} 失败：HTTP {exc.code}{hint}", flush=True)
+            return False
+        if len(raw) > PEER_STATUS_MAX_BYTES:
+            print(f"[Peer] 拉取 {label} 失败：回包超过 {PEER_STATUS_MAX_BYTES} 字节", flush=True)
+            return False
+        if resp_ts != ts or not isinstance(resp_sig, str) or not resp_sig.isascii():
+            print(f"[Peer] 拉取 {label} 失败：响应时间戳或签名头缺失/不符", flush=True)
+            return False
+        if not hmac.compare_digest(resp_sig, peer_response_signature(shared_key, ts, raw)):
+            print(f"[Peer] 拉取 {label} 失败：响应签名不匹配", flush=True)
+            return False
+        data = json.loads(raw.decode("utf-8"))
+        valid = (
+            isinstance(data, dict)
+            and all(isinstance(data.get(k), str) for k in ("peer_id", "name", "node_ip", "region"))
+            and data.get("status") in ("connected", "disconnected")
+            and isinstance(data.get("ts"), int)
+            and not isinstance(data.get("ts"), bool)
+        )
+        if not valid:
+            print(f"[Peer] 拉取 {label} 失败：回包字段缺失或类型不对", flush=True)
+            return False
+        if data["peer_id"] != peer_id:
+            print(f"[Peer] 拉取 {label} 失败：回包 peer_id 与配置不一致", flush=True)
+            return False
+        row = {
+            "peer_id": peer_id,
+            "name": data["name"],
+            "status": data["status"],
+            "node_ip": data["node_ip"],
+            "region": data["region"],
+            "last_seen": time.time(),
+        }
+        with lock:
+            peer_status_table[peer_id] = row
+        return True
+    except Exception as exc:
+        print(f"[Peer] 拉取 {label} 失败：{exc}", flush=True)
+        return False
+
+
+def _peer_pull_round() -> None:
+    """One full pull round. The CALLER MUST HOLD ``_peer_pull_lock``.
+
+    "Round start" is here: after the lock is held, before the prune. The
+    config is re-read once and the key / own id / peer list from that
+    snapshot are used for the whole round (rotation takes effect next round).
+    With no peers or an empty key no request is sent.
+    """
+    cfg = load_ui_config()
+    shared_key = cfg.get("peer_shared_key") or ""
+    own_peer_id = cfg.get("peer_id") or ""
+    raw_peers = cfg.get("peers")
+    peers = [p for p in raw_peers if isinstance(p, dict)] if isinstance(raw_peers, list) else []
+    peer_ids = {str(p.get("peer_id")) for p in peers}
+    with lock:
+        prune_peer_table(time.time(), peer_ids)
+    if not peers:
+        return
+    if not shared_key:
+        print("[Peer] 未配置对端共享密钥，本轮不拉取", flush=True)
+        return
+    for peer in peers:
+        try:
+            pull_one_peer(peer, shared_key, own_peer_id)
+        except Exception as exc:
+            print(f"[Peer] 拉取对端 {peer.get('peer_id')} 异常：{exc}", flush=True)
+
+
+def peer_pull_loop() -> None:
+    """Daemon thread: first round immediately, then every 300 seconds.
+
+    The lock covers one round only; the sleep is OUTSIDE the lock (so
+    ``pull_running`` reads false and a manual refresh can start while idle).
+    A failing round is logged and the loop still sleeps the full interval.
+    """
+    while True:
+        try:
+            with _peer_pull_lock:
+                _peer_pull_round()
+        except Exception as exc:
+            print(f"[Peer] 拉取轮次异常：{exc}", flush=True)
+        time.sleep(PEER_PULL_INTERVAL_SECONDS)
+
+
+# Serialises the read-modify-write of ui_auth.json done by /api/update_peers.
+# Lock order: _peer_config_lock is the OUTER lock, the global ``lock`` the
+# inner one (load_ui_config/write_json take it); never take _peer_config_lock
+# while holding the global lock.
+_peer_config_lock = threading.Lock()
+
+
+def peer_display_state(age_seconds: float) -> str:
+    """Display state from receiver-local age: <=900s ok, <=1800s stale, else offline."""
+    if age_seconds <= 900:
+        return "ok"
+    if age_seconds <= 1800:
+        return "stale"
+    return "offline"
+
+
+def _peer_pull_round_locked() -> None:
+    """Worker body for a manual refresh. ``_peer_pull_lock`` is already held
+    (taken by ``_run_peer_pull_round_async``) and is always released here."""
+    try:
+        _peer_pull_round()
+    except Exception as exc:
+        print(f"[Peer] 手动刷新轮次异常：{exc}", flush=True)
+    finally:
+        _peer_pull_lock.release()
+
+
+def _run_peer_pull_round_async() -> dict[str, Any]:
+    """Start one pull round in the background unless one is already running.
+
+    There is no separate "running" flag: the non-blocking acquire of
+    ``_peer_pull_lock`` is the check. Lock already held (timed round or a
+    previous refresh) -> report running, no queueing, no waiting.
+    """
+    if not _peer_pull_lock.acquire(blocking=False):
+        return {"ok": True, "running": True}
+    try:
+        threading.Thread(target=_peer_pull_round_locked, daemon=True).start()
+    except Exception:
+        _peer_pull_lock.release()
+        return {"ok": False, "error": "thread_start_failed"}
+    return {"ok": True, "running": True}
+
+
 def current_connection_country() -> str:
     """Country short code (upper) of the current connection, or ""."""
     return _connection_scope(read_nodes())[1]
@@ -6503,7 +6978,7 @@ INDEX_HTML = r"""<!doctype html>
 
     main {
       padding: 24px 32px;
-      max-width: 1400px;
+      max-width: 1600px;
       margin: 0 auto;
     }
 
@@ -7624,12 +8099,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.2.9 正式版</span>
+        <span id="github_version_label">V1.3.0 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.2.9 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.3.0 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <div class="update-action-row">
@@ -7733,6 +8208,10 @@ INDEX_HTML = r"""<!doctype html>
     <button id="btn_retained" class="toolbar-btn" type="button" onclick="toggleRetainedView()" style="height: 42px; gap: 6px;">
       保留池
     </button>
+    <button id="btn_peers" class="toolbar-btn" type="button" onclick="togglePeersView()" style="height: 42px; gap: 6px;">
+      其它服务器
+      <span id="peers_badge" style="display: none; background: var(--primary); color: #fff; border-radius: 10px; padding: 0 7px; font-size: 12px; line-height: 18px;">0</span>
+    </button>
     <label class="toolbar-btn" for="show_retained_pool_ips" style="height: 42px; gap: 6px; display: inline-flex; align-items: center; cursor: pointer;">
       <input id="show_retained_pool_ips" type="checkbox" checked onchange="toggleRetainedPoolVisibility(this)">
       <span>显示保留池IP</span>
@@ -7764,6 +8243,49 @@ INDEX_HTML = r"""<!doctype html>
         <div style="padding: 10px 14px; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 8px; font-size: 12px; color: var(--warning); line-height: 1.5;">
           <strong>仅用收藏是强锁定模式。</strong>开启后只会连接收藏节点；如果收藏节点全部不可用，系统不会切换到非收藏节点。
         </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="peers_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
+    <div style="display: flex; flex-direction: column; gap: 16px;">
+      <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;">
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <span style="font-size: 15px; font-weight: 600; color: var(--text-primary);">其它服务器节点汇总</span>
+          <span style="font-size: 13px; color: var(--text-secondary);">只读查看各服务器当前在用的节点，不参与选路。每 5 分钟自动拉取一次。</span>
+        </div>
+        <button id="btn_peers_refresh" type="button" class="toolbar-btn" style="height: 36px; padding: 0 14px; font-size: 13px; border-radius: 6px;" onclick="maybeRefreshPeers()">刷新</button>
+      </div>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>服务器</th>
+              <th>状态</th>
+              <th>在用节点 IP</th>
+              <th>地区</th>
+              <th>最后更新</th>
+            </tr>
+          </thead>
+          <tbody id="peers_rows"></tbody>
+        </table>
+      </div>
+      <div id="peers_hint" style="font-size: 13px; color: var(--text-secondary);"></div>
+      <div style="border-top: 1px solid var(--border-color); padding-top: 14px; display: flex; flex-direction: column; gap: 12px;">
+        <div style="font-size: 13px; color: var(--text-secondary);">
+          本机 peer_id（复制到对端的添加表单里填写）：<code id="peers_self_id" style="user-select: all; color: var(--text-primary);"></code>
+          　本机名称：<span id="peers_self_name" style="color: var(--text-primary);"></span>
+        </div>
+        <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+          <input id="peer_add_id" type="text" class="input-field" placeholder="对端 peer_id" style="flex: 2 1 220px;">
+          <input id="peer_add_name" type="text" class="input-field" placeholder="名称" style="flex: 1 1 120px;">
+          <input id="peer_add_host" type="text" class="input-field" placeholder="主机（IP 或域名）" style="flex: 1 1 160px;">
+          <input id="peer_add_port" type="number" class="input-field" placeholder="端口" min="1" max="65535" style="flex: 0 1 100px;">
+          <input id="peer_add_secret" type="text" class="input-field" placeholder="secret_path" style="flex: 1 1 140px;">
+          <button type="button" class="toolbar-btn" style="height: 36px; padding: 0 14px; font-size: 13px; border-radius: 6px;" onclick="addPeer()">添加对端</button>
+        </div>
+        <div id="peers_form_msg" role="status" style="font-size: 13px; color: var(--text-secondary);"></div>
+        <div id="peers_manage_rows" style="display: flex; flex-direction: column; gap: 6px;"></div>
       </div>
     </div>
   </div>
@@ -8486,7 +9008,7 @@ function stableSortNodes() {
 function render(){
   updateRetainedPoolVisibilityUI();
   updateRetainedPoolEnabledUI();
-  const versionLabel = state.app_version_label || "V1.2.9 正式版";
+  const versionLabel = state.app_version_label || "V1.3.0 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -9116,6 +9638,7 @@ async function disconnectNode(){
 async function load(){
   const d = await fetchNodesSnapshot();
   applyNodesSnapshot(d);
+  maybeRefreshPeers(); // V1.3.0：面板收起时也更新徽标与本机行（30 秒冷却内只读快照）
 
   if (state.maintenance_running) {
     startRefreshPolling();
@@ -9469,6 +9992,191 @@ function toggleFavoritesView() {
   showFavoritesOnly = !showFavoritesOnly;
   currentPage = 1;
   render();
+}
+
+// ===== V1.3.0 其它服务器汇总（只读视图；不参与选路、不写任何设置） =====
+let lastPeersRefreshAt = 0;
+let peersPanelOpen = false;
+
+function peersClock(ms) {
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function peersRelative(seconds) {
+  const age = Math.max(0, Math.floor(seconds));
+  if (age < 60) return age + " 秒前";
+  if (age < 3600) return Math.floor(age / 60) + " 分钟前";
+  if (age < 86400) return Math.floor(age / 3600) + " 小时前";
+  return Math.floor(age / 86400) + " 天前";
+}
+
+function peersStatusHtml(row) {
+  let html = row.status === "connected" ? "已连接" : "未连接";
+  if (row.display === "stale") {
+    html += ' <span style="color: #f59e0b;">（过期）</span>';
+  } else if (row.display === "offline") {
+    html += ' <span style="color: var(--danger);">（离线）</span>';
+  }
+  return html;
+}
+
+function updatePeersPanelUI() {
+  const panel = $("peers_panel");
+  if (panel) panel.style.display = peersPanelOpen ? "block" : "none";
+  const btn = $("btn_peers");
+  if (btn) {
+    if (peersPanelOpen) btn.classList.add("active");
+    else btn.classList.remove("active");
+  }
+}
+
+function renderPeers(data) {
+  if (!data) return;
+  const peers = Array.isArray(data.peers) ? data.peers : [];
+  const configured = Array.isArray(data.configured_peers) ? data.configured_peers : [];
+  const self = data.self || {};
+  // 徽标数 = 已有成功拉取记录的对端行数（不是配置对端数）；为 0 时隐藏
+  const badge = $("peers_badge");
+  if (badge) {
+    badge.textContent = String(data.peers.length);
+    badge.style.display = data.peers.length > 0 ? "inline-block" : "none";
+  }
+  const selfId = $("peers_self_id");
+  if (selfId) selfId.textContent = self.peer_id || "";
+  const selfName = $("peers_self_name");
+  if (selfName) selfName.textContent = self.name || "";
+  const cell = (v) => esc(v ? v : "—");
+  let html = "<tr><td>" + esc(self.name || "") + ' <span style="color: var(--primary);">（本机）</span></td>'
+    + "<td>" + peersStatusHtml(self) + "</td>"
+    + "<td>" + cell(self.node_ip) + "</td>"
+    + "<td>" + cell(self.region) + "</td>"
+    + "<td>实时 " + peersClock(Date.now()) + "</td></tr>";
+  const nowMs = Date.now();
+  for (const row of peers) {
+    const seenMs = Number(row.last_seen) * 1000;
+    html += "<tr><td>" + esc(row.name) + "</td>"
+      + "<td>" + peersStatusHtml(row) + "</td>"
+      + "<td>" + cell(row.node_ip) + "</td>"
+      + "<td>" + cell(row.region) + "</td>"
+      + "<td>" + peersClock(seenMs) + " · " + peersRelative((nowMs - seenMs) / 1000) + "</td></tr>";
+  }
+  const rowsEl = $("peers_rows");
+  if (rowsEl) rowsEl.innerHTML = html;
+  const hint = $("peers_hint");
+  if (hint) {
+    if (configured.length === 0) hint.textContent = "尚未配置对端。在下方填入对端信息后添加；各机须使用相同的 peer_shared_key。";
+    else if (peers.length === 0) hint.textContent = "尚未拉取到对端状态。";
+    else hint.textContent = "";
+  }
+  // 删除行遍历 data.configured_peers（配置数据，不是状态行），尚无状态行的对端也能删
+  let manage = "";
+  for (const peer of data.configured_peers || []) {
+    manage += '<div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">'
+      + "<span>" + esc(peer.name) + " （" + esc(peer.host) + ":" + esc(peer.port) + "）</span>"
+      + '<code style="color: var(--text-secondary);">' + esc(peer.peer_id) + "</code>"
+      + '<button type="button" class="connect-btn" style="height: 28px; padding: 0 10px;" data-peer-id="' + esc(peer.peer_id)
+      + '" onclick="removePeer(this.dataset.peerId)">删除</button></div>';
+  }
+  const manageEl = $("peers_manage_rows");
+  if (manageEl) manageEl.innerHTML = manage;
+  // 手动刷新按钮：以最近一次成功快照的 pull_running 为准；快照失败时不进入本函数，状态保持
+  const refreshBtn = $("btn_peers_refresh");
+  if (refreshBtn) {
+    if (data.pull_running === true) {
+      refreshBtn.textContent = "拉取中…";
+      refreshBtn.disabled = true;
+    } else {
+      refreshBtn.textContent = "刷新";
+      refreshBtn.disabled = false;
+    }
+  }
+}
+
+async function fetchPeersSnapshot() {
+  try {
+    const response = await fetchWithTimeout("./api/peers", {cache: "no-store"}, 5000);
+    if (!response.ok) return null;
+    const data = await response.json();
+    renderPeers(data);
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 展开面板、load() 启动、手动「刷新」三路共用同一 30 秒冷却
+async function maybeRefreshPeers() {
+  if (Date.now() - lastPeersRefreshAt < 30000) {
+    await fetchPeersSnapshot();
+    return;
+  }
+  lastPeersRefreshAt = Date.now(); // 发送请求前就置位，防连点；请求失败冷却也保留
+  try {
+    await fetchWithTimeout("./api/peers/refresh", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: "{}",
+    }, 5000);
+  } catch (e) {
+  }
+  await fetchPeersSnapshot();
+}
+
+function togglePeersView() {
+  peersPanelOpen = !peersPanelOpen;
+  updatePeersPanelUI();
+  if (peersPanelOpen) maybeRefreshPeers();
+}
+
+async function addPeer() {
+  const msg = $("peers_form_msg");
+  const peer = {
+    peer_id: $("peer_add_id").value.trim(),
+    name: $("peer_add_name").value.trim(),
+    host: $("peer_add_host").value.trim(),
+    port: Number($("peer_add_port").value),
+    secret_path: $("peer_add_secret").value.trim(),
+  };
+  try {
+    const response = await fetchWithTimeout("./api/update_peers", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: "add", peer: peer}),
+    }, 10000);
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.ok) {
+      msg.textContent = "添加失败：" + (result.error || ("HTTP " + response.status));
+      return;
+    }
+    for (const id of ["peer_add_id", "peer_add_name", "peer_add_host", "peer_add_port", "peer_add_secret"]) $(id).value = "";
+    msg.textContent = "已添加。";
+    await fetchPeersSnapshot();
+  } catch (e) {
+    msg.textContent = "添加失败：请求出错";
+  }
+}
+
+async function removePeer(peerId) {
+  const msg = $("peers_form_msg");
+  if (!peerId || !window.confirm("确定删除该对端？")) return;
+  try {
+    const response = await fetchWithTimeout("./api/update_peers", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: "remove", peer_id: peerId}),
+    }, 10000);
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.ok) {
+      msg.textContent = "删除失败：" + (result.error || ("HTTP " + response.status));
+      return;
+    }
+    msg.textContent = "已删除。";
+    await fetchPeersSnapshot();
+  } catch (e) {
+    msg.textContent = "删除失败：请求出错";
+  }
 }
 
 // Phase 1: retained-pool view (observing nodes only), mirrors the
@@ -10005,6 +10713,7 @@ setInterval(async () => {
       const data = await fetchNodesSnapshot();
       applyNodesSnapshot(data);
     }
+    if (peersPanelOpen) await fetchPeersSnapshot(); // V1.3.0：仅展开时附带只读快照，不触发后端拉取
   } catch(e) {
   } finally {
     backgroundPollInFlight = false;
@@ -10568,11 +11277,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
 
-    def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK, extra_headers: dict[str, str] | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if extra_headers:
+            for header_name, header_value in extra_headers.items():
+                self.send_header(header_name, header_value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -10596,9 +11308,69 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("请求 JSON 必须是对象")
         return data
 
+    def handle_peer_status(self) -> None:
+        """GET /api/peer_status: HMAC-authenticated read-only peer endpoint.
+
+        Threat model: guards against keyless direct scans, replays outside the
+        +/-300 second window, and keyless forged responses. It does NOT defend
+        against link hijacking -- the panel itself is plain HTTP, and the
+        login password and session cookie also travel in the clear, so the
+        peer sync is no weaker than the panel. Replays inside the window are
+        accepted (read-only status, nothing to change or forge; the per-IP
+        rate limit bounds the cost). All instances need NTP-synced clocks
+        (within 5 minutes); on 401, ts_delta in the log tells clock skew
+        (|ts_delta| > 300) from a wrong key (|ts_delta| <= 300).
+
+        Fixed check order, any failure returns immediately and NEVER falls
+        back to the session gate: empty key -> rate limit -> missing headers
+        -> non-ASCII -> timestamp format/window -> signature. The key is read
+        fresh from ui_auth.json on every request (no startup snapshot), so
+        key rotation needs no restart.
+        """
+        try:
+            key = load_ui_config().get("peer_shared_key")
+            if not isinstance(key, str) or not key:
+                self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                return
+            client_ip = str(self.client_address[0])
+            if not peer_rate_limit_allow(client_ip):
+                self.send_json({"error": "Too Many Requests"}, HTTPStatus.TOO_MANY_REQUESTS)
+                return
+            ts_header = self.headers.get("X-Peer-Timestamp")
+            sig_header = self.headers.get("X-Peer-Signature")
+            now_int = int(time.time())
+            ok, reason = verify_peer_request(key, ts_header, sig_header, now_int)
+            if not ok:
+                print(
+                    f"[Peer] 拒绝 {PEER_STATUS_PATH} 请求：{reason} ip={client_ip} "
+                    f"ts_delta={peer_ts_delta(ts_header, now_int)}",
+                    flush=True,
+                )
+                self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                return
+            # Serialise once, sign exactly those bytes, send exactly those bytes.
+            body = json.dumps(build_peer_status(), ensure_ascii=False).encode("utf-8")
+            signature = peer_response_signature(key, ts_header, body)
+            self.send_bytes(
+                body,
+                "application/json; charset=utf-8",
+                extra_headers={
+                    "X-Peer-Timestamp": str(ts_header),
+                    "X-Peer-Response-Signature": signature,
+                },
+            )
+        except Exception as exc:
+            print(f"[Peer] 处理 {PEER_STATUS_PATH} 出错：{exc}", flush=True)
+            self.send_json({"error": "internal error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
     def do_GET(self) -> None:
         effective_path = self.validate_path()
         if effective_path == "": return
+
+        # V1.3.0: HMAC-only exception for this single path; is_authorized() is untouched.
+        if effective_path == PEER_STATUS_PATH:
+            self.handle_peer_status()
+            return
         
         if not self.is_authorized():
             if effective_path in ("/", "/index.html"):
@@ -10657,6 +11429,46 @@ class Handler(BaseHTTPRequestHandler):
                     connection_state.get("retained_pool_enabled", True)
                 ),
             })
+        elif effective_path == "/api/peers":
+            try:
+                # Lock discipline: config read and build_peer_status() happen
+                # OUTSIDE the global lock; prune + response construction INSIDE
+                # it; the pull_running probe and the send happen AFTER release.
+                ui_cfg = load_ui_config()
+                raw_peers = ui_cfg.get("peers")
+                cfg_peers = [p for p in raw_peers if isinstance(p, dict)] if isinstance(raw_peers, list) else []
+                peer_ids = {str(p.get("peer_id")) for p in cfg_peers}
+                configured_peers = [
+                    {"peer_id": p.get("peer_id"), "name": p.get("name"), "host": p.get("host"), "port": p.get("port")}
+                    for p in cfg_peers
+                ]
+                self_row = build_peer_status()
+                now = time.time()
+                self_row["last_seen"] = now
+                self_row["display"] = "ok" if self_row["status"] == "connected" else "disconnected"
+                rows: list[dict[str, Any]] = []
+                with lock:
+                    prune_peer_table(now, peer_ids)
+                    for cfg_peer in cfg_peers:
+                        row = peer_status_table.get(str(cfg_peer.get("peer_id")))
+                        if row is None:
+                            continue
+                        out = dict(row)
+                        out["display"] = peer_display_state(now - float(row["last_seen"]))
+                        rows.append(out)
+                if _peer_pull_lock.acquire(blocking=False):
+                    _peer_pull_lock.release()
+                    pull_running = False
+                else:
+                    pull_running = True
+                self.send_json({
+                    "self": self_row,
+                    "peers": rows,
+                    "configured_peers": configured_peers,
+                    "pull_running": pull_running,
+                })
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/state":
             # 1.2.6 stage 3 (plan §五.3): lightweight state-only view
             # for the panel's busy-period polling. Unlike /api/nodes it
@@ -10886,6 +11698,67 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self.is_authorized():
             self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+
+        if effective_path == "/api/peers/refresh":
+            result = _run_peer_pull_round_async()
+            self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/update_peers":
+            try:
+                payload = self.read_json_body()
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc) or "请求体解析失败"}, HTTPStatus.BAD_REQUEST)
+                return
+            action = payload.get("action")
+            if action not in ("add", "remove"):
+                self.send_json({"ok": False, "error": "未知的 action"}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                removed_id = ""
+                # Whole read-modify-write under _peer_config_lock (outer lock).
+                with _peer_config_lock:
+                    ui_cfg = load_ui_config()
+                    peers = [p for p in ui_cfg.get("peers", []) if isinstance(p, dict)]
+                    if action == "add":
+                        entry, reason = normalize_peer_entry(payload.get("peer"))
+                        if entry is None:
+                            self.send_json({"ok": False, "error": reason}, HTTPStatus.BAD_REQUEST)
+                            return
+                        if entry["peer_id"] == ui_cfg.get("peer_id"):
+                            self.send_json({"ok": False, "error": "不能添加本机自己"}, HTTPStatus.BAD_REQUEST)
+                            return
+                        if any(p.get("peer_id") == entry["peer_id"] for p in peers):
+                            self.send_json({"ok": False, "error": "peer_id 已存在"}, HTTPStatus.CONFLICT)
+                            return
+                        peers.append(entry)
+                    else:
+                        target = payload.get("peer_id")
+                        if not isinstance(target, str) or not target.strip():
+                            self.send_json({"ok": False, "error": "peer_id 不能为空"}, HTTPStatus.BAD_REQUEST)
+                            return
+                        removed_id = target.strip()
+                        if not any(p.get("peer_id") == removed_id for p in peers):
+                            self.send_json({"ok": False, "error": "未找到该对端"}, HTTPStatus.NOT_FOUND)
+                            return
+                        peers = [p for p in peers if p.get("peer_id") != removed_id]
+                    ui_cfg["peers"] = peers
+                    with lock:
+                        DATA_DIR.mkdir(exist_ok=True, parents=True)
+                        write_json(DATA_DIR / "ui_auth.json", ui_cfg)
+                if removed_id:
+                    with lock:
+                        peer_status_table.pop(removed_id, None)
+                self.send_json({
+                    "ok": True,
+                    "peers": [
+                        {"peer_id": p.get("peer_id"), "name": p.get("name"), "host": p.get("host"), "port": p.get("port")}
+                        for p in peers
+                    ],
+                })
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         if effective_path == "/api/update_code":
@@ -11594,6 +12467,7 @@ def main() -> None:
     threading.Thread(target=ip_enrichment_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
+    threading.Thread(target=peer_pull_loop, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
