@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -12,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest import mock
@@ -881,8 +884,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.2.9", manager.APP_VERSION)
-        self.assertEqual("V1.2.9 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.3.0", manager.APP_VERSION)
+        self.assertEqual("V1.3.0 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -966,7 +969,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.2.9 正式版", result["current_version_label"])
+        self.assertEqual("V1.3.0 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -985,7 +988,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.2.9", result["current_version"])
+        self.assertEqual("1.3.0", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1530,19 +1533,20 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_2_9(self) -> None:
-        self.assertEqual("1.2.9", manager.APP_VERSION)
-        self.assertEqual("V1.2.9 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.2.9 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_3_0(self) -> None:
+        self.assertEqual("1.3.0", manager.APP_VERSION)
+        self.assertEqual("V1.3.0 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.3.0 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.2.9"', install_text)
+        self.assertIn('"1.3.0"', install_text)
         self.assertNotIn('"1.2.2"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.2.9", compose_text)
+        self.assertIn(":1.3.0", compose_text)
         self.assertNotIn("1.2.2", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.2.9", version_text)
+        self.assertEqual("1.3.0", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## V1.3.0（2026-11-17，已发布正式版 v1.3.0）", changelog)
         self.assertIn("## V1.2.9（2026-11-16，已发布正式版 v1.2.9）", changelog)
         self.assertIn("## V1.2.8（2026-11-06，已发布正式版 v1.2.8）", changelog)
         self.assertIn("## V1.2.7（2026-11-06，已发布正式版 v1.2.7）", changelog)
@@ -6434,3 +6438,1270 @@ class Plus128Tests(unittest.TestCase):
             self.assertEqual(
                 "not-json{{{", status_path.read_text(encoding="utf-8")
             )
+
+
+class Plus130PeerHubTests(unittest.TestCase):
+    """V1.3.0 section 6: peer node-status hub (mesh pull, view-only)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        patcher = mock.patch.object(manager, "DATA_DIR", self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Peer state isolation: table and rate-limit dict start empty. The
+        # getattr guards let the behaviour-lock tests also run on the baseline
+        # tree, where these module globals do not exist yet.
+        table = getattr(manager, "peer_status_table", None)
+        if table is not None:
+            with manager.lock:
+                table.clear()
+        rate = getattr(manager, "_peer_rate_limit", None)
+        if rate is not None:
+            rate_lock = getattr(manager, "_peer_rate_limit_lock", None)
+            if rate_lock is not None:
+                with rate_lock:
+                    rate.clear()
+            else:
+                rate.clear()
+
+    def tearDown(self) -> None:
+        table = getattr(manager, "peer_status_table", None)
+        if table is not None:
+            with manager.lock:
+                table.clear()
+
+    # ---- helpers ----
+    def _write_cfg(self, **extra) -> None:
+        cfg = {"username": "peer-user", "password": "peer-pass"}
+        cfg.update(extra)
+        (self.root / "ui_auth.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    def _read_cfg_file(self) -> dict:
+        return json.loads((self.root / "ui_auth.json").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _good_peer(peer_id: str = "peer-a", **over) -> dict:
+        peer = {
+            "peer_id": peer_id,
+            "name": f"name-{peer_id}",
+            "host": "192.0.2.1",
+            "port": 8787,
+            "secret_path": "secretpath",
+        }
+        peer.update(over)
+        return peer
+
+    # ---- Task 1: config ----
+    def test_peer_config_defaults_generated(self) -> None:
+        auth_file = self.root / "ui_auth.json"
+        self.assertFalse(auth_file.exists())
+        cfg = manager.load_ui_config()
+        self.assertRegex(cfg["peer_id"], r"^[0-9a-f]{32}$")
+        self.assertTrue(cfg["peer_name"])
+        self.assertEqual([], cfg["peers"])
+        self.assertEqual("", cfg["peer_shared_key"])
+        self.assertTrue(auth_file.exists())
+        saved = self._read_cfg_file()
+        self.assertEqual(cfg["peer_id"], saved["peer_id"])
+        self.assertEqual([], saved["peers"])
+        self.assertEqual("", saved["peer_shared_key"])
+        # Stable across reloads (generated once, then persisted).
+        self.assertEqual(cfg["peer_id"], manager.load_ui_config()["peer_id"])
+        # An existing (empty-object) file is also completed and rewritten.
+        auth_file.write_text("{}", encoding="utf-8")
+        cfg2 = manager.load_ui_config()
+        self.assertRegex(cfg2["peer_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual([], cfg2["peers"])
+        self.assertEqual(cfg2["peer_id"], self._read_cfg_file()["peer_id"])
+
+    def test_peer_config_invalid_entries_dropped(self) -> None:
+        own_id = "own-peer-id-fixed"
+        good_a = self._good_peer("peer-a")
+        good_c = self._good_peer("peer-c", host="2001:db8::1")
+        raw = [
+            good_a,                                                  # 0 keep
+            {k: v for k, v in good_a.items() if k != "name"} | {"peer_id": "no-name"},  # 1 missing field
+            self._good_peer("p-true", port=True),                    # 2 port True
+            self._good_peer("p-float", port=1.5),                    # 3 port 1.5
+            self._good_peer("p-big", port=70000),                    # 4 port 70000
+            self._good_peer("p-str", port="abc"),                    # 5 port "abc"
+            self._good_peer("p-slash", host="a/b"),                  # 6 host with /
+            self._good_peer("p-empty-secret", secret_path=""),       # 7 empty secret_path
+            self._good_peer("peer-a", name="duplicate"),             # 8 duplicate peer_id
+            self._good_peer(own_id),                                 # 9 self pull
+            "not-a-dict",                                            # 10 non-object
+            self._good_peer("p-at", host="x@y"),                     # 11 host with @
+            self._good_peer("p-q", secret_path="a?b"),               # 12 secret with ?
+            self._good_peer("p-hash", secret_path="a#b"),            # 13 secret with #
+            self._good_peer("p-space", host="a b"),                  # 14 host with space
+            self._good_peer("p-zero", port=0),                       # 15 port 0
+            self._good_peer("  peer-c  ", name="  Cname  ", host="  2001:db8::1  "),  # 16 strip -> keep
+            self._good_peer("   "),                                  # 17 blank id after strip
+        ]
+        self._write_cfg(peer_id=own_id, peers=raw)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cfg = manager.load_ui_config()
+        self.assertEqual(own_id, cfg["peer_id"])
+        self.assertEqual(
+            [good_a, dict(good_c, name="Cname")], cfg["peers"],
+        )
+        self.assertEqual(cfg["peers"], self._read_cfg_file()["peers"])
+        logged = buf.getvalue()
+        for index in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17):
+            self.assertIn(f"peers[{index}]", logged)
+
+    def test_peer_config_non_list_peers_reset(self) -> None:
+        for bad in (None, {"peer_id": "x"}, "abc", 5):
+            with self.subTest(bad=bad):
+                self._write_cfg(peers=bad)
+                cfg = manager.load_ui_config()
+                self.assertEqual([], cfg["peers"])
+                self.assertEqual([], self._read_cfg_file()["peers"])
+
+    def test_peer_shared_key_non_string_normalized(self) -> None:
+        for bad in (None, 123, True, ["k"], {"k": 1}):
+            with self.subTest(bad=bad):
+                self._write_cfg(peer_shared_key=bad)
+                cfg = manager.load_ui_config()
+                self.assertEqual("", cfg["peer_shared_key"])
+                self.assertEqual("", self._read_cfg_file()["peer_shared_key"])
+        # A real string value is kept verbatim and never auto-generated.
+        self._write_cfg(peer_shared_key="mesh-key-1")
+        self.assertEqual("mesh-key-1", manager.load_ui_config()["peer_shared_key"])
+        self.assertEqual("mesh-key-1", self._read_cfg_file()["peer_shared_key"])
+
+    def test_peer_config_peer_name_fallback_and_truncate(self) -> None:
+        with mock.patch.object(manager.socket, "gethostname", side_effect=OSError("boom")):
+            self._write_cfg(peer_name="")
+            self.assertEqual("aimilivpn", manager.load_ui_config()["peer_name"])
+        with mock.patch.object(manager.socket, "gethostname", return_value=""):
+            self._write_cfg(peer_name=None)
+            self.assertEqual("aimilivpn", manager.load_ui_config()["peer_name"])
+        with mock.patch.object(manager.socket, "gethostname", return_value="h" * 100):
+            self._write_cfg(peer_name="")
+            cfg = manager.load_ui_config()
+            self.assertEqual("h" * 64, cfg["peer_name"])
+            self.assertEqual("h" * 64, self._read_cfg_file()["peer_name"])
+        with mock.patch.object(manager.socket, "gethostname", return_value="ignored"):
+            self._write_cfg(peer_name="my-server")
+            self.assertEqual("my-server", manager.load_ui_config()["peer_name"])
+            self._write_cfg(peer_name="n" * 80)
+            self.assertEqual("n" * 64, manager.load_ui_config()["peer_name"])
+
+    # ---- Task 2: build_peer_status ----
+    def _status_nodes(self) -> list[dict]:
+        return [
+            {"id": "JP_203.0.113.7_1194_udp", "ip": "203.0.113.7",
+             "remote_host": "vpn-host.example", "country_short": "JP",
+             "country": "日本", "active": False},
+            {"id": "US_198.51.100.9_443_tcp", "ip": "198.51.100.9",
+             "remote_host": "198.51.100.9", "country_short": "US",
+             "country": "美国", "active": True},  # stale flag on disk
+        ]
+
+    def test_build_peer_status_connected(self) -> None:
+        self._write_cfg(peer_id="me-id", peer_name="me-name")
+        with mock.patch.object(manager, "active_openvpn_node_id", "JP_203.0.113.7_1194_udp"), \
+                mock.patch.object(manager, "read_nodes", return_value=self._status_nodes()), \
+                mock.patch.object(manager.time, "time", return_value=1700000000.9):
+            payload = manager.build_peer_status()
+        self.assertEqual(
+            {"peer_id": "me-id", "name": "me-name", "status": "connected",
+             "node_ip": "203.0.113.7", "region": "JP", "ts": 1700000000},
+            payload,
+        )
+        self.assertIsInstance(payload["ts"], int)
+
+    def test_build_peer_status_falls_back_to_remote_host(self) -> None:
+        nodes = [{"id": "n1", "ip": "", "remote_host": "vpn-host.example", "country_short": "KR"}]
+        with mock.patch.object(manager, "active_openvpn_node_id", "n1"), \
+                mock.patch.object(manager, "read_nodes", return_value=nodes):
+            payload = manager.build_peer_status()
+        self.assertEqual("connected", payload["status"])
+        self.assertEqual("vpn-host.example", payload["node_ip"])
+        self.assertEqual("KR", payload["region"])
+
+    def test_build_peer_status_disconnected_ignores_stale_active_flag(self) -> None:
+        # Global empty but the table still carries a stale active flag on disk:
+        # must report disconnected (never goes through _connection_scope).
+        with mock.patch.object(manager, "active_openvpn_node_id", ""), \
+                mock.patch.object(manager, "read_nodes", return_value=self._status_nodes()), \
+                mock.patch.object(manager, "_connection_scope", side_effect=AssertionError("must not be used")):
+            payload = manager.build_peer_status()
+        self.assertEqual("disconnected", payload["status"])
+        self.assertEqual("", payload["node_ip"])
+        self.assertEqual("", payload["region"])
+
+    def test_build_peer_status_connected_node_missing_from_table(self) -> None:
+        with mock.patch.object(manager, "active_openvpn_node_id", "ghost-node"), \
+                mock.patch.object(manager, "read_nodes", return_value=self._status_nodes()):
+            payload = manager.build_peer_status()
+        self.assertEqual("connected", payload["status"])
+        self.assertEqual("", payload["node_ip"])
+        self.assertEqual("", payload["region"])
+
+    # ---- Task 3: receiver GET /api/peer_status ----
+    PEER_KEY = "mesh-key-1"
+    PEER_SECRET = "testsecret"
+
+    def _start_server(self) -> str:
+        server = manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop() -> None:
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def _setup_peer_server(self, key: str = PEER_KEY, **cfg_extra) -> str:
+        self._write_cfg(secret_path=self.PEER_SECRET, peer_shared_key=key,
+                        peer_id="own-id", peer_name="own-name", **cfg_extra)
+        self.server_root = self._start_server()
+        return f"{self.server_root}/{self.PEER_SECRET}"
+
+    @staticmethod
+    def _sign_req(key: str, ts) -> str:
+        return hmac.new(key.encode(), f"{ts}\n/api/peer_status".encode(), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _http(url: str, headers: dict | None = None, data: bytes | None = None,
+              method: str | None = None) -> tuple[int, dict, bytes]:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(url, headers=headers or {}, data=data, method=method)
+        try:
+            with opener.open(req, timeout=5) as response:
+                return response.status, dict(response.headers), response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, dict(exc.headers), exc.read()
+
+    def _peer_get(self, base: str, ts=None, sig=None, key: str | None = PEER_KEY,
+                  path: str = "/api/peer_status", extra: dict | None = None,
+                  now: float | None = None) -> tuple[int, dict, bytes]:
+        """GET with HMAC headers. ``now`` freezes the server clock for the whole round-trip."""
+        headers = dict(extra or {})
+        if ts is None and key is not None:
+            ts = int(manager.time.time() if now is None else now)
+        if ts is not None:
+            headers["X-Peer-Timestamp"] = str(ts)
+        if sig is None and key is not None and ts is not None:
+            sig = self._sign_req(key, ts)
+        if sig is not None:
+            headers["X-Peer-Signature"] = sig
+        if now is None:
+            return self._http(base + path, headers)
+        with mock.patch.object(manager.time, "time", return_value=now):
+            return self._http(base + path, headers)
+
+    def _assert_peer_endpoint_live(self, base: str) -> None:
+        """Control: a valid signed request succeeds, so the rejections asserted by
+        the caller are real rejections and not just a missing route."""
+        self.assertEqual(200, self._peer_get(base)[0])
+        rate = getattr(manager, "_peer_rate_limit", None)
+        if rate is not None:
+            with manager._peer_rate_limit_lock:
+                rate.clear()
+
+    def test_peer_status_rejects_without_secret_prefix(self) -> None:
+        base = self._setup_peer_server()
+        self._assert_peer_endpoint_live(base)
+        status, _, _ = self._peer_get(self.server_root)
+        self.assertEqual(404, status)
+
+    def test_peer_status_rejects_missing_or_bad_hmac(self) -> None:
+        base = self._setup_peer_server()
+        self._assert_peer_endpoint_live(base)
+        now = int(manager.time.time())
+        self.assertEqual(401, self._http(base + "/api/peer_status")[0])
+        self.assertEqual(401, self._peer_get(base, ts=now, sig="0" * 64)[0])
+        self.assertEqual(401, self._peer_get(base, key="wrong-key")[0])
+        # Only one of the two headers present.
+        self.assertEqual(401, self._http(base + "/api/peer_status", {"X-Peer-Timestamp": str(now)})[0])
+        self.assertEqual(401, self._http(base + "/api/peer_status", {"X-Peer-Signature": self._sign_req(self.PEER_KEY, now)})[0])
+
+    def test_peer_status_rejects_bad_timestamps(self) -> None:
+        base = self._setup_peer_server()
+        self._assert_peer_endpoint_live(base)
+        now = int(manager.time.time())
+        for bad_ts in (now - 400, now + 400, "abc", "1.5", "", "-5", "1_000", " 12", "+12"):
+            with self.subTest(ts=bad_ts):
+                sig = self._sign_req(self.PEER_KEY, bad_ts)
+                headers = {"X-Peer-Timestamp": str(bad_ts), "X-Peer-Signature": sig}
+                self.assertEqual(401, self._http(base + "/api/peer_status", headers)[0])
+
+    def test_peer_status_non_ascii_headers_are_401_not_500(self) -> None:
+        base = self._setup_peer_server()
+        self._assert_peer_endpoint_live(base)
+        now = int(manager.time.time())
+        good_sig = self._sign_req(self.PEER_KEY, now)
+        status, _, _ = self._http(base + "/api/peer_status",
+                                  {"X-Peer-Timestamp": str(now), "X-Peer-Signature": "é" * 64})
+        self.assertEqual(401, status)
+        status, _, _ = self._http(base + "/api/peer_status",
+                                  {"X-Peer-Timestamp": "é", "X-Peer-Signature": good_sig})
+        self.assertEqual(401, status)
+
+    def test_peer_status_disabled_when_local_key_empty(self) -> None:
+        base = self._setup_peer_server()
+        self._assert_peer_endpoint_live(base)  # enabled first ...
+        cfg = self._read_cfg_file()
+        cfg["peer_shared_key"] = ""            # ... then disabled by emptying the key
+        (self.root / "ui_auth.json").write_text(json.dumps(cfg), encoding="utf-8")
+        for key in ("", "anything", self.PEER_KEY):
+            with self.subTest(key=key):
+                now = int(manager.time.time())
+                sig = self._sign_req(key, now)
+                self.assertEqual(401, self._peer_get(base, ts=now, sig=sig, key=None)[0])
+        # Disabled requests are not counted by the rate limiter.
+        rate = getattr(manager, "_peer_rate_limit", {})
+        self.assertEqual({}, dict(rate))
+
+    def test_peer_status_valid_cookie_does_not_bypass_hmac(self) -> None:
+        base = self._setup_peer_server()
+        token = "peer-cookie-token"
+        manager.active_sessions[token] = manager.time.time() + 600
+        self.addCleanup(manager.active_sessions.pop, token, None)
+        status, _, _ = self._http(base + "/api/peer_status", {"Cookie": f"session={token}"})
+        self.assertEqual(401, status)
+        # A valid session plus a wrong signature is still 401 (no fallback to the session gate).
+        status, _, _ = self._peer_get(base, key="wrong-key", extra={"Cookie": f"session={token}"})
+        self.assertEqual(401, status)
+
+    def test_peer_status_valid_hmac_returns_payload_and_signed_response(self) -> None:
+        base = self._setup_peer_server()
+        payload = {"peer_id": "own-id", "name": "测试机", "status": "connected",
+                   "node_ip": "203.0.113.7", "region": "JP", "ts": 1700000000}
+        now = int(manager.time.time())
+        with mock.patch.object(manager, "build_peer_status", return_value=payload):
+            status, headers, body = self._peer_get(base, ts=now)
+        self.assertEqual(200, status)
+        self.assertEqual(json.dumps(payload, ensure_ascii=False).encode("utf-8"), body)
+        self.assertEqual(str(now), headers["X-Peer-Timestamp"])
+        expected = hmac.new(self.PEER_KEY.encode(), str(now).encode("ascii") + b"\n" + body,
+                            hashlib.sha256).hexdigest()
+        self.assertEqual(expected, headers["X-Peer-Response-Signature"])
+        self.assertEqual("no-store", headers["Cache-Control"])
+
+    def test_peer_status_unpatched_payload_has_fixed_fields(self) -> None:
+        base = self._setup_peer_server()
+        status, _, body = self._peer_get(base)
+        self.assertEqual(200, status)
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual({"peer_id", "name", "status", "node_ip", "region", "ts"}, set(data))
+        self.assertEqual("own-id", data["peer_id"])
+        self.assertEqual("own-name", data["name"])
+
+    def test_hmac_header_does_not_open_ordinary_api(self) -> None:
+        base = self._setup_peer_server()
+        # Behaviour lock: ordinary API still needs a session, with or without HMAC headers.
+        self.assertEqual(401, self._http(base + "/api/logs")[0])
+        self.assertEqual(401, self._peer_get(base, path="/api/logs")[0])
+        self.assertEqual(401, self._peer_get(base, path="/api/nodes")[0])
+        token = "ordinary-token"
+        manager.active_sessions[token] = manager.time.time() + 600
+        self.addCleanup(manager.active_sessions.pop, token, None)
+        status, headers, _ = self._http(base + "/api/logs", {"Cookie": f"session={token}"})
+        self.assertEqual(200, status)
+        self.assertNotIn("X-Peer-Timestamp", headers)  # send_bytes unchanged when extra_headers omitted
+
+    def test_empty_secret_path_still_protects_routes(self) -> None:
+        self._write_cfg(secret_path="", peer_shared_key=self.PEER_KEY)
+        root = self._start_server()
+        self.assertEqual(401, self._http(root + "/api/logs")[0])
+        self.assertEqual(401, self._peer_get(root, path="/api/logs")[0])
+
+    def test_peer_status_window_boundary_with_frozen_clock(self) -> None:
+        base = self._setup_peer_server()
+        now_int = 1_700_000_000
+        frozen = now_int + 0.7  # fractional part must not matter (integer-second comparison)
+        for delta, expected in ((300, 200), (-300, 200), (301, 401), (-301, 401), (0, 200)):
+            with self.subTest(delta=delta):
+                rate = getattr(manager, "_peer_rate_limit", None)
+                if rate is not None:
+                    with manager._peer_rate_limit_lock:
+                        rate.clear()
+                status, _, _ = self._peer_get(base, ts=now_int + delta, now=frozen)
+                self.assertEqual(expected, status)
+
+    def test_peer_status_401_log_carries_ts_delta(self) -> None:
+        base = self._setup_peer_server()
+        now_int = 1_700_000_000
+        cases = [
+            ({}, "ts_delta=missing"),
+            # Present but empty: unparseable, not missing (Boy fix for GPT P2, 2026-11-17).
+            ({"X-Peer-Timestamp": "", "X-Peer-Signature": "x"}, "ts_delta=unparseable"),
+            ({"X-Peer-Timestamp": "abc", "X-Peer-Signature": "x"}, "ts_delta=unparseable"),
+            ({"X-Peer-Timestamp": str(now_int + 400), "X-Peer-Signature": "x"}, "ts_delta=400"),
+            ({"X-Peer-Timestamp": str(now_int - 450), "X-Peer-Signature": "x"}, "ts_delta=-450"),
+            # Missing signature but a valid-integer timestamp: delta still reported.
+            ({"X-Peer-Timestamp": str(now_int + 7)}, "ts_delta=7"),
+            # Right clock, wrong key: delta within the window.
+            ({"X-Peer-Timestamp": str(now_int), "X-Peer-Signature": "0" * 64}, "ts_delta=0"),
+        ]
+        for headers, expected in cases:
+            with self.subTest(expected=expected):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    with mock.patch.object(manager.time, "time", return_value=float(now_int)):
+                        status, _, _ = self._http(base + "/api/peer_status", headers)
+                self.assertEqual(401, status)
+                self.assertIn(expected, buf.getvalue())
+                self.assertNotIn(self.PEER_KEY, buf.getvalue())
+
+    def test_peer_status_key_rotation_without_restart(self) -> None:
+        base = self._setup_peer_server(key="old-key")
+        self.assertEqual(200, self._peer_get(base, key="old-key")[0])
+        cfg = self._read_cfg_file()
+        cfg["peer_shared_key"] = "new-key"
+        (self.root / "ui_auth.json").write_text(json.dumps(cfg), encoding="utf-8")
+        self.assertEqual(401, self._peer_get(base, key="old-key")[0])
+        self.assertEqual(200, self._peer_get(base, key="new-key")[0])
+
+    # ---- Task 3: rate limit ----
+    def test_peer_status_rate_limit_11th_request_is_429(self) -> None:
+        base = self._setup_peer_server()
+        now_int = 1_700_000_000
+        for i in range(10):
+            self.assertEqual(200, self._peer_get(base, ts=now_int, now=float(now_int))[0], i)
+        # 11th: 429 regardless of signature validity or missing headers (limit precedes them).
+        self.assertEqual(429, self._peer_get(base, ts=now_int, now=float(now_int))[0])
+        self.assertEqual(429, self._peer_get(base, ts=now_int, sig="0" * 64, now=float(now_int))[0])
+        with mock.patch.object(manager.time, "time", return_value=float(now_int)):
+            self.assertEqual(429, self._http(base + "/api/peer_status")[0])
+
+    def test_peer_status_rate_limit_counts_unauthenticated_requests(self) -> None:
+        base = self._setup_peer_server()
+        now_int = 1_700_000_000
+        with mock.patch.object(manager.time, "time", return_value=float(now_int)):
+            for _ in range(10):
+                self.assertEqual(401, self._http(base + "/api/peer_status")[0])
+        self.assertEqual(429, self._peer_get(base, ts=now_int, now=float(now_int))[0])
+
+    def test_peer_status_rate_limit_recovers_after_window(self) -> None:
+        base = self._setup_peer_server()
+        t0 = 1_700_000_000
+        for _ in range(10):
+            self.assertEqual(200, self._peer_get(base, ts=t0, now=float(t0))[0])
+        self.assertEqual(429, self._peer_get(base, ts=t0, now=float(t0))[0])
+        # Still blocked just inside the window, free just after it (controlled clock).
+        self.assertEqual(429, self._peer_get(base, ts=t0 + 59, now=float(t0 + 59))[0])
+        self.assertEqual(200, self._peer_get(base, ts=t0 + 61, now=float(t0 + 61))[0])
+
+    def test_peer_status_rate_limit_concurrent_exactly_ten_pass(self) -> None:
+        import concurrent.futures
+        base = self._setup_peer_server()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+            futures = [pool.submit(self._peer_get, base) for _ in range(20)]
+            codes = sorted(f.result()[0] for f in futures)
+        self.assertEqual([200] * 10 + [429] * 10, codes)
+
+    def test_peer_rate_limit_sweeps_expired_keys_and_drops_empty_lists(self) -> None:
+        manager._peer_rate_limit.clear()
+        for _ in range(10):
+            self.assertTrue(manager.peer_rate_limit_allow("192.0.2.1", now=1000.0))
+        self.assertFalse(manager.peer_rate_limit_allow("192.0.2.1", now=1000.0))
+        self.assertIn("192.0.2.1", manager._peer_rate_limit)
+        # Another IP's request triggers a full sweep: the inactive IP's key disappears.
+        self.assertTrue(manager.peer_rate_limit_allow("192.0.2.2", now=1061.0))
+        self.assertNotIn("192.0.2.1", manager._peer_rate_limit)
+        self.assertIn("192.0.2.2", manager._peer_rate_limit)
+        # A later request from the first IP is counted from zero.
+        self.assertTrue(manager.peer_rate_limit_allow("192.0.2.1", now=1062.0))
+        self.assertEqual(1, len(manager._peer_rate_limit["192.0.2.1"]))
+
+    def test_peer_rate_limit_capacity_evicts_oldest_last_request(self) -> None:
+        manager._peer_rate_limit.clear()
+        victim = "198.51.100.200"
+        for i in range(10):  # victim is at its limit; its last request is the oldest of all keys
+            self.assertTrue(manager.peer_rate_limit_allow(victim, now=1000.0 + i * 0.01))
+        self.assertFalse(manager.peer_rate_limit_allow(victim, now=1000.5))
+        for i in range(1023):
+            self.assertTrue(manager.peer_rate_limit_allow(f"10.{i // 256}.{i % 256}.1", now=1001.0 + i * 0.001))
+        self.assertEqual(1024, len(manager._peer_rate_limit))
+        self.assertTrue(manager.peer_rate_limit_allow("203.0.113.99", now=1030.0))
+        self.assertEqual(1024, len(manager._peer_rate_limit))
+        self.assertNotIn(victim, manager._peer_rate_limit)
+        # The evicted IP starts again from zero (it was at its limit before).
+        self.assertTrue(manager.peer_rate_limit_allow(victim, now=1031.0))
+        self.assertEqual(1, len(manager._peer_rate_limit[victim]))
+
+    def test_peer_rate_limit_capacity_tie_breaks_by_ip_order(self) -> None:
+        manager._peer_rate_limit.clear()
+        ips = [f"10.{i // 256}.{i % 256}.1" for i in range(1024)]
+        for ip in ips:
+            self.assertTrue(manager.peer_rate_limit_allow(ip, now=2000.0))  # identical timestamps
+        self.assertTrue(manager.peer_rate_limit_allow("203.0.113.5", now=2001.0))
+        self.assertNotIn(min(ips), manager._peer_rate_limit)  # lexicographically smallest evicted
+        self.assertIn(max(ips), manager._peer_rate_limit)
+        self.assertEqual(1024, len(manager._peer_rate_limit))
+
+    def test_peer_rate_limit_records_rejected_requests(self) -> None:
+        # Boy fix for GPT P1-1 (2026-11-17): rejected requests are recorded,
+        # so a sustained flood is not re-admitted 60 s after the first
+        # accepted request. The block lifts only 60 s after the last request.
+        manager._peer_rate_limit.clear()
+        for _ in range(10):
+            self.assertTrue(manager.peer_rate_limit_allow("192.0.2.1", now=1000.0))
+        for _ in range(5):
+            self.assertFalse(manager.peer_rate_limit_allow("192.0.2.1", now=1010.0))
+        self.assertFalse(manager.peer_rate_limit_allow("192.0.2.1", now=1059.0))
+        self.assertEqual(16, len(manager._peer_rate_limit["192.0.2.1"]))
+        self.assertTrue(manager.peer_rate_limit_allow("192.0.2.1", now=1119.0))
+
+    # ---- Task 3: table pruning ----
+    @staticmethod
+    def _row(peer_id: str, last_seen: float) -> dict:
+        return {"peer_id": peer_id, "name": peer_id, "status": "connected",
+                "node_ip": "203.0.113.1", "region": "JP", "last_seen": last_seen}
+
+    def test_prune_peer_table_age_boundary_and_unconfigured(self) -> None:
+        now = 1_800_000_000.0
+        with manager.lock:
+            manager.peer_status_table.update({
+                "keep-86399": self._row("keep-86399", now - 86399),
+                "drop-86401": self._row("drop-86401", now - 86401),
+                "not-configured": self._row("not-configured", now - 10),
+            })
+            manager.prune_peer_table(now, {"keep-86399", "drop-86401"})
+            self.assertEqual({"keep-86399"}, set(manager.peer_status_table))
+
+    def test_prune_peer_table_caps_rows_dropping_oldest_then_peer_id(self) -> None:
+        now = 1_800_000_000.0
+        ids = {f"p{i:03d}" for i in range(55)}
+        with manager.lock:
+            for i in range(55):
+                pid = f"p{i:03d}"
+                # p000..p004 share the oldest last_seen; the rest are strictly newer.
+                manager.peer_status_table[pid] = self._row(pid, now - 100 if i < 5 else now - 50 + i)
+            manager.prune_peer_table(now, ids)
+            self.assertEqual(50, len(manager.peer_status_table))
+            self.assertEqual(ids - {f"p{i:03d}" for i in range(5)}, set(manager.peer_status_table))
+        # Equal last_seen across the overflow: ascending peer_id is dropped first.
+        with manager.lock:
+            manager.peer_status_table.clear()
+            for i in range(52):
+                pid = f"q{i:03d}"
+                manager.peer_status_table[pid] = self._row(pid, now - 20)
+            manager.prune_peer_table(now, {f"q{i:03d}" for i in range(52)})
+            self.assertEqual({f"q{i:03d}" for i in range(2, 52)}, set(manager.peer_status_table))
+
+    def test_prune_peer_table_does_not_take_lock_or_read_config(self) -> None:
+        # Contract: the caller holds the global lock; the function reads no config files.
+        with mock.patch.object(manager, "load_ui_config", side_effect=AssertionError("no config reads")):
+            with manager.lock:
+                manager.prune_peer_table(1_800_000_000.0, set())
+
+    # ---- Task 4: pull thread ----
+    class _FakePeerResponse:
+        def __init__(self, body: bytes, headers: dict, status: int = 200) -> None:
+            import http.client as http_client
+            self.status = status
+            self.headers = http_client.HTTPMessage()
+            for name, value in headers.items():
+                self.headers[name] = value
+            self._body = body
+            self.read_sizes: list = []
+
+        def read(self, size: int = -1) -> bytes:
+            self.read_sizes.append(size)
+            return self._body if size is None or size < 0 else self._body[:size]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> bool:
+            return False
+
+    class _FakePeerOpener:
+        def __init__(self, responder) -> None:
+            self.responder = responder
+            self.requests: list = []
+            self.timeouts: list = []
+
+        def open(self, request, timeout=None):
+            self.requests.append(request)
+            self.timeouts.append(timeout)
+            return self.responder(request)
+
+    def _peer_payload(self, peer_id: str = "peer-a", **over) -> dict:
+        payload = {"peer_id": peer_id, "name": "Remote A", "status": "connected",
+                   "node_ip": "203.0.113.7", "region": "JP", "ts": 1700000000}
+        payload.update(over)
+        return payload
+
+    def _responder(self, payload=None, key: str = PEER_KEY, body: bytes | None = None,
+                   status: int = 200, ts_header="echo", sig_header="valid",
+                   extra_headers: dict | None = None):
+        """Build a fake reply that echoes the request ts and signs the exact body."""
+        def respond(request):
+            req_ts = request.get_header("X-peer-timestamp")
+            raw = body if body is not None else json.dumps(
+                self._peer_payload() if payload is None else payload, ensure_ascii=False
+            ).encode("utf-8")
+            headers = dict(extra_headers or {})
+            if ts_header == "echo":
+                headers["X-Peer-Timestamp"] = req_ts
+            elif ts_header is not None:
+                headers["X-Peer-Timestamp"] = ts_header
+            if sig_header == "valid":
+                headers["X-Peer-Response-Signature"] = manager.peer_response_signature(key, req_ts, raw)
+            elif sig_header is not None:
+                headers["X-Peer-Response-Signature"] = sig_header
+            return self._FakePeerResponse(raw, headers, status)
+        return respond
+
+    def _pull(self, responder, peer: dict | None = None, key: str = PEER_KEY,
+              own_id: str = "own-id", now: float = 1_700_000_100.5):
+        opener = self._FakePeerOpener(responder)
+        with mock.patch.object(manager, "_peer_build_opener", return_value=opener), \
+                mock.patch.object(manager.time, "time", return_value=now):
+            result = manager.pull_one_peer(peer or self._good_peer("peer-a"), key, own_id)
+        return result, opener
+
+    def _seed_old_row(self, peer_id: str = "peer-a") -> dict:
+        old = {"peer_id": peer_id, "name": "OLD", "status": "disconnected", "node_ip": "",
+               "region": "", "last_seen": 1.0}
+        with manager.lock:
+            manager.peer_status_table[peer_id] = dict(old)
+        return old
+
+    def test_pull_one_peer_success_writes_row_and_signs_request(self) -> None:
+        self._seed_old_row()
+        result, opener = self._pull(self._responder())
+        self.assertTrue(result)
+        with manager.lock:
+            row = dict(manager.peer_status_table["peer-a"])
+        self.assertEqual(
+            {"peer_id": "peer-a", "name": "Remote A", "status": "connected",
+             "node_ip": "203.0.113.7", "region": "JP", "last_seen": 1_700_000_100.5},
+            row,
+        )
+        (request,) = opener.requests
+        self.assertEqual("http://192.0.2.1:8787/secretpath/api/peer_status", request.full_url)
+        self.assertEqual([10], opener.timeouts)
+        ts = request.get_header("X-peer-timestamp")
+        self.assertEqual("1700000100", ts)
+        self.assertEqual(manager.peer_request_signature(self.PEER_KEY, ts),
+                         request.get_header("X-peer-signature"))
+        self.assertEqual(f"Mozilla/5.0 AimiliVPN/{manager.APP_VERSION}", request.get_header("User-agent"))
+
+    def test_pull_one_peer_brackets_ipv6_host(self) -> None:
+        result, opener = self._pull(self._responder(), peer=self._good_peer("peer-a", host="2001:db8::1", port=9000))
+        self.assertTrue(result)
+        self.assertEqual("http://[2001:db8::1]:9000/secretpath/api/peer_status", opener.requests[0].full_url)
+
+    def test_pull_one_peer_failures_return_false_and_keep_old_row(self) -> None:
+        import urllib.error as urlerr
+        big = b"{" + b" " * 70000 + b"}"
+        good = self._peer_payload()
+
+        def raising(exc):
+            def respond(request):
+                raise exc
+            return respond
+
+        cases = {
+            "timeout": raising(manager.socket.timeout("timed out")),
+            "urlerror": raising(urlerr.URLError("refused")),
+            "http401": raising(urlerr.HTTPError("http://x", 401, "Unauthorized", {}, None)),
+            "http429": raising(urlerr.HTTPError("http://x", 429, "Too Many", {}, None)),
+            "status_204": self._responder(status=204),
+            "bad_json": self._responder(body=b"{not json"),
+            "json_list": self._responder(body=b"[]"),
+            "non_utf8": self._responder(body=b"\xff\xfe"),
+            "missing_field": self._responder(payload={k: v for k, v in good.items() if k != "region"}),
+            "bad_status_value": self._responder(payload=self._peer_payload(status="weird")),
+            "ts_not_int_str": self._responder(payload=self._peer_payload(ts="1700000000")),
+            "ts_bool": self._responder(payload=self._peer_payload(ts=True)),
+            "name_not_str": self._responder(payload=self._peer_payload(name=5)),
+            "peer_id_mismatch": self._responder(payload=self._peer_payload("someone-else")),
+            "bad_response_signature": self._responder(sig_header="0" * 64),
+            "wrong_key_signature": self._responder(key="other-key"),
+            "missing_signature_header": self._responder(sig_header=None),
+            "missing_ts_header": self._responder(ts_header=None),
+            "ts_header_mismatch": self._responder(ts_header="1700000099"),
+            "ts_header_non_ascii": self._responder(ts_header="é"),
+            "sig_header_non_ascii": self._responder(sig_header="é" * 64),
+            "oversize_body": self._responder(body=big),
+            "oversize_content_length": self._responder(extra_headers={"Content-Length": "70000"}),
+        }
+        for name, responder in cases.items():
+            with self.subTest(case=name):
+                old = self._seed_old_row()
+                result, _ = self._pull(responder)
+                self.assertFalse(result)
+                with manager.lock:
+                    self.assertEqual(old, manager.peer_status_table["peer-a"])
+
+    def test_pull_one_peer_oversize_content_length_is_rejected_before_reading(self) -> None:
+        response_holder = {}
+
+        def respond(request):
+            resp = self._responder(extra_headers={"Content-Length": "70000"})(request)
+            response_holder["resp"] = resp
+            return resp
+
+        result, _ = self._pull(respond)
+        self.assertFalse(result)
+        self.assertEqual([], response_holder["resp"].read_sizes)
+
+    def test_pull_one_peer_body_read_is_capped(self) -> None:
+        holder = {}
+
+        def respond(request):
+            holder["resp"] = self._responder(body=b"x" * 200000)(request)
+            return holder["resp"]
+
+        result, _ = self._pull(respond)
+        self.assertFalse(result)
+        self.assertEqual([manager.PEER_STATUS_MAX_BYTES + 1], holder["resp"].read_sizes)
+
+    def test_pull_one_peer_refuses_empty_key_and_self(self) -> None:
+        opener = self._FakePeerOpener(self._responder())
+        with mock.patch.object(manager, "_peer_build_opener", return_value=opener):
+            self.assertFalse(manager.pull_one_peer(self._good_peer("peer-a"), "", "own-id"))
+            self.assertFalse(manager.pull_one_peer(self._good_peer("own-id"), self.PEER_KEY, "own-id"))
+        self.assertEqual([], opener.requests)
+
+    def test_pull_one_peer_never_reloads_config(self) -> None:
+        with mock.patch.object(manager, "load_ui_config", side_effect=AssertionError("must not reload config")):
+            result, _ = self._pull(self._responder())
+        self.assertTrue(result)
+
+    def _round(self) -> None:
+        with manager._peer_pull_lock:
+            manager._peer_pull_round()
+
+    def test_pull_round_sends_nothing_when_peers_or_key_empty(self) -> None:
+        opener = self._FakePeerOpener(self._responder())
+        with mock.patch.object(manager, "_peer_build_opener", return_value=opener):
+            self._write_cfg(peer_shared_key=self.PEER_KEY, peers=[])
+            self._round()
+            self._write_cfg(peer_shared_key="", peers=[self._good_peer("peer-a")])
+            self._round()
+        self.assertEqual([], opener.requests)
+
+    def test_pull_round_isolates_single_peer_exception(self) -> None:
+        self._write_cfg(peer_shared_key=self.PEER_KEY, peer_id="own-id",
+                        peers=[self._good_peer("peer-a"), self._good_peer("peer-b")])
+        seen: list = []
+
+        def fake_pull(peer, key, own_id):
+            seen.append(peer["peer_id"])
+            if peer["peer_id"] == "peer-a":
+                raise RuntimeError("boom")
+            return True
+
+        with mock.patch.object(manager, "pull_one_peer", side_effect=fake_pull):
+            self._round()
+        self.assertEqual(["peer-a", "peer-b"], seen)
+
+    def test_pull_round_uses_round_start_snapshot_of_key_and_own_id(self) -> None:
+        self._write_cfg(peer_shared_key="key-old", peer_id="own-old",
+                        peers=[self._good_peer("peer-a"), self._good_peer("peer-b")])
+        calls: list = []
+
+        def fake_pull(peer, key, own_id):
+            calls.append((peer["peer_id"], key, own_id))
+            if len(calls) == 1:  # rotate the key mid-round
+                self._write_cfg(peer_shared_key="key-new", peer_id="own-new",
+                                peers=[self._good_peer("peer-a"), self._good_peer("peer-b")])
+            return True
+
+        with mock.patch.object(manager, "pull_one_peer", side_effect=fake_pull):
+            self._round()
+            self._round()
+        self.assertEqual(
+            [("peer-a", "key-old", "own-old"), ("peer-b", "key-old", "own-old"),
+             ("peer-a", "key-new", "own-new"), ("peer-b", "key-new", "own-new")],
+            calls,
+        )
+
+    def test_pull_round_prunes_rows_for_removed_peers(self) -> None:
+        self._write_cfg(peer_shared_key=self.PEER_KEY, peers=[self._good_peer("peer-a")])
+        with manager.lock:
+            manager.peer_status_table["peer-a"] = self._row("peer-a", manager.time.time())
+            manager.peer_status_table["removed"] = self._row("removed", manager.time.time())
+        with mock.patch.object(manager, "pull_one_peer", return_value=True):
+            self._round()
+        with manager.lock:
+            self.assertEqual({"peer-a"}, set(manager.peer_status_table))
+
+    def test_peer_pull_loop_runs_first_round_then_sleeps_outside_lock(self) -> None:
+        events: list = []
+        self._write_cfg(peer_shared_key=self.PEER_KEY, peers=[self._good_peer("peer-a")])
+
+        def fake_pull(peer, key, own_id):
+            events.append(("pull", manager._peer_pull_lock.locked()))
+            return True
+
+        def fake_sleep(seconds):
+            events.append(("sleep", seconds, manager._peer_pull_lock.locked()))
+            raise _StopServer()
+
+        with mock.patch.object(manager, "pull_one_peer", side_effect=fake_pull), \
+                mock.patch.object(manager.time, "sleep", side_effect=fake_sleep):
+            with self.assertRaises(_StopServer):
+                manager.peer_pull_loop()
+        self.assertEqual([("pull", True), ("sleep", 300, False)], events)
+
+    def test_peer_pull_loop_still_sleeps_after_round_exception(self) -> None:
+        sleeps: list = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            raise _StopServer()
+
+        with mock.patch.object(manager, "_peer_pull_round", side_effect=RuntimeError("round blew up")), \
+                mock.patch.object(manager.time, "sleep", side_effect=fake_sleep):
+            with self.assertRaises(_StopServer):
+                manager.peer_pull_loop()
+        self.assertEqual([300], sleeps)
+        self.assertFalse(manager._peer_pull_lock.locked())
+
+    def test_main_starts_peer_pull_thread(self) -> None:
+        import sys
+        started_targets: list = []
+
+        def fake_thread(*args, **kwargs):
+            started_targets.append(kwargs.get("target"))
+            return mock.Mock()
+
+        server_mock = mock.Mock()
+        server_mock.serve_forever.side_effect = _StopServer()
+        saved_out, saved_err = sys.stdout, sys.stderr
+        try:
+            with (
+                mock.patch.object(manager, "ensure_dirs"),
+                mock.patch.object(manager, "kill_existing_openvpn_processes"),
+                mock.patch.object(manager, "reset_stale_testing_nodes"),
+                mock.patch.object(manager, "finalize_orphaned_update_status"),
+                mock.patch.object(manager, "Tee", return_value=mock.Mock()),
+                mock.patch.object(manager, "write_json"),
+                mock.patch.object(manager, "sync_config_store_lifecycle"),
+                mock.patch.object(manager.threading, "Thread", side_effect=fake_thread),
+                mock.patch.object(manager.socket, "socket", side_effect=lambda *a, **k: _FakeSocket()),
+                mock.patch.object(manager.time, "sleep"),
+                mock.patch.object(manager, "load_ui_config", return_value={"host": "127.0.0.1", "port": 8787}),
+                mock.patch.object(manager, "DualStackHTTPServer", return_value=server_mock),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(_StopServer):
+                    manager.main()
+        finally:
+            sys.stdout, sys.stderr = saved_out, saved_err
+        self.assertIn(manager.peer_pull_loop, started_targets)
+
+    # ---- Task 5: panel endpoints ----
+    def _login_headers(self) -> dict:
+        token = f"panel-token-{id(self)}"
+        manager.active_sessions[token] = manager.time.time() + 600
+        self.addCleanup(manager.active_sessions.pop, token, None)
+        return {"Cookie": f"session={token}"}
+
+    def _post_json(self, base: str, path: str, payload=None, raw: bytes | None = None,
+                   headers: dict | None = None) -> tuple[int, dict]:
+        hdrs = {"Content-Type": "application/json"}
+        hdrs.update(headers or {})
+        body = raw if raw is not None else json.dumps(payload).encode("utf-8")
+        status, _, data = self._http(base + path, hdrs, data=body, method="POST")
+        try:
+            return status, json.loads(data.decode("utf-8"))
+        except ValueError:
+            return status, {}
+
+    def _get_json(self, base: str, path: str, headers: dict | None = None) -> tuple[int, dict]:
+        status, _, data = self._http(base + path, headers or {})
+        return status, json.loads(data.decode("utf-8"))
+
+    def test_peer_display_state_boundaries(self) -> None:
+        self.assertEqual("ok", manager.peer_display_state(0))
+        self.assertEqual("ok", manager.peer_display_state(900))
+        self.assertEqual("stale", manager.peer_display_state(901))
+        self.assertEqual("stale", manager.peer_display_state(1800))
+        self.assertEqual("offline", manager.peer_display_state(1801))
+
+    def test_panel_peer_endpoints_require_session(self) -> None:
+        base = self._setup_peer_server()
+        headers = self._login_headers()
+        # Control: with a session the endpoints exist, so the 401s below are the session gate.
+        self.assertEqual(200, self._http(base + "/api/peers", headers)[0])
+        self.assertEqual(200, self._post_json(base, "/api/update_peers", {"action": "add", "peer": self._good_peer("ctl")}, headers=headers)[0])
+        with mock.patch.object(manager, "_peer_pull_round"):
+            self.assertEqual(200, self._post_json(base, "/api/peers/refresh", {}, headers=headers)[0])
+            self._wait_until(lambda: not manager._peer_pull_lock.locked())
+        self.assertEqual(401, self._http(base + "/api/peers")[0])
+        self.assertEqual(401, self._post_json(base, "/api/peers/refresh", {})[0])
+        self.assertEqual(401, self._post_json(base, "/api/update_peers", {"action": "remove", "peer_id": "x"})[0])
+        # An HMAC-signed request does not open them either.
+        self.assertEqual(401, self._peer_get(base, path="/api/peers")[0])
+
+    def test_api_peers_structure_rows_and_display_states(self) -> None:
+        peers = [self._good_peer("peer-fresh", name="Fresh"), self._good_peer("peer-stale", name="Stale"),
+                 self._good_peer("peer-off", name="Off"), self._good_peer("peer-never", name="Never"),
+                 self._good_peer("peer-old", name="Old")]
+        base = self._setup_peer_server(peers=peers)
+        headers = self._login_headers()
+        now = manager.time.time()
+        with manager.lock:
+            for pid, age, name in (("peer-fresh", 100, "Reported Fresh"), ("peer-stale", 1000, "S"),
+                                   ("peer-off", 2000, "O"), ("peer-old", 90000, "OLD"),
+                                   ("not-configured", 10, "ghost")):
+                manager.peer_status_table[pid] = self._row(pid, now - age)
+                manager.peer_status_table[pid]["name"] = name
+        with mock.patch.object(manager, "active_openvpn_node_id", ""):
+            status, data = self._get_json(base, "/api/peers", headers)
+        self.assertEqual(200, status)
+        self.assertEqual({"self", "peers", "configured_peers", "pull_running"}, set(data))
+        self.assertFalse(data["pull_running"])
+        rows = {r["peer_id"]: r for r in data["peers"]}
+        self.assertEqual({"peer-fresh", "peer-stale", "peer-off"}, set(rows))  # never/old/ghost have no row
+        self.assertEqual("ok", rows["peer-fresh"]["display"])
+        self.assertEqual("stale", rows["peer-stale"]["display"])
+        self.assertEqual("offline", rows["peer-off"]["display"])
+        self.assertEqual("Reported Fresh", rows["peer-fresh"]["name"])  # peer-reported name, not configured
+        for key in ("peer_id", "name", "status", "node_ip", "region", "last_seen", "display"):
+            self.assertIn(key, rows["peer-fresh"])
+        # configured_peers: config data only, no secret_path, includes never-pulled peers.
+        configured = {c["peer_id"]: c for c in data["configured_peers"]}
+        self.assertEqual({"peer-fresh", "peer-stale", "peer-off", "peer-never", "peer-old"}, set(configured))
+        for entry in configured.values():
+            self.assertEqual({"peer_id", "name", "host", "port"}, set(entry))
+        self.assertEqual("Never", configured["peer-never"]["name"])
+        # Rows over 24h and unconfigured rows were deleted from the table, not just filtered.
+        with manager.lock:
+            self.assertEqual({"peer-fresh", "peer-stale", "peer-off"}, set(manager.peer_status_table))
+        # Self row: live values plus last_seen=now and display.
+        self.assertEqual("own-id", data["self"]["peer_id"])
+        self.assertEqual("disconnected", data["self"]["display"])
+        self.assertAlmostEqual(now, data["self"]["last_seen"], delta=30)
+
+    def test_api_peers_self_display_ok_when_connected(self) -> None:
+        base = self._setup_peer_server()
+        headers = self._login_headers()
+        nodes = [{"id": "n1", "ip": "203.0.113.7", "remote_host": "h", "country_short": "JP"}]
+        with mock.patch.object(manager, "active_openvpn_node_id", "n1"), \
+                mock.patch.object(manager, "read_nodes", return_value=nodes):
+            _, data = self._get_json(base, "/api/peers", headers)
+        self.assertEqual("ok", data["self"]["display"])
+        self.assertEqual("connected", data["self"]["status"])
+        self.assertEqual("203.0.113.7", data["self"]["node_ip"])
+
+    def test_api_peers_empty_config_shape(self) -> None:
+        base = self._setup_peer_server()
+        _, data = self._get_json(base, "/api/peers", self._login_headers())
+        self.assertEqual([], data["peers"])
+        self.assertEqual([], data["configured_peers"])
+
+    def test_api_peers_removed_peer_disappears(self) -> None:
+        base = self._setup_peer_server(peers=[self._good_peer("peer-a")])
+        headers = self._login_headers()
+        with manager.lock:
+            manager.peer_status_table["peer-a"] = self._row("peer-a", manager.time.time())
+        _, data = self._get_json(base, "/api/peers", headers)
+        self.assertEqual(["peer-a"], [r["peer_id"] for r in data["peers"]])
+        status, _ = self._post_json(base, "/api/update_peers", {"action": "remove", "peer_id": "peer-a"}, headers=headers)
+        self.assertEqual(200, status)
+        _, data = self._get_json(base, "/api/peers", headers)
+        self.assertEqual([], data["peers"])
+        self.assertEqual([], data["configured_peers"])
+
+    def test_api_peers_pull_running_reflects_lock(self) -> None:
+        base = self._setup_peer_server()
+        headers = self._login_headers()
+        self.assertFalse(self._get_json(base, "/api/peers", headers)[1]["pull_running"])
+        self.assertTrue(manager._peer_pull_lock.acquire(blocking=False))
+        try:
+            self.assertTrue(self._get_json(base, "/api/peers", headers)[1]["pull_running"])
+        finally:
+            manager._peer_pull_lock.release()
+        # The probe must not leave the lock held.
+        self.assertFalse(manager._peer_pull_lock.locked())
+        self.assertFalse(self._get_json(base, "/api/peers", headers)[1]["pull_running"])
+
+    def _wait_until(self, predicate, timeout: float = 3.0) -> bool:
+        deadline = manager.time.monotonic() + timeout
+        while manager.time.monotonic() < deadline:
+            if predicate():
+                return True
+            manager.time.sleep(0.01)
+        return predicate()
+
+    def test_refresh_runs_one_round_and_returns_immediately(self) -> None:
+        base = self._setup_peer_server()
+        headers = self._login_headers()
+        started = threading.Event()
+        release = threading.Event()
+        calls: list = []
+
+        def slow_round():
+            calls.append(1)
+            started.set()
+            release.wait(5)
+
+        with mock.patch.object(manager, "_peer_pull_round", side_effect=slow_round):
+            status, data = self._post_json(base, "/api/peers/refresh", {}, headers=headers)
+            self.assertEqual((200, {"ok": True, "running": True}), (status, data))
+            self.assertTrue(started.wait(3))
+            self.assertTrue(manager._peer_pull_lock.locked())  # the lock is the running indicator
+            # A second refresh while the round runs: running=True, no extra round, no waiting.
+            status2, data2 = self._post_json(base, "/api/peers/refresh", {}, headers=headers)
+            self.assertEqual((200, {"ok": True, "running": True}), (status2, data2))
+            release.set()
+            self.assertTrue(self._wait_until(lambda: not manager._peer_pull_lock.locked()))
+        self.assertEqual(1, len(calls))
+
+    def test_refresh_while_timed_round_holds_lock_runs_nothing(self) -> None:
+        base = self._setup_peer_server()
+        headers = self._login_headers()
+        calls: list = []
+        self.assertTrue(manager._peer_pull_lock.acquire(blocking=False))
+        try:
+            with mock.patch.object(manager, "_peer_pull_round", side_effect=lambda: calls.append(1)):
+                status, data = self._post_json(base, "/api/peers/refresh", {}, headers=headers)
+                manager.time.sleep(0.2)
+        finally:
+            manager._peer_pull_lock.release()
+        self.assertEqual((200, {"ok": True, "running": True}), (status, data))
+        self.assertEqual([], calls)
+
+    def test_refresh_thread_start_failure_releases_lock(self) -> None:
+        with mock.patch.object(manager.threading, "Thread", side_effect=RuntimeError("no threads")):
+            result = manager._run_peer_pull_round_async()
+        self.assertEqual({"ok": False, "error": "thread_start_failed"}, result)
+        self.assertFalse(manager._peer_pull_lock.locked())
+        done = threading.Event()
+        with mock.patch.object(manager, "_peer_pull_round", side_effect=done.set):
+            self.assertEqual({"ok": True, "running": True}, manager._run_peer_pull_round_async())
+            self.assertTrue(done.wait(3))
+        self.assertTrue(self._wait_until(lambda: not manager._peer_pull_lock.locked()))
+
+    def test_refresh_round_rereads_config_at_round_start_and_releases_lock(self) -> None:
+        self._write_cfg(peer_shared_key="key-old", peer_id="own-old",
+                        peers=[self._good_peer("peer-a"), self._good_peer("peer-b")])
+        calls: list = []
+
+        def fake_pull(peer, key, own_id):
+            calls.append((peer["peer_id"], key, own_id))
+            if len(calls) == 1:
+                self._write_cfg(peer_shared_key="key-new", peer_id="own-new",
+                                peers=[self._good_peer("peer-a"), self._good_peer("peer-b")])
+            return True
+
+        self.assertTrue(manager._peer_pull_lock.acquire(blocking=False))
+        with mock.patch.object(manager, "pull_one_peer", side_effect=fake_pull):
+            manager._peer_pull_round_locked()
+        self.assertFalse(manager._peer_pull_lock.locked())  # released in finally
+        self.assertEqual([("peer-a", "key-old", "own-old"), ("peer-b", "key-old", "own-old")], calls)
+        # Even when the round raises, the lock is released.
+        self.assertTrue(manager._peer_pull_lock.acquire(blocking=False))
+        with mock.patch.object(manager, "_peer_pull_round", side_effect=RuntimeError("x")):
+            manager._peer_pull_round_locked()
+        self.assertFalse(manager._peer_pull_lock.locked())
+
+    def test_update_peers_add_and_remove(self) -> None:
+        base = self._setup_peer_server()
+        headers = self._login_headers()
+        status, data = self._post_json(base, "/api/update_peers",
+                                       {"action": "add", "peer": self._good_peer("peer-a")}, headers=headers)
+        self.assertEqual(200, status)
+        self.assertTrue(data["ok"])
+        self.assertEqual(["peer-a"], [p["peer_id"] for p in data["peers"]])
+        self.assertNotIn("secret_path", data["peers"][0])
+        self.assertEqual([self._good_peer("peer-a")], self._read_cfg_file()["peers"])
+        with manager.lock:
+            manager.peer_status_table["peer-a"] = self._row("peer-a", manager.time.time())
+        status, data = self._post_json(base, "/api/update_peers",
+                                       {"action": "remove", "peer_id": "peer-a"}, headers=headers)
+        self.assertEqual(200, status)
+        self.assertEqual([], data["peers"])
+        self.assertEqual([], self._read_cfg_file()["peers"])
+        with manager.lock:
+            self.assertNotIn("peer-a", manager.peer_status_table)  # old row purged from the table
+
+    def test_update_peers_validation_errors(self) -> None:
+        base = self._setup_peer_server(peers=[self._good_peer("peer-a")])
+        headers = self._login_headers()
+        post = lambda payload=None, raw=None: self._post_json(base, "/api/update_peers", payload, raw, headers)[0]
+        good = self._good_peer("peer-new")
+        self.assertEqual(400, post({"action": "add", "peer": {k: v for k, v in good.items() if k != "name"}}))
+        self.assertEqual(400, post({"action": "add", "peer": {k: v for k, v in good.items() if k != "peer_id"}}))
+        self.assertEqual(400, post({"action": "add", "peer": dict(good, port=True)}))
+        self.assertEqual(400, post({"action": "add", "peer": dict(good, host="a/b")}))
+        self.assertEqual(400, post({"action": "add"}))
+        self.assertEqual(409, post({"action": "add", "peer": self._good_peer("peer-a")}))
+        self.assertEqual(400, post({"action": "add", "peer": self._good_peer("own-id")}))  # self pull
+        self.assertEqual(404, post({"action": "remove", "peer_id": "unknown"}))
+        self.assertEqual(400, post({"action": "remove"}))
+        self.assertEqual(400, post(raw=b"{not json"))
+        self.assertEqual(400, post(raw=b"[1,2]"))
+        self.assertEqual(400, post({"action": "explode"}))
+        self.assertEqual(400, post({}))
+        # Nothing was written by the rejected calls.
+        self.assertEqual([self._good_peer("peer-a")], self._read_cfg_file()["peers"])
+
+    def test_update_peers_concurrent_add_and_remove_lose_nothing(self) -> None:
+        base = self._setup_peer_server(peers=[self._good_peer("peer-a")])
+        headers = self._login_headers()
+        for round_no in range(5):
+            barrier = threading.Barrier(2)
+            results: list = []
+            new_id = f"peer-new-{round_no}"
+
+            def add():
+                barrier.wait()
+                results.append(self._post_json(base, "/api/update_peers",
+                                               {"action": "add", "peer": self._good_peer(new_id)}, headers=headers)[0])
+
+            def remove():
+                barrier.wait()
+                victim = "peer-a" if round_no == 0 else f"peer-new-{round_no - 1}"
+                results.append(self._post_json(base, "/api/update_peers",
+                                               {"action": "remove", "peer_id": victim}, headers=headers)[0])
+
+            threads = [threading.Thread(target=add), threading.Thread(target=remove)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+            self.assertEqual([200, 200], sorted(results))
+            ids = [p["peer_id"] for p in self._read_cfg_file()["peers"]]
+            self.assertEqual([new_id], ids)
+
+    # ---- Task 6: panel UI static markers ----
+    def test_index_html_width_is_1600px(self) -> None:
+        html = manager.INDEX_HTML
+        self.assertIn("max-width: 1600px", html)
+        self.assertNotIn("1400px", html)
+
+    def test_index_html_has_peer_panel_markers(self) -> None:
+        html = manager.INDEX_HTML
+        for marker in (
+            'id="btn_peers"', 'id="peers_badge"', 'id="peers_panel"', 'id="peers_rows"',
+            'id="peers_self_id"', 'id="peers_self_name"',
+            'id="peer_add_id"', 'id="peer_add_name"', 'id="peer_add_host"',
+            'id="peer_add_port"', 'id="peer_add_secret"', 'id="btn_peers_refresh"',
+            'id="peers_hint"', "其它服务器",
+            "尚未配置对端", "尚未拉取到对端状态",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, html)
+        for header in ("服务器", "状态", "在用节点 IP", "地区", "最后更新"):
+            self.assertIn(f"<th>{header}</th>", html)
+        # Layout: button after the retained button; panel after favorites, before the node table.
+        self.assertLess(html.index('id="btn_retained"'), html.index('id="btn_peers"'))
+        self.assertLess(html.index('id="favorites_panel"'), html.index('id="peers_panel"'))
+        self.assertLess(html.index('id="peers_panel"'), html.index('<div class="table-wrapper">'))
+        # The panel starts collapsed.
+        panel_tag = html[html.index('id="peers_panel"'):].split(">", 1)[0]
+        self.assertIn("display: none", panel_tag)
+
+    def test_index_html_peer_js_wiring(self) -> None:
+        html = manager.INDEX_HTML
+        for marker in (
+            "function togglePeersView", "function maybeRefreshPeers", "function fetchPeersSnapshot",
+            "function renderPeers", "let lastPeersRefreshAt = 0", "30000",
+            './api/peers"', './api/peers/refresh"', './api/update_peers"',
+            "已连接", "未连接", "（过期）", "（离线）", "实时 ", "拉取中…", "分钟前",
+            "data.configured_peers", "data.peers.length", "data.pull_running",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, html)
+        # Cooldown is stamped BEFORE the refresh request is sent.
+        body = html[html.index("function maybeRefreshPeers"):]
+        body = body[:body.index("function fetchPeersSnapshot")] if "function fetchPeersSnapshot" in body[:3000] else body[:1500]
+        self.assertLess(body.index("lastPeersRefreshAt = Date.now()"), body.index("api/peers/refresh"))
+        # The 10s poll only fetches peers when the panel is open.
+        self.assertIn("peersPanelOpen", html)
+
+    # ---- Task 8: replay and concurrency ----
+    def test_peer_status_in_window_replay_accepted_then_rejected_after_window(self) -> None:
+        base = self._setup_peer_server()
+        t0 = 1_700_000_000
+        seed = self._row("peer-a", float(t0))
+        with manager.lock:
+            manager.peer_status_table["peer-a"] = dict(seed)
+        headers = {"X-Peer-Timestamp": str(t0), "X-Peer-Signature": self._sign_req(self.PEER_KEY, t0)}
+
+        def replay(server_now: float) -> tuple[int, dict, bytes]:
+            with mock.patch.object(manager.time, "time", return_value=server_now):
+                return self._http(base + "/api/peer_status", headers)
+
+        first = replay(float(t0))
+        second = replay(float(t0))  # same request sent again
+        self.assertEqual((200, 200), (first[0], second[0]))
+        self.assertEqual(first[2], second[2])
+        self.assertEqual(first[1]["X-Peer-Response-Signature"], second[1]["X-Peer-Response-Signature"])
+        late = replay(float(t0 + 250))  # still inside +/-300
+        self.assertEqual(200, late[0])
+        self.assertEqual(str(t0), late[1]["X-Peer-Timestamp"])  # the echoed ts is the request's ts
+        self.assertEqual(200, replay(float(t0 + 300))[0])
+        self.assertEqual(401, replay(float(t0 + 301))[0])      # outside the window
+        self.assertEqual(401, replay(float(t0 + 5000))[0])
+        with manager.lock:  # a replay never changes table contents
+            self.assertEqual({"peer-a": seed}, manager.peer_status_table)
+
+    def test_pull_one_peer_replayed_response_only_accepted_for_same_ts(self) -> None:
+        captured = {}
+
+        def respond(request):
+            resp = self._responder()(request)
+            captured["body"] = resp._body
+            captured["headers"] = {k: v for k, v in resp.headers.items()}
+            return resp
+
+        self.assertTrue(self._pull(respond, now=1_700_000_100.0)[0])
+        replayed = lambda request: self._FakePeerResponse(captured["body"], captured["headers"])
+        # Same whole second -> same request ts -> the recorded reply still verifies.
+        self.assertTrue(self._pull(replayed, now=1_700_000_100.9)[0])
+        # A later request has a different ts -> the old reply is rejected, old row kept.
+        with manager.lock:
+            before = dict(manager.peer_status_table["peer-a"])
+        self.assertFalse(self._pull(replayed, now=1_700_000_400.0)[0])
+        with manager.lock:
+            self.assertEqual(before, manager.peer_status_table["peer-a"])
+
+    def test_concurrent_pull_and_prune_keep_table_consistent(self) -> None:
+        peer = self._good_peer("peer-new")
+        ids = {"peer-new", "peer-old"}
+        for round_no in range(20):
+            with manager.lock:
+                manager.peer_status_table.clear()
+            barrier = threading.Barrier(2)
+            errors: list = []
+            opener = self._FakePeerOpener(self._responder(payload=self._peer_payload("peer-new")))
+
+            def puller():
+                try:
+                    barrier.wait(5)
+                    with mock.patch.object(manager, "_peer_build_opener", return_value=opener):
+                        manager.pull_one_peer(peer, self.PEER_KEY, "own-id")
+                except Exception as exc:  # pragma: no cover - reported via assertion below
+                    errors.append(exc)
+
+            def cleaner():
+                try:
+                    barrier.wait(5)
+                    now = manager.time.time()
+                    with manager.lock:
+                        manager.peer_status_table["peer-old"] = self._row("peer-old", now - 90000)
+                        manager.prune_peer_table(now, ids)
+                except Exception as exc:  # pragma: no cover
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=puller), threading.Thread(target=cleaner)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+            self.assertEqual([], errors, round_no)
+            with manager.lock:
+                self.assertNotIn("peer-old", manager.peer_status_table, round_no)  # stale row deleted
+                self.assertIn("peer-new", manager.peer_status_table, round_no)     # new row survived
+                self.assertLessEqual(len(manager.peer_status_table), 50)
+                self.assertEqual(len(manager.peer_status_table), len(set(manager.peer_status_table)))
