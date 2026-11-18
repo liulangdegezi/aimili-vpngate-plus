@@ -213,7 +213,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.3.0"
+DEFAULT_APP_VERSION = "1.3.1"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -8099,12 +8099,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.3.0 正式版</span>
+        <span id="github_version_label">V1.3.1 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.3.0 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.3.1 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <div class="update-action-row">
@@ -8273,15 +8273,21 @@ INDEX_HTML = r"""<!doctype html>
       <div id="peers_hint" style="font-size: 13px; color: var(--text-secondary);"></div>
       <div style="border-top: 1px solid var(--border-color); padding-top: 14px; display: flex; flex-direction: column; gap: 12px;">
         <div style="font-size: 13px; color: var(--text-secondary);">
-          本机 peer_id（复制到对端的添加表单里填写）：<code id="peers_self_id" style="user-select: all; color: var(--text-primary);"></code>
+          本机编号（复制到对端的添加表单里填写）：<code id="peers_self_id" style="user-select: all; color: var(--text-primary);"></code>
           　本机名称：<span id="peers_self_name" style="color: var(--text-primary);"></span>
         </div>
         <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
-          <input id="peer_add_id" type="text" class="input-field" placeholder="对端 peer_id" style="flex: 2 1 220px;">
+          <input id="peer_key_input" type="password" class="input-field" autocomplete="off" placeholder="共享密钥（各服务器填同一个）" style="flex: 1 1 260px;">
+          <button id="btn_peer_key_save" type="button" class="toolbar-btn" style="height: 36px; padding: 0 14px; font-size: 13px; border-radius: 6px;" onclick="savePeerKey()">保存密钥</button>
+          <span id="peer_key_status" style="font-size: 13px; color: var(--text-secondary);"></span>
+          <span id="peer_key_msg" role="status" style="font-size: 13px; color: var(--text-secondary);"></span>
+        </div>
+        <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+          <input id="peer_add_id" type="text" class="input-field" placeholder="对端编号" style="flex: 2 1 220px;">
           <input id="peer_add_name" type="text" class="input-field" placeholder="名称" style="flex: 1 1 120px;">
           <input id="peer_add_host" type="text" class="input-field" placeholder="主机（IP 或域名）" style="flex: 1 1 160px;">
           <input id="peer_add_port" type="number" class="input-field" placeholder="端口" min="1" max="65535" style="flex: 0 1 100px;">
-          <input id="peer_add_secret" type="text" class="input-field" placeholder="secret_path" style="flex: 1 1 140px;">
+          <input id="peer_add_secret" type="text" class="input-field" placeholder="对端登录安全后缀" style="flex: 1 1 140px;">
           <button type="button" class="toolbar-btn" style="height: 36px; padding: 0 14px; font-size: 13px; border-radius: 6px;" onclick="addPeer()">添加对端</button>
         </div>
         <div id="peers_form_msg" role="status" style="font-size: 13px; color: var(--text-secondary);"></div>
@@ -9008,7 +9014,7 @@ function stableSortNodes() {
 function render(){
   updateRetainedPoolVisibilityUI();
   updateRetainedPoolEnabledUI();
-  const versionLabel = state.app_version_label || "V1.3.0 正式版";
+  const versionLabel = state.app_version_label || "V1.3.1 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -10081,6 +10087,9 @@ function renderPeers(data) {
   }
   const manageEl = $("peers_manage_rows");
   if (manageEl) manageEl.innerHTML = manage;
+  // 密钥只显示“已设置 / 未设置”，永不显示密钥值
+  const keyStatus = $("peer_key_status");
+  if (keyStatus) keyStatus.textContent = data.key_set ? "已设置" : "未设置";
   // 手动刷新按钮：以最近一次成功快照的 pull_running 为准；快照失败时不进入本函数，状态保持
   const refreshBtn = $("btn_peers_refresh");
   if (refreshBtn) {
@@ -10155,6 +10164,27 @@ async function addPeer() {
     await fetchPeersSnapshot();
   } catch (e) {
     msg.textContent = "添加失败：请求出错";
+  }
+}
+
+async function savePeerKey() {
+  const msg = $("peer_key_msg");
+  try {
+    const response = await fetchWithTimeout("./api/update_peer_key", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({peer_shared_key: $("peer_key_input").value}),
+    }, 10000);
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.ok) {
+      msg.textContent = "保存失败：" + (result.error || ("HTTP " + response.status));
+      return;
+    }
+    $("peer_key_input").value = "";
+    msg.textContent = "密钥已保存。";
+    await fetchPeersSnapshot();
+  } catch (e) {
+    msg.textContent = "保存失败：请求出错";
   }
 }
 
@@ -11435,6 +11465,7 @@ class Handler(BaseHTTPRequestHandler):
                 # OUTSIDE the global lock; prune + response construction INSIDE
                 # it; the pull_running probe and the send happen AFTER release.
                 ui_cfg = load_ui_config()
+                key_set = bool(ui_cfg.get("peer_shared_key"))
                 raw_peers = ui_cfg.get("peers")
                 cfg_peers = [p for p in raw_peers if isinstance(p, dict)] if isinstance(raw_peers, list) else []
                 peer_ids = {str(p.get("peer_id")) for p in cfg_peers}
@@ -11466,6 +11497,7 @@ class Handler(BaseHTTPRequestHandler):
                     "peers": rows,
                     "configured_peers": configured_peers,
                     "pull_running": pull_running,
+                    "key_set": key_set,
                 })
             except Exception as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -11730,7 +11762,7 @@ class Handler(BaseHTTPRequestHandler):
                             self.send_json({"ok": False, "error": "不能添加本机自己"}, HTTPStatus.BAD_REQUEST)
                             return
                         if any(p.get("peer_id") == entry["peer_id"] for p in peers):
-                            self.send_json({"ok": False, "error": "peer_id 已存在"}, HTTPStatus.CONFLICT)
+                            self.send_json({"ok": False, "error": "该编号已存在"}, HTTPStatus.CONFLICT)
                             return
                         peers.append(entry)
                     else:
@@ -11757,6 +11789,33 @@ class Handler(BaseHTTPRequestHandler):
                         for p in peers
                     ],
                 })
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/update_peer_key":
+            # Save peer_shared_key from the panel. Auth is the shared
+            # do_POST session check above. The key is saved stripped, with no
+            # charset or length rule, and is NEVER echoed in the response or a
+            # log. Saving does not restart, clear sessions or start a pull.
+            try:
+                payload = self.read_json_body()
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc) or "请求体解析失败"}, HTTPStatus.BAD_REQUEST)
+                return
+            raw_key = payload.get("peer_shared_key")
+            if not isinstance(raw_key, str) or not raw_key.strip():
+                self.send_json({"ok": False, "error": "共享密钥不能为空"}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                # Whole read-modify-write under _peer_config_lock (outer lock).
+                with _peer_config_lock:
+                    ui_cfg = load_ui_config()
+                    ui_cfg["peer_shared_key"] = raw_key.strip()
+                    with lock:
+                        DATA_DIR.mkdir(exist_ok=True, parents=True)
+                        write_json(DATA_DIR / "ui_auth.json", ui_cfg)
+                self.send_json({"ok": True})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
