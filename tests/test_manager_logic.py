@@ -884,8 +884,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.3.0", manager.APP_VERSION)
-        self.assertEqual("V1.3.0 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.3.1", manager.APP_VERSION)
+        self.assertEqual("V1.3.1 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -969,7 +969,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.3.0 正式版", result["current_version_label"])
+        self.assertEqual("V1.3.1 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -988,7 +988,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.3.0", result["current_version"])
+        self.assertEqual("1.3.1", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1533,19 +1533,20 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_3_0(self) -> None:
-        self.assertEqual("1.3.0", manager.APP_VERSION)
-        self.assertEqual("V1.3.0 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.3.0 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_3_1(self) -> None:
+        self.assertEqual("1.3.1", manager.APP_VERSION)
+        self.assertEqual("V1.3.1 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.3.1 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.3.0"', install_text)
+        self.assertIn('"1.3.1"', install_text)
         self.assertNotIn('"1.2.2"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.3.0", compose_text)
+        self.assertIn(":1.3.1", compose_text)
         self.assertNotIn("1.2.2", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.3.0", version_text)
+        self.assertEqual("1.3.1", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## V1.3.1（2026-11-18，已发布正式版 v1.3.1）", changelog)
         self.assertIn("## V1.3.0（2026-11-17，已发布正式版 v1.3.0）", changelog)
         self.assertIn("## V1.2.9（2026-11-16，已发布正式版 v1.2.9）", changelog)
         self.assertIn("## V1.2.8（2026-11-06，已发布正式版 v1.2.8）", changelog)
@@ -7357,7 +7358,7 @@ class Plus130PeerHubTests(unittest.TestCase):
         with mock.patch.object(manager, "active_openvpn_node_id", ""):
             status, data = self._get_json(base, "/api/peers", headers)
         self.assertEqual(200, status)
-        self.assertEqual({"self", "peers", "configured_peers", "pull_running"}, set(data))
+        self.assertEqual({"self", "peers", "configured_peers", "pull_running", "key_set"}, set(data))
         self.assertFalse(data["pull_running"])
         rows = {r["peer_id"]: r for r in data["peers"]}
         self.assertEqual({"peer-fresh", "peer-stale", "peer-off"}, set(rows))  # never/old/ghost have no row
@@ -7705,3 +7706,434 @@ class Plus130PeerHubTests(unittest.TestCase):
                 self.assertIn("peer-new", manager.peer_status_table, round_no)     # new row survived
                 self.assertLessEqual(len(manager.peer_status_table), 50)
                 self.assertEqual(len(manager.peer_status_table), len(set(manager.peer_status_table)))
+
+
+class Plus131PeerKeyTests(unittest.TestCase):
+    """Panel input for peer_shared_key + peer-form placeholder text."""
+
+    PEER_SECRET = "testsecret"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # The real os._exit must never run in this class: a wrong
+        # implementation that schedules a restart would kill the whole test
+        # process (exit code 0, no red signal). One recording mock covers the
+        # whole class without gaps between tests; the verdict is "mock not
+        # called", not "process still alive".
+        exit_patcher = mock.patch.object(manager.os, "_exit")
+        cls._exit_mock = exit_patcher.start()
+        cls.addClassCleanup(exit_patcher.stop)
+
+    def setUp(self) -> None:
+        self._exit_mock.reset_mock()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        patcher = mock.patch.object(manager, "DATA_DIR", self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with manager.lock:
+            manager.peer_status_table.clear()
+        self.addCleanup(self._clear_peer_table)
+
+    @staticmethod
+    def _clear_peer_table() -> None:
+        with manager.lock:
+            manager.peer_status_table.clear()
+
+    # ---- helpers (same shape as the Plus130PeerHubTests helpers) ----
+    def _write_cfg(self, **extra) -> None:
+        cfg = {"username": "peer-user", "password": "peer-pass"}
+        cfg.update(extra)
+        (self.root / "ui_auth.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    def _read_cfg_file(self) -> dict:
+        return json.loads((self.root / "ui_auth.json").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _good_peer(peer_id: str = "peer-a", **over) -> dict:
+        peer = {
+            "peer_id": peer_id,
+            "name": f"name-{peer_id}",
+            "host": "192.0.2.1",
+            "port": 8787,
+            "secret_path": "secretpath",
+        }
+        peer.update(over)
+        return peer
+
+    def _start_server(self) -> str:
+        server = manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop() -> None:
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def _setup_server(self, **cfg_extra) -> str:
+        self._write_cfg(secret_path=self.PEER_SECRET, peer_id="own-id",
+                        peer_name="own-name", **cfg_extra)
+        return f"{self._start_server()}/{self.PEER_SECRET}"
+
+    def _login_headers(self) -> dict:
+        token = f"key-panel-token-{id(self)}"
+        manager.active_sessions[token] = manager.time.time() + 600
+        self.addCleanup(manager.active_sessions.pop, token, None)
+        return {"Cookie": f"session={token}"}
+
+    @staticmethod
+    def _http(url: str, headers: dict | None = None, data: bytes | None = None,
+              method: str | None = None) -> tuple[int, dict, bytes]:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(url, headers=headers or {}, data=data, method=method)
+        try:
+            with opener.open(req, timeout=5) as response:
+                return response.status, dict(response.headers), response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, dict(exc.headers), exc.read()
+
+    def _post_raw(self, base: str, path: str, payload=None, raw: bytes | None = None,
+                  headers: dict | None = None) -> tuple[int, bytes]:
+        hdrs = {"Content-Type": "application/json"}
+        hdrs.update(headers or {})
+        body = raw if raw is not None else json.dumps(payload).encode("utf-8")
+        status, _, data = self._http(base + path, hdrs, data=body, method="POST")
+        return status, data
+
+    def _post_json(self, base: str, path: str, payload=None, raw: bytes | None = None,
+                   headers: dict | None = None) -> tuple[int, dict]:
+        status, data = self._post_raw(base, path, payload, raw, headers)
+        try:
+            return status, json.loads(data.decode("utf-8"))
+        except ValueError:
+            return status, {}
+
+    def _get_json(self, base: str, path: str, headers: dict | None = None) -> tuple[int, dict]:
+        status, _, data = self._http(base + path, headers or {})
+        return status, json.loads(data.decode("utf-8"))
+
+    def _save_key(self, base: str, headers: dict, key) -> tuple[int, dict]:
+        return self._post_json(base, "/api/update_peer_key", {"peer_shared_key": key}, headers=headers)
+
+    # ---- Task 1: POST /api/update_peer_key ----
+    def test_update_peer_key_requires_session(self) -> None:
+        base = self._setup_server()
+        status, _ = self._post_json(base, "/api/update_peer_key", {"peer_shared_key": "key-abc-123"})
+        self.assertEqual(401, status)
+        self.assertEqual("", manager.load_ui_config()["peer_shared_key"])
+
+    def test_update_peer_key_rejects_empty(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        for bad in ("", "   "):
+            with self.subTest(bad=bad):
+                status, data = self._save_key(base, headers, bad)
+                self.assertEqual(400, status)
+                self.assertIn("共享密钥不能为空", data.get("error", ""))
+        self.assertEqual("", self._read_cfg_file()["peer_shared_key"])
+
+    def test_update_peer_key_rejects_non_string(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        for label, payload in (("int", {"peer_shared_key": 123}),
+                               ("null", {"peer_shared_key": None}),
+                               ("missing", {})):
+            with self.subTest(case=label):
+                status, _ = self._post_json(base, "/api/update_peer_key", payload, headers=headers)
+                self.assertEqual(400, status)
+        self.assertEqual("", self._read_cfg_file()["peer_shared_key"])
+
+    def test_update_peer_key_saves_and_reports_key_set(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        status, data = self._save_key(base, headers, "key-abc-123")
+        self.assertEqual(200, status)
+        self.assertTrue(data["ok"])
+        self.assertEqual("key-abc-123", self._read_cfg_file()["peer_shared_key"])
+        status, snap = self._get_json(base, "/api/peers", headers)
+        self.assertEqual(200, status)
+        self.assertIs(True, snap["key_set"])
+
+    def test_update_peer_key_never_returns_key(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        key = "never-echo-key-7f3a"
+        status, body = self._post_raw(base, "/api/update_peer_key", {"peer_shared_key": key}, headers=headers)
+        self.assertEqual(200, status)  # a failed save would also lack the key; prove it saved
+        self.assertEqual(key, self._read_cfg_file()["peer_shared_key"])
+        self.assertNotIn(b"peer_shared_key", body)
+        self.assertNotIn(key.encode(), body)
+        status, _, snap_body = self._http(base + "/api/peers", headers)
+        self.assertEqual(200, status)
+        self.assertNotIn(b"peer_shared_key", snap_body)
+        self.assertNotIn(key.encode(), snap_body)
+
+    def test_update_peer_key_keeps_sessions(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        token = headers["Cookie"].split("=", 1)[1]
+        status, _ = self._save_key(base, headers, "key-abc-123")
+        self.assertEqual(200, status)
+        self.assertEqual(200, self._http(base + "/api/peers", headers)[0])
+        self.assertIn(token, manager.active_sessions)
+
+    def test_update_peer_key_takes_effect_without_restart(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        # os._exit is the class-wide recording mock from setUpClass (the real
+        # one must never run here); the verdict is "mock not called".
+        status, _ = self._save_key(base, headers, "fresh-key-1")
+        self.assertEqual(200, status)
+        # Re-read in the same process (no restart) is the new value.
+        self.assertEqual("fresh-key-1", manager.load_ui_config()["peer_shared_key"])
+        # Both existing restart paths sleep 2s before os._exit; watch 3s.
+        for _ in range(6):
+            manager.time.sleep(0.5)
+            self.assertEqual(200, self._http(base + "/api/peers", headers)[0])
+        self._exit_mock.assert_not_called()
+
+    def test_update_peer_key_save_does_not_start_pull_round(self) -> None:
+        base = self._setup_server(peers=[self._good_peer("peer-a")])
+        headers = self._login_headers()
+        starter = mock.Mock(wraps=manager._run_peer_pull_round_async)
+        with mock.patch.object(manager, "_run_peer_pull_round_async", starter), \
+                mock.patch.object(manager, "pull_one_peer") as pull_mock:
+            status, _ = self._save_key(base, headers, "key-abc-123")
+            self.assertEqual(200, status)
+            starter.assert_not_called()  # synchronous entry point
+            deadline = manager.time.monotonic() + 1.0
+            while manager.time.monotonic() < deadline:  # background-thread form
+                self.assertEqual(0, pull_mock.call_count)
+                manager.time.sleep(0.1)
+            pull_mock.assert_not_called()
+
+    def test_update_peer_key_accepts_non_ascii_and_long_keys(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        for label, key in (("non-ascii", "密钥-abc-123"), ("long", "k" * 4096)):
+            with self.subTest(case=label):
+                status, _ = self._save_key(base, headers, key)
+                self.assertEqual(200, status)
+                self.assertEqual(key, self._read_cfg_file()["peer_shared_key"])
+                self.assertIs(True, self._get_json(base, "/api/peers", headers)[1]["key_set"])
+                # Self-sign / self-verify through the real receiver, which
+                # reads the key fresh from ui_auth.json on every request.
+                ts = int(manager.time.time())
+                sig = manager.peer_request_signature(key, str(ts))
+                status, _, _ = self._http(base + "/api/peer_status",
+                                          {"X-Peer-Timestamp": str(ts), "X-Peer-Signature": sig})
+                self.assertEqual(200, status)
+
+    def test_update_peer_key_preserves_inner_spaces(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        status, _ = self._save_key(base, headers, "a b c")
+        self.assertEqual(200, status)
+        self.assertEqual("a b c", self._read_cfg_file()["peer_shared_key"])
+
+    def test_update_peer_key_strips_surrounding_whitespace(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        status, _ = self._save_key(base, headers, "  a b c  ")
+        self.assertEqual(200, status)
+        self.assertEqual("a b c", self._read_cfg_file()["peer_shared_key"])
+        self.assertIs(True, self._get_json(base, "/api/peers", headers)[1]["key_set"])
+
+    def test_update_peer_key_and_peer_add_do_not_lose_updates(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        # A lost update is a race, so make interleaving likely: many rounds
+        # and a tiny thread switch interval (no sleeps involved).
+        import sys
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        self.addCleanup(sys.setswitchinterval, old_interval)
+        added: list[str] = []
+        for round_no in range(40):
+            barrier = threading.Barrier(2)
+            results: list = []
+            key = f"race-key-{round_no}"
+            new_id = f"peer-race-{round_no}"
+
+            def save_key(key=key):
+                barrier.wait(5)
+                results.append(self._save_key(base, headers, key)[0])
+
+            def add_peer(new_id=new_id):
+                barrier.wait(5)
+                results.append(self._post_json(
+                    base, "/api/update_peers",
+                    {"action": "add", "peer": self._good_peer(new_id)}, headers=headers)[0])
+
+            threads = [threading.Thread(target=save_key), threading.Thread(target=add_peer)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+            added.append(new_id)
+            self.assertEqual([200, 200], sorted(results), round_no)
+            # Lost updates only show on disk: re-read the file, not the responses.
+            on_disk = self._read_cfg_file()
+            self.assertEqual(key, on_disk["peer_shared_key"], round_no)
+            self.assertEqual(added, [p["peer_id"] for p in on_disk["peers"]], round_no)
+
+    def test_update_peer_key_read_modify_write_holds_config_lock(self) -> None:
+        # Deterministic companion to the race test above (which is
+        # probabilistic by nature): the endpoint's own load_ui_config() and
+        # its write of ui_auth.json must both happen while _peer_config_lock
+        # is held, or a concurrent peer add could be overwritten.
+        base = self._setup_server()
+        headers = self._login_headers()
+        manager.load_ui_config()  # complete defaults first: no normalising writes later
+        events: list[tuple[str, bool]] = []
+        real_load, real_write = manager.load_ui_config, manager.write_json
+
+        def spy_load(*args, **kwargs):
+            events.append(("load", manager._peer_config_lock.locked()))
+            return real_load(*args, **kwargs)
+
+        def spy_write(path, data, *args, **kwargs):
+            if Path(path).name == "ui_auth.json":
+                events.append(("write", manager._peer_config_lock.locked()))
+            return real_write(path, data, *args, **kwargs)
+
+        with mock.patch.object(manager, "load_ui_config", spy_load), \
+                mock.patch.object(manager, "write_json", spy_write):
+            status, _ = self._save_key(base, headers, "key-abc-123")
+        self.assertEqual(200, status)
+        # Earlier loads are the session check / path lookup (no lock);
+        # the last load before the write is the endpoint's own.
+        self.assertEqual([("load", True), ("write", True)], events[-2:])
+        self.assertEqual("key-abc-123", self._read_cfg_file()["peer_shared_key"])
+
+    # ---- Task 2: GET /api/peers key_set ----
+    def test_get_peers_reports_key_set_false_by_default(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        status, snap = self._get_json(base, "/api/peers", headers)
+        self.assertEqual(200, status)
+        self.assertIn("key_set", snap)
+        self.assertIs(False, snap["key_set"])
+
+    def test_get_peers_reports_key_set_true_after_save(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        status, _ = self._save_key(base, headers, "key-abc-123")
+        self.assertEqual(200, status)
+        status, snap = self._get_json(base, "/api/peers", headers)
+        self.assertEqual(200, status)
+        self.assertIn("key_set", snap)
+        self.assertIsInstance(snap["key_set"], bool)  # boolean only, never the key value
+        self.assertIs(True, snap["key_set"])
+
+    # ---- Task 3: panel key row (static markers; rendering is browser-verified) ----
+    @staticmethod
+    def _js_function_body(html: str, name: str) -> str:
+        """Source of ``[async ]function name(...) {...}`` via brace matching."""
+        start = html.index(f"function {name}(")
+        open_at = html.index("{", html.index(")", start))
+        depth = 0
+        for pos in range(open_at, len(html)):
+            if html[pos] == "{":
+                depth += 1
+            elif html[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    return html[start:pos + 1]
+        raise AssertionError(f"unbalanced braces in function {name}")
+
+    def test_peers_panel_has_key_row(self) -> None:
+        html = manager.INDEX_HTML
+        for marker in ('id="peer_key_input"', 'id="btn_peer_key_save"',
+                       'id="peer_key_status"', 'id="peer_key_msg"'):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, html)
+        input_tag = re.search(r'<input[^>]*id="peer_key_input"[^>]*>', html)
+        self.assertIsNotNone(input_tag)
+        self.assertIn('type="password"', input_tag.group(0))
+        self.assertIn('autocomplete="off"', input_tag.group(0))
+        self.assertIn('placeholder="共享密钥（各服务器填同一个）"', input_tag.group(0))
+        button_tag = re.search(r'<button[^>]*id="btn_peer_key_save"[^>]*>[^<]*</button>', html)
+        self.assertIsNotNone(button_tag)
+        self.assertIn('onclick="savePeerKey()"', button_tag.group(0))
+        self.assertIn("保存密钥", button_tag.group(0))
+        # The key row sits in the manage area, before the add-peer form row.
+        self.assertLess(html.index('id="peer_key_input"'), html.index('id="peer_add_id"'))
+        self.assertGreater(html.index('id="peer_key_input"'), html.index('id="peers_panel"'))
+        # savePeerKey exists and POSTs to the new endpoint.
+        body = self._js_function_body(html, "savePeerKey")
+        self.assertIn('"./api/update_peer_key"', body)
+        self.assertIn('method: "POST"', body)
+
+    def test_save_peer_key_js_contract(self) -> None:
+        html = manager.INDEX_HTML
+        body = self._js_function_body(html, "savePeerKey")
+        # Request body carries the key under peer_shared_key.
+        self.assertRegex(body, r"JSON\.stringify\(\{\s*peer_shared_key\s*:")
+        # Success branch: clear the input, refresh the snapshot once.
+        self.assertRegex(body, r'\$\("peer_key_input"\)\.value\s*=\s*""')
+        self.assertIn("await fetchPeersSnapshot()", body)
+        # Saving must NOT trigger a pull (no cooldown-refresh helper, no refresh endpoint).
+        self.assertNotIn("maybeRefreshPeers", body)
+        self.assertNotIn("api/peers/refresh", body)
+        # Messages go to #peer_key_msg, never to #peers_form_msg.
+        self.assertIn('$("peer_key_msg")', body)
+        self.assertNotIn("peers_form_msg", body)
+        self.assertIn("密钥已保存。", body)
+        self.assertIn("保存失败：", body)
+        # The key value is never written into the page.
+        self.assertNotRegex(body, r"textContent\s*=[^;]*peer_shared_key")
+        # renderPeers drives #peer_key_status from data.key_set.
+        render = self._js_function_body(html, "renderPeers")
+        self.assertIn("data.key_set", render)
+        self.assertIn("peer_key_status", render)
+        self.assertIn("已设置", render)
+        self.assertIn("未设置", render)
+
+    # ---- Task 4: secret_path display text ----
+    def test_peer_add_placeholder_is_chinese(self) -> None:
+        html = manager.INDEX_HTML
+        self.assertIn('placeholder="对端登录安全后缀"', html)
+        self.assertNotIn('placeholder="secret_path"', html)
+
+    def test_secret_path_identity_unchanged(self) -> None:
+        # Behaviour lock: only display text changed; key name, path and API stay.
+        base = self._setup_server(port=8787)
+        headers = self._login_headers()
+        self.assertEqual(self.PEER_SECRET, self._read_cfg_file()["secret_path"])
+        self.assertEqual(self.PEER_SECRET, manager.Handler.get_secret_path(object.__new__(manager.Handler)))
+        self.assertIn("登录安全后缀 (仅字母和数字)", manager.INDEX_HTML)
+        # Same values as the current config -> no restart is scheduled.
+        status, data = self._post_json(
+            base, "/api/update_credentials",
+            {"username": "peer-user", "password": "peer-pass", "port": 8787,
+             "secret_path": self.PEER_SECRET}, headers=headers)
+        self.assertEqual(200, status)
+        self.assertIs(True, data["ok"])
+        self.assertIs(False, data["restart_needed"])
+        self.assertEqual(self.PEER_SECRET, self._read_cfg_file()["secret_path"])
+
+    # ---- Task 6: peer_id display text ----
+    def test_peer_id_labels_are_chinese(self) -> None:
+        html = manager.INDEX_HTML
+        self.assertIn("本机编号", html)
+        self.assertIn('placeholder="对端编号"', html)
+        self.assertNotIn("本机 peer_id", html)
+        self.assertNotIn('placeholder="对端 peer_id"', html)
+
+    def test_duplicate_peer_error_is_chinese(self) -> None:
+        base = self._setup_server()
+        headers = self._login_headers()
+        status, _ = self._post_json(
+            base, "/api/update_peers",
+            {"action": "add", "peer": self._good_peer("peer-a")}, headers=headers)
+        self.assertEqual(200, status)
+        status, data = self._post_json(
+            base, "/api/update_peers",
+            {"action": "add", "peer": self._good_peer("peer-a")}, headers=headers)
+        self.assertEqual(409, status)
+        self.assertEqual("该编号已存在", data.get("error"))
