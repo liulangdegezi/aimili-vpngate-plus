@@ -884,8 +884,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("1.3.1", manager.APP_VERSION)
-        self.assertEqual("V1.3.1 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("1.3.2", manager.APP_VERSION)
+        self.assertEqual("V1.3.2 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -969,7 +969,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V1.3.1 正式版", result["current_version_label"])
+        self.assertEqual("V1.3.2 正式版", result["current_version_label"])
 
     def test_latest_release_check_no_release_returns_current_without_error(self) -> None:
         import io
@@ -988,7 +988,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["no_release"])
         self.assertFalse(result["update_available"])
-        self.assertEqual("1.3.1", result["current_version"])
+        self.assertEqual("1.3.2", result["current_version"])
 
     def test_full_sweep_order_fixed_ip_first(self) -> None:
         nodes = [
@@ -1533,19 +1533,20 @@ class CodeUpdateTests(unittest.TestCase):
             _, kwargs = popen_mock.call_args
             self.assertTrue(kwargs.get("start_new_session"))
 
-    def test_version_sync_1_3_1(self) -> None:
-        self.assertEqual("1.3.1", manager.APP_VERSION)
-        self.assertEqual("V1.3.1 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("V1.3.1 正式版", manager.INDEX_HTML)
+    def test_version_sync_1_3_2(self) -> None:
+        self.assertEqual("1.3.2", manager.APP_VERSION)
+        self.assertEqual("V1.3.2 正式版", manager.APP_VERSION_LABEL)
+        self.assertIn("V1.3.2 正式版", manager.INDEX_HTML)
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('"1.3.1"', install_text)
+        self.assertIn('"1.3.2"', install_text)
         self.assertNotIn('"1.2.2"', install_text)
         compose_text = (manager.ROOT_DIR / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn(":1.3.1", compose_text)
+        self.assertIn(":1.3.2", compose_text)
         self.assertNotIn("1.2.2", compose_text)
         version_text = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual("1.3.1", version_text)
+        self.assertEqual("1.3.2", version_text)
         changelog = (manager.ROOT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## V1.3.2（2026-11-19，已发布正式版 v1.3.2）", changelog)
         self.assertIn("## V1.3.1（2026-11-18，已发布正式版 v1.3.1）", changelog)
         self.assertIn("## V1.3.0（2026-11-17，已发布正式版 v1.3.0）", changelog)
         self.assertIn("## V1.2.9（2026-11-16，已发布正式版 v1.2.9）", changelog)
@@ -7592,8 +7593,12 @@ class Plus130PeerHubTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, html)
-        for header in ("服务器", "状态", "在用节点 IP", "地区", "最后更新"):
-            self.assertIn(f"<th>{header}</th>", html)
+        headers = ("服务器", "自定义名称", "状态", "在用节点 IP", "服务器IP", "地区", "最后更新")
+        tbody_at = html.index('<tbody id="peers_rows">')
+        header_row = html[html.rfind("<thead", 0, tbody_at):tbody_at]
+        positions = [header_row.index(f"<th>{header}</th>") for header in headers]
+        self.assertEqual(sorted(positions), positions)
+        self.assertEqual(7, len(positions))
         # Layout: button after the retained button; panel after favorites, before the node table.
         self.assertLess(html.index('id="btn_retained"'), html.index('id="btn_peers"'))
         self.assertLess(html.index('id="favorites_panel"'), html.index('id="peers_panel"'))
@@ -7601,6 +7606,23 @@ class Plus130PeerHubTests(unittest.TestCase):
         # The panel starts collapsed.
         panel_tag = html[html.index('id="peers_panel"'):].split(">", 1)[0]
         self.assertIn("display: none", panel_tag)
+
+    def test_peer_panel_new_columns_and_status_colors(self) -> None:
+        html = manager.INDEX_HTML
+        status_body = Plus131PeerKeyTests._js_function_body(html, "peersStatusHtml")
+        for marker in ("#34d399", "var(--text-secondary)"):
+            self.assertIn(marker, status_body)
+        for marker in ("#f59e0b", "var(--danger)"):
+            self.assertNotIn(marker, status_body)
+
+        render_body = Plus131PeerKeyTests._js_function_body(html, "renderPeers")
+        self.assertIn("configuredByPeerId.get(row.peer_id)", render_body)
+        self.assertIn("configuredByPeerId.set(peerId, peer)", render_body)
+        self.assertIn("peerConfig && peerConfig.name", render_body)
+        self.assertIn("peerConfig && peerConfig.host", render_body)
+        self.assertEqual(2, render_body.count('+ "<td>—</td>"'))
+        for marker in ("已连接", "未连接", "（过期）", "（离线）"):
+            self.assertIn(marker, status_body)
 
     def test_index_html_peer_js_wiring(self) -> None:
         html = manager.INDEX_HTML
