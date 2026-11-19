@@ -213,7 +213,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "1.3.1"
+DEFAULT_APP_VERSION = "1.3.2"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -8099,12 +8099,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V1.3.1 正式版</span>
+        <span id="github_version_label">V1.3.2 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V1.3.1 正式版</div>
+          <div id="current_version_label" class="version-current-label">V1.3.2 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <div class="update-action-row">
@@ -8261,8 +8261,10 @@ INDEX_HTML = r"""<!doctype html>
           <thead>
             <tr>
               <th>服务器</th>
+              <th>自定义名称</th>
               <th>状态</th>
               <th>在用节点 IP</th>
+              <th>服务器IP</th>
               <th>地区</th>
               <th>最后更新</th>
             </tr>
@@ -9014,7 +9016,7 @@ function stableSortNodes() {
 function render(){
   updateRetainedPoolVisibilityUI();
   updateRetainedPoolEnabledUI();
-  const versionLabel = state.app_version_label || "V1.3.1 正式版";
+  const versionLabel = state.app_version_label || "V1.3.2 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -10019,13 +10021,20 @@ function peersRelative(seconds) {
 }
 
 function peersStatusHtml(row) {
-  let html = row.status === "connected" ? "已连接" : "未连接";
+  const connected = row.status === "connected";
+  let text = connected ? "已连接" : "未连接";
   if (row.display === "stale") {
-    html += ' <span style="color: #f59e0b;">（过期）</span>';
+    text += " （过期）";
   } else if (row.display === "offline") {
-    html += ' <span style="color: var(--danger);">（离线）</span>';
+    text += " （离线）";
   }
-  return html;
+  if (row.display === "offline") {
+    return '<span style="color: var(--text-secondary);">' + text + "</span>";
+  }
+  if (connected) {
+    return '<span style="color: #34d399;">' + text + "</span>";
+  }
+  return text;
 }
 
 function updatePeersPanelUI() {
@@ -10042,6 +10051,11 @@ function renderPeers(data) {
   if (!data) return;
   const peers = Array.isArray(data.peers) ? data.peers : [];
   const configured = Array.isArray(data.configured_peers) ? data.configured_peers : [];
+  const configuredByPeerId = new Map();
+  for (const peer of configured) {
+    const peerId = peer && peer.peer_id;
+    if (peerId && !configuredByPeerId.has(peerId)) configuredByPeerId.set(peerId, peer);
+  }
   const self = data.self || {};
   // 徽标数 = 已有成功拉取记录的对端行数（不是配置对端数）；为 0 时隐藏
   const badge = $("peers_badge");
@@ -10055,16 +10069,21 @@ function renderPeers(data) {
   if (selfName) selfName.textContent = self.name || "";
   const cell = (v) => esc(v ? v : "—");
   let html = "<tr><td>" + esc(self.name || "") + ' <span style="color: var(--primary);">（本机）</span></td>'
+    + "<td>—</td>"
     + "<td>" + peersStatusHtml(self) + "</td>"
     + "<td>" + cell(self.node_ip) + "</td>"
+    + "<td>—</td>"
     + "<td>" + cell(self.region) + "</td>"
     + "<td>实时 " + peersClock(Date.now()) + "</td></tr>";
   const nowMs = Date.now();
   for (const row of peers) {
     const seenMs = Number(row.last_seen) * 1000;
+    const peerConfig = configuredByPeerId.get(row.peer_id);
     html += "<tr><td>" + esc(row.name) + "</td>"
+      + "<td>" + cell(peerConfig && peerConfig.name) + "</td>"
       + "<td>" + peersStatusHtml(row) + "</td>"
       + "<td>" + cell(row.node_ip) + "</td>"
+      + "<td>" + cell(peerConfig && peerConfig.host) + "</td>"
       + "<td>" + cell(row.region) + "</td>"
       + "<td>" + peersClock(seenMs) + " · " + peersRelative((nowMs - seenMs) / 1000) + "</td></tr>";
   }
